@@ -452,16 +452,21 @@ impl SmoltcpDevice for SmoltcpAfXdpDevice {
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.max_transmission_unit;
         caps.max_burst_size = Some(64);
-        // AF_XDP delivers raw wire frames. On virtio/VM-to-VM paths the
-        // sender may offload checksum completion to the NIC, which marks
-        // the skb CHECKSUM_UNNECESSARY while leaving the field partial in
-        // the bytes we receive. The kernel stack trusts that mark; a
-        // userspace stack must declare the same capability or it drops
-        // perfectly valid frames at checksum verification. We still
-        // compute checksums on TX ourselves.
-        caps.checksum.tcp = Checksum::Tx;
-        caps.checksum.udp = Checksum::Tx;
-        caps.checksum.ipv4 = Checksum::Tx;
+        // AF_XDP delivers raw wire frames with no RX checksum metadata —
+        // the kernel's CHECKSUM_UNNECESSARY mark never reaches this layer,
+        // so a userspace stack cannot inherit "the skb was verified" trust.
+        // A real sender's NIC completes TX checksum offload before the
+        // frame reaches the wire, so valid wire frames always carry
+        // complete checksums; verify them in software and let corrupt
+        // frames drop here instead of being fed to the socket layer.
+        // Isolated veth test links are the exception (peer TX offload
+        // leaves the field partial); such senders must run with checksum
+        // offload disabled, never by weakening verification.
+        caps.checksum.tcp = Checksum::Both;
+        caps.checksum.udp = Checksum::Both;
+        caps.checksum.ipv4 = Checksum::Both;
+        caps.checksum.icmpv4 = Checksum::Both;
+        caps.checksum.icmpv6 = Checksum::Both;
         caps
     }
 }
@@ -693,7 +698,26 @@ impl AfXdpTcpReactor {
     /// bridge refuses *new* session admissions but keeps feeding existing
     /// sessions, so pressure is shed at the admission boundary instead of
     /// collapsing the whole queue.
-    #[cfg(target_os = "linux")]
+    /// F1 explicit teardown: abort every live smoltcp session so the next
+    /// `poll` emits RST frames on the wire. Callers must flush the egress
+    /// to TX before dropping the queue — a retired dataplane terminates
+    /// peers visibly instead of leaving silently hung sockets.
+    pub(crate) fn abort_all_sessions(&mut self) -> usize {
+        let mut aborted = 0usize;
+        for session in self.sessions.values_mut() {
+            if session.closing {
+                continue;
+            }
+            let socket = self
+                .sockets
+                .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
+            socket.abort();
+            session.closing = true;
+            aborted += 1;
+        }
+        aborted
+    }
+
     pub(crate) fn has_session(&self, flow: &AfXdpTcpFlowKey) -> bool {
         self.sessions.contains_key(flow)
     }
@@ -2060,11 +2084,20 @@ pub(crate) fn proxy_bridge_should_idle(
         && tcp_egress_frames == 0
 }
 
+/// F1: worker liveness gate. Polling continues while the dataplane lease
+/// is alive and its *current owner* manager has redirect armed — manager
+/// replacement under an adopted dataplane never stops a worker that still
+/// owns live sessions.
 #[cfg(any(test, target_os = "linux"))]
-pub(crate) fn proxy_bridge_should_continue(manager: &Arc<XdpManager>) -> bool {
-    manager_is_current(manager)
-        && !manager.attached.read().is_empty()
-        && (manager.proxy_redirect_ready() || manager.proxy_workers_starting())
+pub(crate) fn proxy_bridge_should_continue(
+    lease: &crate::xdp::AfXdpDataplaneLease,
+) -> bool {
+    if lease.is_retired() {
+        return false;
+    }
+    let owner = lease.owner();
+    !owner.attached.read().is_empty()
+        && (owner.proxy_redirect_ready() || owner.proxy_workers_starting())
 }
 
 impl AfXdpTcpStream {

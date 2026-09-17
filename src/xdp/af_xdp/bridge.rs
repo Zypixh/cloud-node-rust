@@ -42,6 +42,10 @@ pub(crate) struct AfXdpQueueCtx {
     pub(crate) udp_routes: Arc<DashMap<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>>,
     /// First channel per interface for cross-interface forwarding.
     pub(crate) iface_fwd: Arc<HashMap<String, mpsc::Sender<AfXdpForward>>>,
+    /// F1: dataplane lease — workers gate on this, never on manager
+    /// staleness, so a compatible reload keeps sessions polling while the
+    /// manager generation changes underneath them.
+    pub(crate) lease: Arc<crate::xdp::AfXdpDataplaneLease>,
 }
 
 pub fn runtime() -> AfXdpRuntime {
@@ -195,7 +199,7 @@ pub(crate) async fn run_proxy_bridge(
     // CPU-pinned OS thread running an isolated smoltcp reactor. The shared
     // af_xdp mutex and single poll loop are removed from the dataplane;
     // RSS flow-to-queue affinity keeps flows on one reactor.
-    let queue_handles = {
+    let mut queue_handles = {
         let mut runtime = manager.af_xdp.lock();
         match runtime.as_mut() {
             Some(runtime) => runtime.take_queues(),
@@ -208,6 +212,49 @@ pub(crate) async fn run_proxy_bridge(
         }
     };
     if queue_handles.is_empty() {
+        // F1: an adopted runtime has no queues left — they are owned by the
+        // still-running workers of the previous generation. A retired lease
+        // means those workers exited; rebuild a fresh socket set so a dead
+        // dataplane recovers instead of reporting a permanent fallback.
+        let retired = manager
+            .af_xdp
+            .lock()
+            .as_ref()
+            .and_then(|runtime| runtime.lease.as_ref().map(|lease| lease.is_retired()))
+            .unwrap_or(false);
+        if retired {
+            *manager.af_xdp.lock() = None;
+            if let Err(err) = manager.configure_af_xdp_runtime() {
+                manager.set_proxy_fallback_reason(format!(
+                    "AF_XDP dataplane rebuild after worker loss failed: {err}; traffic will PASS"
+                ));
+                return;
+            }
+            queue_handles = {
+                let mut runtime = manager.af_xdp.lock();
+                match runtime.as_mut() {
+                    Some(runtime) => runtime.take_queues(),
+                    None => Vec::new(),
+                }
+            };
+        }
+    }
+    if queue_handles.is_empty() {
+        // F1: an adopted runtime whose lease is still live means the
+        // previous generation's workers own the dataplane — this manager
+        // must not spawn duplicates or touch redirect state.
+        let lease_live = manager
+            .af_xdp
+            .lock()
+            .as_ref()
+            .and_then(|runtime| runtime.lease.as_ref().map(|lease| !lease.is_retired()))
+            .unwrap_or(false);
+        if lease_live {
+            tracing::debug!(
+                "AF_XDP proxy bridge: dataplane adopted by this generation; workers still running"
+            );
+            return;
+        }
         let message =
             "AF_XDP proxy bridge has no AF_XDP queues; proxy redirect disabled, traffic will PASS"
                 .to_string();
@@ -215,12 +262,31 @@ pub(crate) async fn run_proxy_bridge(
         manager.disable_proxy_redirect_for_fallback(message);
         return;
     }
+    // F1: the dataplane lease outlives the manager that spawned it —
+    // workers gate on the lease, and a compatible reload repoints the
+    // lease owner instead of stopping the polling loops.
+    let lease = {
+        let mut runtime = manager.af_xdp.lock();
+        let lease = match runtime.as_mut() {
+            Some(runtime) => match &runtime.lease {
+                Some(lease) => lease.clone(),
+                None => {
+                    let lease = Arc::new(crate::xdp::AfXdpDataplaneLease::new(manager.clone()));
+                    runtime.lease = Some(lease.clone());
+                    lease
+                }
+            },
+            None => Arc::new(crate::xdp::AfXdpDataplaneLease::new(manager.clone())),
+        };
+        lease
+    };
     // EN-12 worker lease: prove every reactor is running *before* opening
     // redirect — a registered XSK is a socket, not a worker. Redirecting
     // into an XSK nobody drains would silently drop every proxied packet.
     spawn_queue_reactors(
         &manager,
         queue_handles,
+        lease,
         quic_demux,
         tcp_manager,
         http_manager,
@@ -236,6 +302,7 @@ pub(crate) async fn run_proxy_bridge(
 pub(crate) async fn spawn_queue_reactors(
     manager: &Arc<XdpManager>,
     queue_handles: Vec<linux::AfXdpQueueHandle>,
+    lease: Arc<crate::xdp::AfXdpDataplaneLease>,
     quic_demux: Arc<crate::quic_udp_demux::QuicUdpDemuxManager>,
     tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
     http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
@@ -277,6 +344,7 @@ pub(crate) async fn spawn_queue_reactors(
             dial_registry: dial_registry.clone(),
             udp_routes: udp_routes.clone(),
             iface_fwd: Arc::new(HashMap::new()),
+            lease: lease.clone(),
         });
     }
     // Publish only after every queue is registered — and only when the
@@ -341,6 +409,8 @@ pub(crate) async fn spawn_queue_reactors(
         let http_manager = http_manager.clone();
         let ready = ready_tx.clone();
         let name = thread_name.clone();
+        let worker_lease = ctx.lease.clone();
+        worker_lease.worker_started();
         let join = match std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
@@ -365,15 +435,20 @@ pub(crate) async fn spawn_queue_reactors(
                             tcp_manager,
                             http_manager,
                             per_queue_tcp_session_limit,
-                        ))
+                        ));
                     }
                     Err(err) => {
                         tracing::error!("{name}: failed to build reactor runtime: {err}")
                     }
                 }
+                // Queue sockets drop with the ctx — bookkeeping for callers
+                // that must not rebind the queue until it is provably free.
+                worker_lease.worker_exited();
             }) {
             Ok(join) => join,
             Err(err) => {
+                // The closure never ran — undo the worker_started above.
+                lease.worker_exited();
                 manager.disable_proxy_redirect_for_fallback(format!(
                     "AF_XDP proxy bridge failed to spawn reactor thread: {err}; proxy redirect disabled, traffic will PASS"
                 ));
@@ -506,22 +581,30 @@ pub(crate) async fn spawn_queue_reactors(
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         if joins.iter().all(|(_, _, join)| join.is_finished()) {
+            // Every worker is gone — the socket generation is dead. Mark
+            // the lease retired so the next manager generation rebuilds a
+            // fresh dataplane instead of inheriting a husk.
+            lease.retire();
             return;
         }
-        if proxy_bridge_should_continue(manager) {
+        if !lease.is_retired() {
             // EN-05: a dead reactor withdraws only its own queue — the
             // queue's XSK slots are removed so its traffic takes the
             // explicit dataplane fallback while sibling queues keep
             // serving. A queue's fault must not widen globally.
+            // Fault bookkeeping always lands on the *current* owner of the
+            // lease, which may be a newer manager generation after an
+            // adopted reload.
+            let owner = lease.owner();
             for (interface, queue, join) in &joins {
                 // Skip queues the worker already withdrew itself — its
                 // original fault detail is more precise than a generic
                 // "thread exited" reason.
                 if join.is_finished()
                     && reported_dead.insert((interface.clone(), *queue))
-                    && !manager.xsk_queue_faulted(interface, *queue)
+                    && !owner.xsk_queue_faulted(interface, *queue)
                 {
-                    manager.disable_queue_redirect_for_fault(
+                    owner.disable_queue_redirect_for_fault(
                         interface,
                         *queue,
                         "AF_XDP queue reactor thread exited unexpectedly".to_string(),
@@ -534,7 +617,10 @@ pub(crate) async fn spawn_queue_reactors(
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn run_queue_bridge_loop(
-    manager: Arc<XdpManager>,
+    // Kept for the spawn-site Arc lifetime; the loop itself gates and
+    // reports through `ctx.lease` so a manager generation swap never
+    // stops a polling worker that still owns sessions (F1).
+    _manager: Arc<XdpManager>,
     mut queue_handle: linux::AfXdpQueueHandle,
     ctx: AfXdpQueueCtx,
     quic_demux: Arc<crate::quic_udp_demux::QuicUdpDemuxManager>,
@@ -567,6 +653,7 @@ pub(crate) async fn run_queue_bridge_loop(
         dial_registry,
         udp_routes,
         iface_fwd,
+        lease,
     } = ctx;
     let own_interface: Arc<str> = Arc::from(queue_handle.interface.as_str());
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -603,10 +690,30 @@ pub(crate) async fn run_queue_bridge_loop(
     let mut last_status_refresh = std::time::Instant::now();
 
     loop {
-        if !proxy_bridge_should_continue(&manager) {
-            let message =
-                "AF_XDP proxy bridge exiting because XDP manager is stale or redirect is disabled"
-                    .to_string();
+        // F1: the worker gates on the dataplane lease, not on manager
+        // staleness — a compatible reload swaps the lease owner while
+        // these sockets keep polling. The only exits are lease retire
+        // (real teardown) or redirect disabled on the *current* owner.
+        if lease.is_retired() || !proxy_bridge_should_continue(&lease) {
+            // Explicit teardown contract: never leave peers on a silently
+            // hung session. Abort every live smoltcp session and flush
+            // the resulting RST frames before dropping the socket.
+            let aborted = tcp_reactor.abort_all_sessions();
+            let egress = tcp_reactor.poll();
+            let mut sent = 0usize;
+            for (route, ip_packet) in &egress {
+                if encode_ip_reply_frame(&route.link, ip_packet, &mut encode_scratch).is_some()
+                    && queue_handle
+                        .send_raw_frame(&encode_scratch)
+                        .unwrap_or(false)
+                {
+                    sent += 1;
+                }
+            }
+            let message = format!(
+                "AF_XDP proxy bridge exiting: dataplane retired={} aborted={aborted} rst_sent={sent}",
+                lease.is_retired()
+            );
             tracing::warn!("{message}");
             crate::logging::report_node_log(
                 "warn".to_string(),
@@ -619,7 +726,8 @@ pub(crate) async fn run_queue_bridge_loop(
         if last_status_refresh.elapsed() >= AF_XDP_STATUS_REFRESH_INTERVAL {
             last_status_refresh = std::time::Instant::now();
             let stats = queue_handle.rx.fd().xdp_statistics().ok();
-            manager.update_xsk_queue_status(
+            let owner = lease.owner();
+            owner.update_xsk_queue_status(
                 &queue_handle.interface,
                 queue_handle.queue,
                 |status| {
@@ -653,10 +761,10 @@ pub(crate) async fn run_queue_bridge_loop(
                 let detail = format!(
                     "AF_XDP proxy bridge poll failed ({consecutive_poll_errors}/{AF_XDP_MAX_CONSECUTIVE_POLL_ERRORS}): {err}"
                 );
-                manager.set_proxy_fallback_reason(detail.clone());
+                lease.owner().set_proxy_fallback_reason(detail.clone());
                 tracing::warn!("{}", detail);
                 if consecutive_poll_errors >= AF_XDP_MAX_CONSECUTIVE_POLL_ERRORS {
-                    manager.disable_queue_redirect_for_fault(
+                    lease.owner().disable_queue_redirect_for_fault(
                         &own_interface,
                         queue_handle.queue,
                         format!("AF_XDP proxy bridge poll failed repeatedly: {err}"),
@@ -838,7 +946,7 @@ pub(crate) async fn run_queue_bridge_loop(
                         Ok(crate::udp_proxy::UdpIngressDatagramStatus::Closed) => {
                             tracing::debug!("AF_XDP proxy bridge upstream session closed");
                             if udp_ingress_failures.record(AfXdpTxStatus::Failed) {
-                                manager.disable_queue_redirect_for_fault(
+                                lease.owner().disable_queue_redirect_for_fault(
                                     &own_interface,
                                     queue_handle.queue,
                                     format!(
@@ -854,7 +962,7 @@ pub(crate) async fn run_queue_bridge_loop(
                                 err
                             );
                             if udp_ingress_failures.record(AfXdpTxStatus::Failed) {
-                                manager.disable_queue_redirect_for_fault(
+                                lease.owner().disable_queue_redirect_for_fault(
                                     &own_interface,
                                     queue_handle.queue,
                                     format!(
@@ -1050,7 +1158,7 @@ pub(crate) async fn run_queue_bridge_loop(
                         err
                     );
                     if tx_failures.record(AfXdpTxStatus::Failed) {
-                        manager.disable_queue_redirect_for_fault(
+                        lease.owner().disable_queue_redirect_for_fault(
                             &own_interface,
                             queue_handle.queue,
                             format!(
@@ -1117,7 +1225,7 @@ pub(crate) async fn run_queue_bridge_loop(
                 Err(err) => {
                     tracing::debug!("AF_XDP forwarded TX failed: {err}");
                     if tx_failures.record(AfXdpTxStatus::Failed) {
-                        manager.disable_queue_redirect_for_fault(
+                        lease.owner().disable_queue_redirect_for_fault(
                             &own_interface,
                             queue_handle.queue,
                             format!(
@@ -1203,7 +1311,7 @@ pub(crate) async fn run_queue_bridge_loop(
                         err
                     );
                     if tx_failures.record(AfXdpTxStatus::Failed) {
-                        manager.disable_queue_redirect_for_fault(
+                        lease.owner().disable_queue_redirect_for_fault(
                             &own_interface,
                             queue_handle.queue,
                             format!(

@@ -59,7 +59,10 @@ pub(crate) struct AfXdpDialOwner {
 /// `release` (called on session reap) unwinds the rest.
 #[cfg(target_os = "linux")]
 pub(crate) struct AfXdpDialRegistry {
-    manager: Arc<XdpManager>,
+    /// F1: the manager generation that owns the live eBPF handle — used
+    /// for out-CT map writes. Repointed at dataplane adoption so a reload
+    /// never leaves dials writing through a detached generation.
+    manager: parking_lot::RwLock<Arc<XdpManager>>,
     owners: DashMap<AfXdpTcpFlowKey, AfXdpDialOwner>,
     queues: DashMap<(String, u32), mpsc::Sender<AfXdpReactorRequest>>,
     port_cursor: AtomicU32,
@@ -80,7 +83,7 @@ impl AfXdpDialRegistry {
             .map(|upstream| upstream.dial_port_range())
             .unwrap_or((AF_XDP_DIAL_PORT_BASE, 49_999));
         Self {
-            manager,
+            manager: parking_lot::RwLock::new(manager),
             port_base,
             port_span: port_end.saturating_sub(port_base).saturating_add(1),
             owners: DashMap::new(),
@@ -95,6 +98,13 @@ impl AfXdpDialRegistry {
                     .max(1),
             ),
         }
+    }
+
+    /// F1: repoint bookkeeping to the successor manager after dataplane
+    /// adoption. Queue senders and owner entries are untouched — the
+    /// workers sharing this registry never stopped.
+    pub(crate) fn repoint(&self, manager: Arc<XdpManager>) {
+        *self.manager.write() = manager;
     }
 
     /// Called once per queue reactor at spawn time. Stale senders are
@@ -342,7 +352,7 @@ impl AfXdpDialRegistry {
                 flow.peer_addr
             );
         };
-        if let Err(err) = self.manager.upsert_out_ct(ct_key) {
+        if let Err(err) = self.manager.read().upsert_out_ct(ct_key) {
             bail!(
                 io::ErrorKind::Other,
                 "AF_XDP dial {} -> {}: XDP_OUT_CT insert failed: {err}",
@@ -476,7 +486,7 @@ impl AfXdpDialRegistry {
                 ),
             ));
         };
-        if let Err(err) = self.manager.upsert_out_ct(ct_key) {
+        if let Err(err) = self.manager.read().upsert_out_ct(ct_key) {
             self.rollback(&flow);
             return Err(io::Error::other(format!(
                 "AF_XDP UDP dial {} -> {}: XDP_OUT_CT insert failed: {err}",
@@ -513,7 +523,7 @@ impl AfXdpDialRegistry {
             return;
         };
         if let Some(key) = linux::out_ct_key(flow.local_addr, flow.peer_addr, owner.proto)
-            && let Err(err) = self.manager.remove_out_ct(&key)
+            && let Err(err) = self.manager.read().remove_out_ct(&key)
         {
             tracing::warn!(
                 "AF_XDP dial release failed to remove XDP_OUT_CT row local={} peer={}: {err}",

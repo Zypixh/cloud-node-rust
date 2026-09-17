@@ -260,6 +260,14 @@ pub struct XdpStatusSnapshot {
     /// EN-10: owner generation stamped on emitted lifecycle events.
     #[serde(default)]
     pub owner_epoch: u64,
+    /// F1: this manager adopted a live AF_XDP dataplane from its
+    /// predecessor — sockets/workers/sessions carried over a reload.
+    #[serde(default)]
+    pub dataplane_adopted: bool,
+    /// F1: adoptions the current dataplane lease has survived (0 = the
+    /// running socket generation was created by this manager).
+    #[serde(default)]
+    pub dataplane_lease_adoptions: u64,
     /// ICMP/ICMPv6 control traffic handed to the kernel stack.
     #[serde(default)]
     pub control: u64,
@@ -297,6 +305,155 @@ fn xsk_status_refresh_due(
         }
         None => true,
     }
+}
+
+/// F1: generation-independent handle for one AF_XDP socket generation.
+/// The lease is created when the proxy bridge spawns its per-queue
+/// reactor threads and is adopted wholesale by the next manager when a
+/// reload is dataplane-compatible — workers keep polling the same
+/// sockets and their smoltcp sessions are never dropped.
+///
+/// Workers gate on this lease, not on the manager Arc they were spawned
+/// with: `manager_is_current` must never stop a polling loop that still
+/// owns live sessions.
+pub(crate) struct AfXdpDataplaneLease {
+    /// Set when this socket generation is truly decommissioned — runtime
+    /// stop, `xdp.enabled=false`, or dataplane teardown. A compatible
+    /// reload never touches this flag; workers only exit on it.
+    pub(crate) retired: AtomicBool,
+    /// Manager generation that currently owns status/fault reporting and
+    /// the eBPF handle. Repointed once at adoption handover, after the
+    /// new owner's redirect bookkeeping is already armed — workers never
+    /// observe a not-ready owner.
+    owner: parking_lot::RwLock<std::sync::Arc<XdpManager>>,
+    /// Number of times this dataplane has been adopted by a newer
+    /// manager generation (0 = original owner still attached).
+    adoptions: AtomicU64,
+    /// Live reactor workers gating on this lease — incremented at
+    /// spawn, decremented when the worker loop returns. Retirement
+    /// callers that rebind the queues wait for this to drain so a new
+    /// socket generation never races a dying worker's still-open fd.
+    #[allow(dead_code)]
+    live_workers: AtomicU64,
+}
+
+impl AfXdpDataplaneLease {
+    pub(crate) fn new(owner: std::sync::Arc<XdpManager>) -> Self {
+        Self {
+            retired: AtomicBool::new(false),
+            owner: parking_lot::RwLock::new(owner),
+            adoptions: AtomicU64::new(0),
+            live_workers: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn owner(&self) -> std::sync::Arc<XdpManager> {
+        self.owner.read().clone()
+    }
+
+    /// Adoption handover — caller must arm the new manager's redirect
+    /// bookkeeping *before* this repoint.
+    pub(crate) fn adopt(&self, new_owner: std::sync::Arc<XdpManager>) {
+        *self.owner.write() = new_owner;
+        self.adoptions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn adoptions(&self) -> u64 {
+        self.adoptions.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn worker_started(&self) {
+        self.live_workers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn worker_exited(&self) {
+        self.live_workers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Bounded wait for every retired worker to drop its queue sockets —
+    /// used before rebinding the same queues on a rebuilt dataplane.
+    /// Returns false when the deadline expired with workers still alive;
+    /// the caller reports that explicitly rather than assuming.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn wait_workers_drained(&self, deadline: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        while self.live_workers.load(Ordering::Relaxed) > 0 {
+            if start.elapsed() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        true
+    }
+}
+
+impl std::fmt::Debug for AfXdpDataplaneLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately shallow — `owner` is an Arc<XdpManager> and
+        // XdpManager::fmt would recurse back into this lease.
+        f.debug_struct("AfXdpDataplaneLease")
+            .field("retired", &self.retired.load(Ordering::Relaxed))
+            .field("adoptions", &self.adoptions.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+/// F1 reload gate: fields that determine the AF_XDP socket/queue/link
+/// shape. A reload changing any of these cannot keep the running
+/// dataplane's sessions and is rejected before the new generation
+/// commits — the old dataplane keeps serving untouched. Map-content
+/// settings (local IPs, forwards, rules, proxy ports, rate limits) are
+/// deliberately absent: they are re-synced gap-free into the pinned
+/// maps and take effect on the running program.
+#[cfg(any(test, target_os = "linux"))]
+fn dataplane_shape_compatible(old: &XdpManager, new: &XdpConfig) -> Result<(), String> {
+    let old_cfg = &old.config;
+    if old_cfg.attach_mode != new.attach_mode {
+        return Err(format!(
+            "attachMode changed {} -> {}",
+            old_cfg.attach_mode.as_str(),
+            new.attach_mode.as_str()
+        ));
+    }
+    if old_cfg.ebpf_object != new.ebpf_object {
+        return Err("ebpfObject override changed".to_string());
+    }
+    // Compare *resolved* table sizes: `None` means auto-scale, which is
+    // deterministic for an identical socket shape on the same node — so
+    // a reload pinning the previously auto-scaled values stays
+    // compatible, while a genuinely different sizing is rejected.
+    if let Some(new_tables) = &new.state_tables
+        && old.effective_state_tables.read().as_ref() != Some(new_tables)
+    {
+        return Err("stateTables changed (pinned eBPF map sizes are fixed)".to_string());
+    }
+    if old_cfg.upstream != new.upstream {
+        return Err("upstream dataplane settings changed".to_string());
+    }
+    let shape = |interfaces: &[crate::runtime_mode::XdpInterfaceConfig]| {
+        interfaces
+            .iter()
+            .map(|i| (i.name.clone(), i.mode, i.queues.clone(), i.cpus.clone()))
+            .collect::<Vec<_>>()
+    };
+    let old_shape = shape(&old_cfg.interfaces);
+    let new_shape = shape(&new.interfaces);
+    if old_shape != new_shape {
+        return Err(format!(
+            "interface socket shape changed ({old_shape:?} -> {new_shape:?})"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -405,6 +562,16 @@ pub(crate) struct XdpManager {
     /// Socket registration alone is not proof a worker is running.
     #[allow(dead_code)]
     proxy_workers_starting: AtomicBool,
+    /// F1: this generation adopted the predecessor's live AF_XDP
+    /// dataplane instead of creating fresh sockets — observability for
+    /// /status and reload diagnostics.
+    #[cfg(target_os = "linux")]
+    dataplane_adopted: AtomicBool,
+    /// F1: set by the atomic link swap when a mid-commit failure reverted
+    /// every swapped link cleanly — the predecessor's dataplane is then
+    /// intact and reload rollback keeps it serving instead of rebuilding.
+    #[cfg(target_os = "linux")]
+    attach_dataplane_restored: std::sync::Arc<AtomicBool>,
     /// EN-05: (ifindex, queue) pairs whose XSK_INDEX/XSKS slots were
     /// withdrawn after a queue-scoped fault. Periodic map syncs consult
     /// this so they never resurrect a dead queue's redirect entry; cleared
@@ -510,6 +677,10 @@ impl XdpManager {
             attach_committed: AtomicBool::new(false),
             proxy_workers_starting: AtomicBool::new(false),
             #[cfg(target_os = "linux")]
+            dataplane_adopted: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            attach_dataplane_restored: std::sync::Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "linux")]
             xsk_withdrawn: parking_lot::Mutex::new(std::collections::HashSet::new()),
             last_state_write_at: AtomicU64::new(0),
             rule_sweeper_started: AtomicBool::new(false),
@@ -525,18 +696,30 @@ impl XdpManager {
     }
 
     async fn initialize(&self) -> anyhow::Result<()> {
-        self.initialize_inner(None).await
+        self.initialize_inner(None, None).await
     }
 
     /// `predecessor` is set during an owner-respecting reload: the old
     /// generation keeps its kernel links and AF_XDP sockets until the new
     /// attach commits, then releases them so the new sockets can bind the
-    /// same queues.
+    /// same queues. `self_arc` is the Arc of `self` — required when the
+    /// reload adopts the predecessor's live dataplane so the lease owner
+    /// can be repointed at this generation.
     async fn initialize_inner(
         &self,
         predecessor: Option<&std::sync::Arc<XdpManager>>,
+        self_arc: Option<&std::sync::Arc<XdpManager>>,
     ) -> anyhow::Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = (predecessor, self_arc);
         if !self.config.enabled {
+            // F1: disabling XDP decommissions the predecessor's dataplane
+            // for real — retire the lease so workers abort their sessions
+            // with wire-visible RSTs instead of polling dead rings.
+            #[cfg(target_os = "linux")]
+            if let Some(old) = predecessor {
+                old.retire_dataplane_lease();
+            }
             self.ensure_detached_when_disabled().await;
             return Ok(());
         }
@@ -578,15 +761,42 @@ impl XdpManager {
 
         #[cfg(target_os = "linux")]
         {
+            // F1: decide dataplane adoption before attach. A predecessor
+            // with a live (non-retired) dataplane lease can only be
+            // replaced by a dataplane-compatible config — anything else
+            // would orphan the AF_XDP sessions the workers still own, so
+            // the reload is rejected before any commit damage.
+            let adopt_lease = predecessor.and_then(|old| old.live_dataplane_lease());
+            if let Some(old) = predecessor
+                && adopt_lease.is_some()
+                && let Err(detail) = dataplane_shape_compatible(old, &self.config)
+            {
+                let reason = format!(
+                    "XDP reload rejected — dataplane-incompatible change ({detail}); \
+                     the live AF_XDP dataplane keeps serving under the previous generation; \
+                     restart the node to apply this config"
+                );
+                self.set_fallback_reason(reason.clone());
+                anyhow::bail!("{reason}");
+            }
             // The daemon never purges pinned state implicitly: an
             // ABI-incompatible state map is a migration boundary and must
             // surface as an explicit fallback reason, not silent state loss.
+            let atomic_reattach = predecessor
+                .filter(|_| adopt_lease.is_some())
+                .map(|old| linux::AtomicReattach {
+                    xsk_withdrawn: old.xsk_withdrawn.lock().clone(),
+                    dataplane_restored: self.attach_dataplane_restored.clone(),
+                });
             self.attach_committed.store(false, Ordering::Relaxed);
+            self.attach_dataplane_restored
+                .store(false, Ordering::Relaxed);
             match linux::attach(
                 &self.config,
                 object_override.as_deref(),
                 false,
                 Some(&self.attach_committed),
+                atomic_reattach.as_ref(),
             )
             .await
             {
@@ -609,22 +819,30 @@ impl XdpManager {
                     // EN-14: populate the pinned cookie key ring on first
                     // attach (no-op when a generation already holds a key).
                     self.sync_cookie_key();
-                    // New attach generation: queue withdrawals applied to
-                    // the previous socket set must not leak into this
-                    // generation's index sync — fresh sockets get fresh
-                    // slots.
-                    self.xsk_withdrawn.lock().clear();
-                    self.flush_maps_full_blocking(self.proxy_redirect_ready());
                     if let Some(old) = predecessor {
-                        // The attach commit already swapped the kernel
-                        // links. Release the previous generation's AF_XDP
-                        // sockets and eBPF handle so this generation can
-                        // bind the same queues. Flows owned by the old
-                        // smoltcp sockets terminate at this handover —
-                        // they cannot migrate to the kernel path and are
-                        // never left as silent zombies.
-                        old.release_for_handover();
+                        if let Some(lease) = &adopt_lease {
+                            // F1: adopt the predecessor's live dataplane —
+                            // sockets, workers, sessions, dial registry and
+                            // guard all carry over; the atomic link swap
+                            // already pointed the kernel at this object's
+                            // program. Redirect bookkeeping is armed here
+                            // *before* the lease owner repoint inside.
+                            self.adopt_af_xdp_runtime(old, lease, self_arc);
+                            old.release_bookkeeping_for_adoption();
+                        } else {
+                            // The attach commit already swapped the kernel
+                            // links. Release the previous generation's
+                            // AF_XDP sockets and eBPF handle so this
+                            // generation can bind the same queues.
+                            old.release_for_handover();
+                        }
+                    } else {
+                        // Fresh attach: queue withdrawals applied to a
+                        // previous socket set must not leak into this
+                        // generation's index sync.
+                        self.xsk_withdrawn.lock().clear();
                     }
+                    self.flush_maps_full_blocking(self.proxy_redirect_ready());
                     self.configure_af_xdp_runtime()?;
                 }
                 Err(err) => {
@@ -657,6 +875,9 @@ impl XdpManager {
         self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         {
+            // F1: retire the lease first so workers abort live sessions
+            // with wire RSTs instead of polling dead rings.
+            self.retire_dataplane_lease();
             self.release_dial_guard().await;
             *self.af_xdp.lock() = None;
             *self.ebpf.lock() = None;
@@ -881,6 +1102,13 @@ impl XdpManager {
 
         #[cfg(target_os = "linux")]
         {
+            // F1: an adopted dataplane already carries the runtime handle
+            // (sockets + workers + sessions) — do not bind fresh sockets.
+            if self.af_xdp.lock().is_some() {
+                self.set_proxy_fallback_reason(xdp_proxy_partial_detail(&self.config));
+                self.set_tcp_dataplane_detail(xdp_tcp_dataplane_detail(&self.config));
+                return Ok(());
+            }
             match linux::prepare_af_xdp_sockets(&self.config) {
                 Ok(mut runtime) => {
                     let mut registration_failed = false;
@@ -1260,6 +1488,19 @@ impl XdpManager {
             flow_events_evicted: self.flow_events_evicted.load(Ordering::Relaxed),
             imported_flows: self.imported_flows.load(Ordering::Relaxed),
             owner_epoch: self.owner_epoch.load(Ordering::Relaxed),
+            #[cfg(target_os = "linux")]
+            dataplane_adopted: self.dataplane_adopted.load(Ordering::Relaxed),
+            #[cfg(not(target_os = "linux"))]
+            dataplane_adopted: false,
+            #[cfg(target_os = "linux")]
+            dataplane_lease_adoptions: self
+                .af_xdp
+                .lock()
+                .as_ref()
+                .and_then(|runtime| runtime.lease.as_ref().map(|lease| lease.adoptions()))
+                .unwrap_or(0),
+            #[cfg(not(target_os = "linux"))]
+            dataplane_lease_adoptions: 0,
             rate_limit_active: self.rate_limit_active.load(Ordering::Relaxed) != 0,
             rate_limit_detail: self.rate_limit_detail.lock().clone(),
             updated_at: crate::utils::time::now_timestamp(),
@@ -2259,6 +2500,8 @@ impl XdpManager {
     /// object fd) are dropped. The bridge reactor threads exit on the
     /// stale-manager check and close their queue sockets; the socket
     /// create path on the new generation retries across that window.
+    /// The dial guard and registry are released here (not at publish) so
+    /// a rejected or failed reload never disarms the guard mid-prepare.
     fn release_for_handover(&self) {
         self.stop_rule_sweeper();
         self.stop_map_sync_worker();
@@ -2266,7 +2509,118 @@ impl XdpManager {
         self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         {
+            // Retiring the lease makes the workers abort live sessions
+            // with wire RSTs before they drop the queue sockets — no
+            // silent zombie flows.
+            self.retire_dataplane_lease();
+            self.dial_registry.lock().take();
+            self.release_dial_guard_blocking();
             *self.af_xdp.lock() = None;
+            *self.ebpf.lock() = None;
+        }
+        self.attached.write().clear();
+        self.xsk_status.write().clear();
+    }
+
+    /// F1: the dataplane lease this generation's AF_XDP runtime carries,
+    /// while it is still live. `None` when no bridge ever spawned (sockets
+    /// staged but no workers) or the lease was already retired.
+    #[cfg(target_os = "linux")]
+    fn live_dataplane_lease(
+        &self,
+    ) -> Option<std::sync::Arc<AfXdpDataplaneLease>> {
+        let lease = self.af_xdp.lock().as_ref()?.lease.clone()?;
+        if lease.is_retired() {
+            None
+        } else {
+            Some(lease)
+        }
+    }
+
+    /// F1: retire the lease carried by this generation's runtime — workers
+    /// observing it abort their sessions (wire RST) and drop their queue
+    /// sockets. No-op when the dataplane was adopted away or never ran.
+    #[cfg(target_os = "linux")]
+    fn retire_dataplane_lease(&self) {
+        let lease = self
+            .af_xdp
+            .lock()
+            .as_ref()
+            .and_then(|runtime| runtime.lease.clone());
+        if let Some(lease) = lease {
+            lease.retire();
+        }
+    }
+
+    /// F1: adopt the predecessor's live dataplane after an atomic attach
+    /// commit. Everything the workers need moves wholesale: the runtime
+    /// handle (status book), the dial registry (shared with workers —
+    /// repointed to this generation), and the dial-guard report (the
+    /// kernel-side nft/sysctl state was never torn down). Redirect
+    /// bookkeeping is armed *before* the lease owner repoint so no worker
+    /// observes a not-ready owner.
+    #[cfg(target_os = "linux")]
+    fn adopt_af_xdp_runtime(
+        &self,
+        old: &XdpManager,
+        lease: &std::sync::Arc<AfXdpDataplaneLease>,
+        self_arc: Option<&std::sync::Arc<XdpManager>>,
+    ) {
+        *self.xsk_status.write() = old.xsk_status.read().clone();
+        *self.xsk_withdrawn.lock() = old.xsk_withdrawn.lock().clone();
+        *self.af_xdp.lock() = old.af_xdp.lock().take();
+        let registry = old.dial_registry.lock().take();
+        if let (Some(registry), Some(owner)) = (&registry, self_arc) {
+            registry.repoint(owner.clone());
+        } else if registry.is_some() {
+            tracing::error!(
+                "F1 adoption: dial registry could not be repointed (no self Arc); \
+                 AF_XDP upstream dials will fail explicitly"
+            );
+        }
+        *self.dial_registry.lock() = registry;
+        *self.dial_guard.lock() = old.dial_guard.lock().take();
+        self.dial_guard_hits
+            .store(old.dial_guard_hits.load(Ordering::Relaxed), Ordering::Relaxed);
+        *self.dial_guard_detail.lock() = old.dial_guard_detail.lock().clone();
+        self.proxy_redirect_enabled.store(
+            old.proxy_redirect_enabled.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.dataplane_adopted.store(true, Ordering::Relaxed);
+        if let Some(owner) = self_arc {
+            lease.adopt(owner.clone());
+        }
+        tracing::info!(
+            "F1: adopted live AF_XDP dataplane (lease adoptions={}); \
+             existing sessions keep polling through the reload",
+            lease.adoptions()
+        );
+        crate::logging::report_node_log(
+            "info".to_string(),
+            "xdp_proxy".to_string(),
+            format!(
+                "AF_XDP dataplane adopted across reload (adoptions={}); sessions preserved",
+                lease.adoptions()
+            ),
+            0,
+        );
+    }
+
+    /// F1: bookkeeping-only release for the adoption path — the AF_XDP
+    /// runtime handle, dial registry and guard were already moved to the
+    /// successor, so only sweepers, the eBPF object handle (frees the
+    /// swapped-out programs) and stale status book are cleared here.
+    /// Redirect flag clears after the lease owner repoint, which the
+    /// caller performed first.
+    #[cfg(target_os = "linux")]
+    fn release_bookkeeping_for_adoption(&self) {
+        self.stop_rule_sweeper();
+        self.stop_map_sync_worker();
+        self.stop_flow_event_consumer();
+        self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        {
             *self.ebpf.lock() = None;
         }
         self.attached.write().clear();
@@ -2280,6 +2634,9 @@ impl XdpManager {
         self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         {
+            // F1: workers may still own the queue sockets — retire the
+            // lease so they abort sessions with wire RSTs on exit.
+            self.retire_dataplane_lease();
             let disable_result = {
                 let mut ebpf = self.ebpf.lock();
                 match ebpf.as_mut() {
@@ -2501,11 +2858,11 @@ fn replace_manager_from_runtime() -> std::sync::Arc<XdpManager> {
     previous.stop_rule_sweeper();
     previous.stop_map_sync_worker();
     previous.stop_flow_event_consumer();
-    #[cfg(target_os = "linux")]
-    {
-        previous.set_dial_registry(None);
-        previous.release_dial_guard_blocking();
-    }
+    // F1: do NOT release the dial guard or registry at publish — the
+    // successor's prepare may still fail or be rejected by the dataplane
+    // compatibility gate, in which case this generation keeps serving.
+    // Guard/registry move to `release_for_handover` (real handover) or
+    // `adopt_af_xdp_runtime` (adoption).
     current.clone()
 }
 
@@ -2922,7 +3279,10 @@ pub async fn reload_from_runtime() -> anyhow::Result<()> {
     let old_manager = current;
     let manager = replace_manager_from_runtime();
     manager.sync_snapshot(&snapshot);
-    match manager.initialize_inner(Some(&old_manager)).await {
+    match manager
+        .initialize_inner(Some(&old_manager), Some(&manager))
+        .await
+    {
         Ok(()) => {
             start_rule_sweeper(&manager);
             start_flow_event_consumer(&manager);
@@ -2932,13 +3292,26 @@ pub async fn reload_from_runtime() -> anyhow::Result<()> {
         Err(err) => {
             // Roll back to the old generation. A prepare-phase failure
             // left its links live — restore bookkeeping only and never
-            // detach. A commit-phase failure may have detached the old
-            // links and pinned partial new ones: remove the partial
-            // generation's links, then re-attach the previous object so
-            // a half-committed reload does not leave the dataplane down.
+            // detach. A commit-phase failure under the atomic path may
+            // have reverted every link swap cleanly (`dataplane_restored`)
+            // — the adopted dataplane is then untouched and keeps serving.
+            // Only an unrestored commit failure needs the rebuild: remove
+            // the partial generation's links, drain the orphaned workers,
+            // then re-attach the previous object.
             let committed = manager.attach_committed.load(Ordering::Relaxed);
+            #[cfg(target_os = "linux")]
+            let dataplane_restored = manager
+                .attach_dataplane_restored
+                .load(Ordering::Relaxed);
+            #[cfg(not(target_os = "linux"))]
+            let dataplane_restored = false;
+            // Release the failed generation's handles first: under a clean
+            // revert this only drops its eBPF object (the reverted links
+            // point at the predecessor's programs); under a dirty commit
+            // it also retires any lease it managed to adopt.
+            manager.release_for_handover();
             restore_manager(old_manager.clone());
-            if committed {
+            if committed && !dataplane_restored {
                 #[cfg(target_os = "linux")]
                 if let Err(detach_err) = linux::detach(&manager.config).await {
                     tracing::warn!(
@@ -2947,14 +3320,38 @@ pub async fn reload_from_runtime() -> anyhow::Result<()> {
                 }
                 old_manager.attached.write().clear();
                 #[cfg(target_os = "linux")]
-                old_manager.ebpf.lock().take();
+                {
+                    old_manager.ebpf.lock().take();
+                    // F1: an unrestored commit failure already mutated the
+                    // live dataplane. Retire the lease so workers abort
+                    // sessions explicitly (wire RST), then wait for the
+                    // queue sockets to actually close before rebinding
+                    // them on the rebuilt dataplane.
+                    let lease = old_manager
+                        .af_xdp
+                        .lock()
+                        .as_ref()
+                        .and_then(|runtime| runtime.lease.clone());
+                    if let Some(lease) = lease {
+                        lease.retire();
+                        if !lease
+                            .wait_workers_drained(std::time::Duration::from_secs(3))
+                            .await
+                        {
+                            tracing::warn!(
+                                "XDP reload rollback: AF_XDP workers did not drain \
+                                 within 3s; socket rebind may race a still-open queue fd"
+                            );
+                        }
+                    }
+                    *old_manager.af_xdp.lock() = None;
+                }
                 if let Err(reattach_err) = old_manager.initialize().await {
                     tracing::warn!(
                         "XDP reload rollback re-attach failed: {reattach_err}"
                     );
                 }
             }
-            manager.release_for_handover();
             old_manager.persist_status_blocking();
             Err(err)
         }

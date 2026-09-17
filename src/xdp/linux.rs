@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::ffi::CString;
 use std::io::Write;
 use std::num::NonZeroU32;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use xsk_rs::config::{
     BindFlags, FrameSize, Interface, LibxdpFlags, QueueSize, SocketConfig, UmemConfig,
@@ -30,6 +30,232 @@ const AF_XDP_RX_BATCH: usize = 64;
 const AF_XDP_MAX_SOCKETS: usize = 4096;
 const AF_XDP_SOCKET_CREATE_ATTEMPTS: usize = 80;
 const AF_XDP_SOCKET_CREATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+// Raw bpf(2) commands used for atomic dataplane handover. aya keeps
+// `XdpLinkInner` crate-private, so `Xdp::attach_to_link` cannot be reached
+// with a pinned link — these wrap the stable kernel uapi directly.
+// Command numbers are fixed Linux uapi (linux/bpf.h enum bpf_cmd).
+const BPF_MAP_LOOKUP_ELEM_CMD: i32 = 1;
+const BPF_MAP_UPDATE_ELEM_CMD: i32 = 2;
+const BPF_MAP_DELETE_ELEM_CMD: i32 = 3;
+const BPF_OBJ_GET_CMD: i32 = 7;
+const BPF_PROG_GET_FD_BY_ID_CMD: i32 = 13;
+const BPF_OBJ_GET_INFO_BY_FD_CMD: i32 = 15;
+const BPF_LINK_UPDATE_CMD: i32 = 26;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BpfAttrGetId {
+    // union { start_id, prog_id, map_id, btf_id, link_id } — offset 0
+    id: u32,
+    next_id: u32,
+    open_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BpfAttrObjGet {
+    pathname: u64,
+    bpf_fd_type: u32,
+    file_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BpfAttrLinkUpdate {
+    link_fd: u32,
+    new_prog_fd: u32,
+    flags: u32,
+    old_prog_fd: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BpfAttrObjInfo {
+    fd: u32,
+    info_len: u32,
+    info: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BpfAttrMapElem {
+    map_fd: u32,
+    _pad: u32,
+    key: u64,
+    // union { value, next_key } — both are pointers at offset 16
+    value: u64,
+    flags: u64,
+}
+
+#[repr(C)]
+union BpfAttr {
+    get_id: BpfAttrGetId,
+    obj: BpfAttrObjGet,
+    link_update: BpfAttrLinkUpdate,
+    info: BpfAttrObjInfo,
+    map_elem: BpfAttrMapElem,
+    _pad: [u64; 32],
+}
+
+impl BpfAttr {
+    fn zeroed() -> Self {
+        BpfAttr { _pad: [0; 32] }
+    }
+}
+
+fn bpf_raw(cmd: i32, attr: &BpfAttr) -> std::io::Result<i32> {
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            cmd,
+            attr as *const BpfAttr,
+            std::mem::size_of::<BpfAttr>() as u32,
+        )
+    };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(ret as i32)
+    }
+}
+
+/// Open a pinned bpf object's fd via BPF_OBJ_GET — works for links and
+/// maps alike. For links this is deliberately used instead of
+/// BPF_LINK_GET_FD_BY_ID, which only exists since kernel 6.6;
+/// pinned-path obj_get works on every kernel that supports pinning.
+fn bpf_obj_get_fd(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    let c_path = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let mut attr = BpfAttr::zeroed();
+    attr.obj = BpfAttrObjGet {
+        pathname: c_path.as_ptr() as u64,
+        bpf_fd_type: 0,
+        file_flags: 0,
+    };
+    let fd = bpf_raw(BPF_OBJ_GET_CMD, &attr)?;
+    // SAFETY: the kernel returned a fresh fd for this pinned link.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+fn bpf_prog_fd_by_id(prog_id: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    let mut attr = BpfAttr::zeroed();
+    attr.get_id = BpfAttrGetId {
+        id: prog_id,
+        next_id: 0,
+        open_flags: 0,
+    };
+    let fd = bpf_raw(BPF_PROG_GET_FD_BY_ID_CMD, &attr)?;
+    // SAFETY: the kernel returned a fresh fd for this program.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+const BPF_F_REPLACE: u32 = 4;
+
+/// Atomically swap the program behind an XDP link (BPF_LINK_UPDATE). The
+/// interface never observes a no-program window; on success the previous
+/// program stays pinned until its last reference drops. `expected_fd`
+/// enables BPF_F_REPLACE: the kernel only swaps while the link still
+/// holds exactly that program, so a racing writer cannot slip a third
+/// program between our read of the pinned link and the update.
+fn bpf_link_update(
+    link_fd: std::os::fd::RawFd,
+    new_prog_fd: std::os::fd::RawFd,
+    expected_fd: Option<std::os::fd::RawFd>,
+) -> std::io::Result<()> {
+    let mut attr = BpfAttr::zeroed();
+    attr.link_update = BpfAttrLinkUpdate {
+        link_fd: link_fd as u32,
+        new_prog_fd: new_prog_fd as u32,
+        flags: if expected_fd.is_some() {
+            BPF_F_REPLACE
+        } else {
+            0
+        },
+        old_prog_fd: expected_fd.unwrap_or(0) as u32,
+    };
+    bpf_raw(BPF_LINK_UPDATE_CMD, &attr).map(|_| ())
+}
+
+/// Read a loaded program's instruction-hash tag (bpf_prog_info.tag). The
+/// tag is stable across loads, so identical eBPF text always compares
+/// equal — the tag-equality check is what lets the dispatch-table
+/// handover prove the pinned link's entry program is bytecode-identical
+/// to the new generation's `cloud_node_xdp` on kernels without
+/// BPF_LINK_UPDATE for XDP links (< 6.4).
+fn bpf_prog_tag_by_fd(prog_fd: std::os::fd::RawFd) -> std::io::Result<u64> {
+    // bpf_prog_info: type u32 @0, id u32 @4, tag [u8;8] @8.
+    let mut buf = [0u8; 64];
+    let mut attr = BpfAttr::zeroed();
+    attr.info = BpfAttrObjInfo {
+        fd: prog_fd as u32,
+        info_len: buf.len() as u32,
+        info: buf.as_mut_ptr() as u64,
+    };
+    bpf_raw(BPF_OBJ_GET_INFO_BY_FD_CMD, &attr)?;
+    Ok(u64::from_be_bytes(buf[8..16].try_into().unwrap()))
+}
+
+/// BPF_MAP_LOOKUP_ELEM on a u32-keyed map (XDP_DISPATCH prog array).
+/// Prog-array lookups from userspace return the program ID, not an fd.
+fn bpf_map_lookup_u32(map_fd: std::os::fd::RawFd, key: u32) -> std::io::Result<Option<u32>> {
+    let mut value = 0u32;
+    let mut attr = BpfAttr::zeroed();
+    attr.map_elem = BpfAttrMapElem {
+        map_fd: map_fd as u32,
+        _pad: 0,
+        key: &key as *const u32 as u64,
+        value: &mut value as *mut u32 as u64,
+        flags: 0,
+    };
+    match bpf_raw(BPF_MAP_LOOKUP_ELEM_CMD, &attr) {
+        Ok(_) => Ok(Some(value)),
+        Err(err) if err.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// BPF_MAP_UPDATE_ELEM writing a u32 value (a prog fd for prog arrays).
+fn bpf_map_update_u32(
+    map_fd: std::os::fd::RawFd,
+    key: u32,
+    value: u32,
+) -> std::io::Result<()> {
+    let mut attr = BpfAttr::zeroed();
+    attr.map_elem = BpfAttrMapElem {
+        map_fd: map_fd as u32,
+        _pad: 0,
+        key: &key as *const u32 as u64,
+        value: &value as *const u32 as u64,
+        flags: 0,
+    };
+    bpf_raw(BPF_MAP_UPDATE_ELEM_CMD, &attr).map(|_| ())
+}
+
+/// BPF_MAP_DELETE_ELEM on a u32-keyed map. On a prog array this clears
+/// the slot back to NULL.
+fn bpf_map_delete_u32(map_fd: std::os::fd::RawFd, key: u32) -> std::io::Result<()> {
+    let mut attr = BpfAttr::zeroed();
+    attr.map_elem = BpfAttrMapElem {
+        map_fd: map_fd as u32,
+        _pad: 0,
+        key: &key as *const u32 as u64,
+        value: 0,
+        flags: 0,
+    };
+    bpf_raw(BPF_MAP_DELETE_ELEM_CMD, &attr).map(|_| ())
+}
+
+/// Inputs the atomic handover path needs from the adopted dataplane.
+pub struct AtomicReattach {
+    /// Queue-withdrawal history from the adopted dataplane — a queue that
+    /// faulted out must stay withdrawn after the generation swap (EN-05).
+    pub xsk_withdrawn: std::collections::HashSet<(u32, u32)>,
+    /// Set when a mid-commit failure reverted every swapped link back to
+    /// the previous program — the adopted dataplane is then intact and
+    /// the reload rollback must NOT detach/retire/rebuild it.
+    pub dataplane_restored: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
 pub struct AttachedProgram {
     pub interfaces: BTreeSet<String>,
@@ -52,6 +278,12 @@ pub struct AfXdpRuntimeHandle {
     queues: Vec<AfXdpQueueHandle>,
     pub statuses: Vec<XdpQueueStatus>,
     last_status_refresh_at: Option<std::time::Instant>,
+    /// F1: lease shared with the reactor worker threads. Created when the
+    /// proxy bridge spawns its workers; `None` before that. Adopted
+    /// wholesale by the next manager generation when a reload is
+    /// dataplane-compatible — the sockets, UMEMs and worker threads are
+    /// never dropped across such a reload.
+    pub(crate) lease: Option<std::sync::Arc<AfXdpDataplaneLease>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -373,6 +605,7 @@ pub fn prepare_af_xdp_sockets(config: &XdpConfig) -> anyhow::Result<AfXdpRuntime
         queues,
         statuses,
         last_status_refresh_at: None,
+        lease: None,
     })
 }
 
@@ -600,11 +833,20 @@ fn create_af_xdp_queue(
 /// and pin the new links. A failure anywhere in phase 1 leaves the old
 /// program running; a failure in phase 2 surfaces as an attach error with
 /// the dataplane on the kernel path (bounded commit window, ms-scale).
+/// `atomic` selects the F1 connection-preserving handover commit: instead
+/// of detach→attach (which leaves a no-program window and drops the
+/// AF_XDP socket map contents), the dispatch table is repointed to the
+/// newly verified subprograms, maps are rewritten fill-then-prune, and
+/// each interface link swaps program in place via BPF_LINK_UPDATE. The
+/// caller must only pass `Some` after the dataplane-compatibility gate
+/// accepted the reload — the running program keeps serving adopted
+/// sockets throughout.
 pub async fn attach(
     config: &XdpConfig,
     object_path: Option<&Path>,
     purge_stale_state: bool,
     commit_started: Option<&std::sync::atomic::AtomicBool>,
+    atomic: Option<&AtomicReattach>,
 ) -> anyhow::Result<AttachedProgram> {
     std::fs::create_dir_all(xdp_bpf_pin_dir())
         .map_err(|err| {
@@ -666,6 +908,17 @@ pub async fn attach(
     loader.map_pin_path(
         "XDP_COUNTERS",
         Path::new(xdp_bpf_pin_dir()).join("XDP_COUNTERS"),
+    );
+    // F1: the XSK socket table must be shared across generations. On an
+    // adopted reload the successor's freshly loaded dispatch workers
+    // resolve redirect targets through this map — if it stayed a
+    // per-object instance it would be empty (nobody re-registers adopted
+    // sockets) and every inbound frame would drop while TX kept flowing.
+    // Pinning shares the live socket registrations; a closed socket's
+    // entry is removed by the kernel, so the pin never holds a dead fd.
+    loader.map_pin_path(
+        "XDP_XSKS",
+        Path::new(xdp_bpf_pin_dir()).join("XDP_XSKS"),
     );
     // EN-10 takeover contract: flow state and the lifecycle feedback channel
     // are pinned so a reload/restart adopts existing flows instead of
@@ -765,15 +1018,17 @@ pub async fn attach(
     if let Some(flag) = commit_started {
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
     }
-    detach(config).await?;
-    // detach() removed the XDP_DISPATCH pin; our object still holds the
-    // map fd (reused during load), so re-pin it — pinned links must keep a
-    // live tail-call table after a one-shot `xdp attach` exits.
-    if let Some(map) = ebpf.map("XDP_DISPATCH") {
-        let dispatch_pin = Path::new(xdp_bpf_pin_dir()).join("XDP_DISPATCH");
-        map.pin(&dispatch_pin).map_err(|err| {
-            anyhow::anyhow!("re-pin XDP_DISPATCH to {}: {err}", dispatch_pin.display())
-        })?;
+    if atomic.is_none() {
+        detach(config).await?;
+        // detach() removed the XDP_DISPATCH pin; our object still holds the
+        // map fd (reused during load), so re-pin it — pinned links must keep a
+        // live tail-call table after a one-shot `xdp attach` exits.
+        if let Some(map) = ebpf.map("XDP_DISPATCH") {
+            let dispatch_pin = Path::new(xdp_bpf_pin_dir()).join("XDP_DISPATCH");
+            map.pin(&dispatch_pin).map_err(|err| {
+                anyhow::anyhow!("re-pin XDP_DISPATCH to {}: {err}", dispatch_pin.display())
+            })?;
+        }
     }
     let prog_pin_dir = Path::new(xdp_bpf_pin_dir()).join("progs");
     std::fs::create_dir_all(&prog_pin_dir)
@@ -813,8 +1068,47 @@ pub async fn attach(
             anyhow::anyhow!("pin {name} to {}: {err}", pin_path.display())
         })?;
     }
+    let mut dispatch_prev: Vec<(u32, Option<u32>)> = Vec::new();
+    // Owned fd for the pinned XDP_DISPATCH map — held for the revert path
+    // in atomic_link_swap; closed when this function returns.
+    let mut dispatch_map_fd: Option<std::os::fd::OwnedFd> = None;
     match ebpf.map_mut("XDP_DISPATCH") {
         Some(map) => {
+            if atomic.is_some() {
+                // F1: capture the previous generation's slot contents
+                // before overwriting — a mid-commit failure restores the
+                // dispatch table byte-for-byte so the adopted dataplane
+                // returns to a byte-identical state. The fd comes from
+                // the pin (the same kernel object `map` wraps) because
+                // aya keeps the inner MapData private.
+                let pin = Path::new(xdp_bpf_pin_dir()).join("XDP_DISPATCH");
+                let capture = bpf_obj_get_fd(&pin).and_then(|fd| {
+                    let mut prev = Vec::with_capacity(dispatch_fds.len());
+                    for (slot, _) in &dispatch_fds {
+                        prev.push((*slot, bpf_map_lookup_u32(fd.as_raw_fd(), *slot)?));
+                    }
+                    Ok((fd, prev))
+                });
+                match capture {
+                    Ok((fd, prev)) => {
+                        dispatch_prev = prev;
+                        dispatch_map_fd = Some(fd);
+                    }
+                    Err(err) => {
+                        // Nothing has been mutated yet — dispatch slots,
+                        // links and synced maps are all still the old
+                        // generation's, so mark the dataplane intact and
+                        // let the caller keep it serving.
+                        if let Some(a) = atomic {
+                            a.dataplane_restored
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        return Err(anyhow::anyhow!(
+                            "capture XDP_DISPATCH slots for revert: {err}"
+                        ));
+                    }
+                }
+            }
             let mut table = aya::maps::ProgramArray::try_from(map)?;
             let mut missing = false;
             for (slot, fd) in &dispatch_fds {
@@ -843,62 +1137,85 @@ pub async fn attach(
         }
     }
     let (owner_epoch, imported_flows) = adopt_flow_state(&mut ebpf)?;
-    sync_interface_policy(&mut ebpf, config)?;
-    sync_local_ip_maps(&mut ebpf, config)?;
-    sync_proxy_ports(&mut ebpf, config, false)?;
-    sync_xsk_indices(&mut ebpf, config, false, &Default::default())?;
-    zero_counters(&mut ebpf)?;
+    if let Some(atomic) = atomic {
+        // F1 adopted dataplane: the running program keeps serving the
+        // adopted AF_XDP sockets throughout. Map rewrites are
+        // fill-then-prune (no missing-key window), redirect maps stay
+        // active, and counters are preserved across the generation swap.
+        sync_interface_policy(&mut ebpf, config)?;
+        sync_local_ip_maps(&mut ebpf, config)?;
+        sync_proxy_ports(&mut ebpf, config, true)?;
+        sync_xsk_indices(&mut ebpf, config, true, &atomic.xsk_withdrawn)?;
+    } else {
+        sync_interface_policy(&mut ebpf, config)?;
+        sync_local_ip_maps(&mut ebpf, config)?;
+        sync_proxy_ports(&mut ebpf, config, false)?;
+        sync_xsk_indices(&mut ebpf, config, false, &Default::default())?;
+        zero_counters(&mut ebpf)?;
+    }
     let program: &mut aya::programs::Xdp = ebpf
         .program_mut("cloud_node_xdp")
         .ok_or_else(|| anyhow::anyhow!("missing eBPF program cloud_node_xdp"))?
         .try_into()?;
-    for interface in &config.interfaces {
-        // The commit-phase detach just released the previous link; kernel
-        // link teardown can lag the pin removal by an RCU grace period, so
-        // retry EBUSY briefly rather than racing bpf_link_create once.
-        let mut attach_err = None;
-        let mut link_id = None;
-        for _ in 0..20 {
-            match program.attach(&interface.name, mode) {
-                Ok(id) => {
-                    link_id = Some(id);
-                    break;
-                }
-                Err(err) => {
-                    let busy = match &err {
-                        aya::programs::ProgramError::SyscallError(e) => {
-                            e.io_error.raw_os_error() == Some(libc::EBUSY)
-                        }
-                        _ => false,
-                    };
-                    attach_err = Some(err);
-                    if !busy {
+    if let Some(atomic) = atomic {
+        atomic_link_swap(
+            program,
+            config,
+            mode,
+            &mut attached,
+            atomic,
+            dispatch_map_fd.as_ref(),
+            &dispatch_prev,
+        )?;
+    } else {
+        for interface in &config.interfaces {
+            // The commit-phase detach just released the previous link; kernel
+            // link teardown can lag the pin removal by an RCU grace period, so
+            // retry EBUSY briefly rather than racing bpf_link_create once.
+            let mut attach_err = None;
+            let mut link_id = None;
+            for _ in 0..20 {
+                match program.attach(&interface.name, mode) {
+                    Ok(id) => {
+                        link_id = Some(id);
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    Err(err) => {
+                        let busy = match &err {
+                            aya::programs::ProgramError::SyscallError(e) => {
+                                e.io_error.raw_os_error() == Some(libc::EBUSY)
+                            }
+                            _ => false,
+                        };
+                        attach_err = Some(err);
+                        if !busy {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
                 }
             }
+            let link_id = link_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "attach XDP to {} after bounded EBUSY wait: {}",
+                    interface.name,
+                    attach_err.map(|e| e.to_string()).unwrap_or_default()
+                )
+            })?;
+            let link = program.take_link(link_id)?;
+            let fd_link: aya::programs::links::FdLink = link.try_into().map_err(|err| {
+                anyhow::anyhow!(
+                    "kernel attached {} through a legacy XDP link that cannot be pinned: {err}",
+                    interface.name
+                )
+            })?;
+            let pin_path = link_pin_path(&interface.name);
+            if pin_path.exists() {
+                std::fs::remove_file(&pin_path)?;
+            }
+            fd_link.pin(&pin_path)?;
+            attached.insert(interface.name.clone());
         }
-        let link_id = link_id.ok_or_else(|| {
-            anyhow::anyhow!(
-                "attach XDP to {} after bounded EBUSY wait: {}",
-                interface.name,
-                attach_err.map(|e| e.to_string()).unwrap_or_default()
-            )
-        })?;
-        let link = program.take_link(link_id)?;
-        let fd_link: aya::programs::links::FdLink = link.try_into().map_err(|err| {
-            anyhow::anyhow!(
-                "kernel attached {} through a legacy XDP link that cannot be pinned: {err}",
-                interface.name
-            )
-        })?;
-        let pin_path = link_pin_path(&interface.name);
-        if pin_path.exists() {
-            std::fs::remove_file(&pin_path)?;
-        }
-        fd_link.pin(&pin_path)?;
-        attached.insert(interface.name.clone());
     }
     Ok(AttachedProgram {
         interfaces: attached,
@@ -907,6 +1224,193 @@ pub async fn attach(
         imported_flows,
         effective_state_tables: effective_config.state_tables,
     })
+}
+
+/// F1 atomic handover: point the running dataplane at the new
+/// generation's programs without ever detaching the links.
+///
+/// Per interface with a pinned link:
+/// 1. Try `BPF_LINK_UPDATE` (kernel ≥ 6.4): swaps the program behind the
+///    link in place, no no-program window, and also installs the new
+///    entry program.
+/// 2. On kernels without XDP link update (EINVAL from the missing
+///    `.update_prog` op, e.g. 6.1), fall back to a bytecode check: if the
+///    pinned link's entry program tag equals the new `cloud_node_xdp`
+///    tag, the dispatcher is instruction-identical and the
+///    already-updated XDP_DISPATCH slots carry the entire semantic
+///    change — keeping the old entry attached is correct. If the tags
+///    differ the entry logic genuinely changed and a hot handover is
+///    impossible on this kernel: the reload is rejected explicitly
+///    (caller keeps the old dataplane serving).
+///
+/// `dispatch_prev`/`dispatch_map_fd` describe the XDP_DISPATCH contents
+/// before this generation rewrote them — a mid-commit failure restores
+/// every captured slot so the adopted dataplane returns byte-identical.
+/// A mid-swap failure also reverts the interfaces already swapped via
+/// link update to their previous programs so a partial commit never
+/// leaves mixed generations running.
+fn atomic_link_swap(
+    program: &mut aya::programs::Xdp,
+    config: &XdpConfig,
+    mode: aya::programs::XdpMode,
+    attached: &mut BTreeSet<String>,
+    atomic: &AtomicReattach,
+    dispatch_map_fd: Option<&std::os::fd::OwnedFd>,
+    dispatch_prev: &[(u32, Option<u32>)],
+) -> anyhow::Result<()> {
+    let new_prog_fd = program
+        .fd()?
+        .try_clone()
+        .map_err(|err| anyhow::anyhow!("clone cloud_node_xdp fd for link update: {err}"))?;
+    let new_tag = bpf_prog_tag_by_fd(new_prog_fd.as_fd().as_raw_fd())
+        .map_err(|err| anyhow::anyhow!("read new cloud_node_xdp program tag: {err}"))?;
+    // (interface, old_prog_id): only links that were truly swapped via
+    // BPF_LINK_UPDATE need a link-level revert — tag-adopted interfaces
+    // are covered by the dispatch-table restore.
+    let mut swapped: Vec<(String, u32)> = Vec::new();
+    let mut tag_adopted = 0usize;
+
+    let revert = |swapped: &[(String, u32)]| -> bool {
+        let mut failed = false;
+        for (iface, old_prog_id) in swapped {
+            let r = bpf_prog_fd_by_id(*old_prog_id).and_then(|old_fd| {
+                let link_fd = bpf_obj_get_fd(&link_pin_path(iface))?;
+                bpf_link_update(link_fd.as_raw_fd(), old_fd.as_raw_fd(), None)
+            });
+            if let Err(revert_err) = r {
+                failed = true;
+                tracing::error!("F1 atomic swap rollback failed for {iface}: {revert_err}");
+            }
+        }
+        if let Some(map_fd) = dispatch_map_fd {
+            let map_fd = map_fd.as_raw_fd();
+            for (slot, old_id) in dispatch_prev.iter().rev() {
+                let r = match old_id {
+                    Some(id) => bpf_prog_fd_by_id(*id).and_then(|fd| {
+                        bpf_map_update_u32(map_fd, *slot, fd.as_raw_fd() as u32)
+                    }),
+                    None => bpf_map_delete_u32(map_fd, *slot),
+                };
+                if let Err(revert_err) = r {
+                    failed = true;
+                    tracing::error!(
+                        "F1 dispatch-table rollback failed for slot {slot}: {revert_err}"
+                    );
+                }
+            }
+        }
+        failed
+    };
+
+    for interface in &config.interfaces {
+        let pin_path = link_pin_path(&interface.name);
+        if !pin_path.exists() {
+            // Newly configured interface — no adopted sessions exist on
+            // it, so a cold attach is safe.
+            let link_id = program.attach(&interface.name, mode).map_err(|err| {
+                anyhow::anyhow!("attach XDP to {} (new interface): {err}", interface.name)
+            })?;
+            let link = program.take_link(link_id)?;
+            let fd_link: aya::programs::links::FdLink = link.try_into().map_err(|err| {
+                anyhow::anyhow!(
+                    "kernel attached {} through a legacy XDP link that cannot be pinned: {err}",
+                    interface.name
+                )
+            })?;
+            fd_link.pin(&pin_path)?;
+            attached.insert(interface.name.clone());
+            continue;
+        }
+        let swap = (|| -> anyhow::Result<Option<u32>> {
+            let pinned = PinnedLink::from_pin(&pin_path).map_err(|err| {
+                anyhow::anyhow!("open pinned link {}: {err}", pin_path.display())
+            })?;
+            let fd_link: aya::programs::links::FdLink = pinned.into();
+            let info = fd_link
+                .info()
+                .map_err(|err| anyhow::anyhow!("link info {}: {err}", pin_path.display()))?;
+            let old_prog_id = info.program_id();
+            let link_fd = bpf_obj_get_fd(&pin_path).map_err(|err| {
+                anyhow::anyhow!("fd for pinned link {}: {err}", pin_path.display())
+            })?;
+            // BPF_F_REPLACE: the kernel verifies the link still runs the
+            // program we read a moment ago before swapping.
+            let expected = bpf_prog_fd_by_id(old_prog_id).map_err(|err| {
+                anyhow::anyhow!("fd for current program of {}: {err}", interface.name)
+            })?;
+            match bpf_link_update(
+                link_fd.as_raw_fd(),
+                new_prog_fd.as_fd().as_raw_fd(),
+                Some(expected.as_raw_fd()),
+            ) {
+                Ok(()) => Ok(Some(old_prog_id)),
+                Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+                    // Kernels before 6.4 expose XDP links without an
+                    // update_prog op. The link stays attached to the old
+                    // entry program; adoption is still correct if and
+                    // only if that entry is bytecode-identical to the
+                    // new one — the XDP_DISPATCH slots (already updated
+                    // above) carry every worker-program change.
+                    let old_tag = bpf_prog_tag_by_fd(expected.as_raw_fd()).map_err(|e| {
+                        anyhow::anyhow!("read old entry program tag on {}: {e}", interface.name)
+                    })?;
+                    if old_tag == new_tag {
+                        tracing::info!(
+                            "F1 handover on {}: kernel lacks XDP BPF_LINK_UPDATE; \
+                             entry program tag matches (0x{new_tag:016x}) — dispatch-table swap adopted",
+                            interface.name
+                        );
+                        Ok(None)
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "XDP dispatcher program changed across reload (old tag \
+                             0x{old_tag:016x}, new 0x{new_tag:016x}) and this kernel has \
+                             no XDP BPF_LINK_UPDATE (<6.4) — a hot handover cannot retarget \
+                             the pinned link on {}; rejecting reload, the running dataplane \
+                             stays on the previous generation",
+                            interface.name
+                        ))
+                    }
+                }
+                Err(err) => Err(anyhow::anyhow!(
+                    "BPF_LINK_UPDATE on {} (link id {}): {err}",
+                    interface.name,
+                    info.id()
+                )),
+            }
+        })();
+        match swap {
+            Ok(Some(old_prog_id)) => {
+                swapped.push((interface.name.clone(), old_prog_id));
+                attached.insert(interface.name.clone());
+            }
+            Ok(None) => {
+                tag_adopted += 1;
+                attached.insert(interface.name.clone());
+            }
+            Err(err) => {
+                // Revert already-swapped links and restore the captured
+                // dispatch slots. When everything reverts cleanly the
+                // adopted dataplane is byte-identical to before the
+                // commit — links still point at the old programs,
+                // dispatch slots hold the old workers, XSK maps were
+                // never cleared — and the caller's rollback keeps the
+                // old generation serving instead of rebuilding it.
+                if !revert(&swapped) {
+                    atomic
+                        .dataplane_restored
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                return Err(err);
+            }
+        }
+    }
+    tracing::info!(
+        "F1 atomic dataplane handover: {} interface link(s) via BPF_LINK_UPDATE, \
+         {tag_adopted} adopted via dispatch-table swap (kernel lacks XDP link update)",
+        swapped.len()
+    );
+    Ok(())
 }
 
 pub async fn detach(config: &XdpConfig) -> anyhow::Result<()> {
@@ -1293,12 +1797,41 @@ fn zero_counters(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write `desired` into a hash map without a missing-key window: new and
+/// updated entries are inserted first, then keys absent from `desired`
+/// are removed. A live dataplane never observes a gap where a kept key
+/// is absent (contrast: clear-then-fill drops every entry for the whole
+/// rewrite). An empty `desired` set prunes everything — equivalent to
+/// clearing.
+fn fill_then_prune<K, V>(
+    map: &mut AyaHashMap<&mut aya::maps::MapData, K, V>,
+    desired: &std::collections::HashMap<K, V>,
+) -> anyhow::Result<()>
+where
+    K: aya::Pod + Eq + std::hash::Hash,
+    V: aya::Pod,
+{
+    for (key, value) in desired {
+        map.insert(*key, *value, 0)?;
+    }
+    let stale = map
+        .keys()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|key| !desired.contains_key(key))
+        .collect::<Vec<_>>();
+    for key in stale {
+        map.remove(&key)?;
+    }
+    Ok(())
+}
+
 fn sync_interface_policy(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Result<()> {
     let map = ebpf
         .map_mut("XDP_INTERFACE_POLICY")
         .ok_or_else(|| anyhow::anyhow!("missing map XDP_INTERFACE_POLICY"))?;
     let mut policies = AyaHashMap::<_, u32, XdpInterfacePolicy>::try_from(map)?;
-    clear_hash_map(&mut policies)?;
+    let mut desired = std::collections::HashMap::new();
     for interface in &config.interfaces {
         let ifindex = ifindex_from_name(&interface.name)?;
         let policy = XdpInterfacePolicy {
@@ -1319,9 +1852,9 @@ fn sync_interface_policy(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Re
             },
             frame_size: interface.frame_size,
         };
-        policies.insert(ifindex, policy, 0)?;
+        desired.insert(ifindex, policy);
     }
-    Ok(())
+    fill_then_prune(&mut policies, &desired)
 }
 
 /// XDP_LOCAL_* value: bit0 marks presence; bits[2:1] carry the per-VIP
@@ -1357,19 +1890,19 @@ fn sync_local_ip_maps(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Resul
             .map_mut("XDP_LOCAL_V4")
             .ok_or_else(|| anyhow::anyhow!("missing map XDP_LOCAL_V4"))?;
         let mut map = AyaHashMap::<_, XdpLocalIpv4Key, u32>::try_from(map)?;
-        clear_hash_map(&mut map)?;
+        let mut desired = std::collections::HashMap::new();
         for interface in &config.interfaces {
             let ifindex = ifindex_from_name(&interface.name)?;
             for ip in &interface.local_ips {
                 if let IpAddr::V4(addr) = ip {
-                    map.insert(
+                    desired.insert(
                         XdpLocalIpv4Key::new(ifindex, u32::from_be_bytes(addr.octets())),
                         local_ip_flags(interface, ip),
-                        0,
-                    )?;
+                    );
                 }
             }
         }
+        fill_then_prune(&mut map, &desired)?;
     }
 
     {
@@ -1377,19 +1910,19 @@ fn sync_local_ip_maps(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Resul
             .map_mut("XDP_LOCAL_V6")
             .ok_or_else(|| anyhow::anyhow!("missing map XDP_LOCAL_V6"))?;
         let mut map = AyaHashMap::<_, XdpLocalIpv6Key, u32>::try_from(map)?;
-        clear_hash_map(&mut map)?;
+        let mut desired = std::collections::HashMap::new();
         for interface in &config.interfaces {
             let ifindex = ifindex_from_name(&interface.name)?;
             for ip in &interface.local_ips {
                 if let IpAddr::V6(addr) = ip {
-                    map.insert(
+                    desired.insert(
                         XdpLocalIpv6Key::new(ifindex, addr.octets()),
                         local_ip_flags(interface, ip),
-                        0,
-                    )?;
+                    );
                 }
             }
         }
+        fill_then_prune(&mut map, &desired)?;
     }
 
     Ok(())
@@ -1404,25 +1937,23 @@ fn sync_proxy_ports(
         .map_mut("XDP_PROXY_PORTS")
         .ok_or_else(|| anyhow::anyhow!("missing map XDP_PROXY_PORTS"))?;
     let mut map = AyaHashMap::<_, XdpPortProtoKey, u32>::try_from(map)?;
-    clear_hash_map(&mut map)?;
-    if !dataplane_active {
-        return Ok(());
-    }
-    for port in &config.proxy.ports {
-        if !xdp_protocol_dataplane_supported(&port.protocol) {
-            continue;
+    let mut desired = std::collections::HashMap::new();
+    if dataplane_active {
+        for port in &config.proxy.ports {
+            if !xdp_protocol_dataplane_supported(&port.protocol) {
+                continue;
+            }
+            desired.insert(
+                XdpPortProtoKey {
+                    port_be: port.port.to_be(),
+                    proto: xdp_ip_proto(&port.protocol),
+                    _pad: 0,
+                },
+                1,
+            );
         }
-        map.insert(
-            XdpPortProtoKey {
-                port_be: port.port.to_be(),
-                proto: xdp_ip_proto(&port.protocol),
-                _pad: 0,
-            },
-            1,
-            0,
-        )?;
     }
-    Ok(())
+    fill_then_prune(&mut map, &desired)
 }
 
 fn sync_xsk_indices(
@@ -1435,19 +1966,18 @@ fn sync_xsk_indices(
         .map_mut("XDP_XSK_INDEX")
         .ok_or_else(|| anyhow::anyhow!("missing map XDP_XSK_INDEX"))?;
     let mut map = AyaHashMap::<_, XdpQueueKey, u32>::try_from(map)?;
-    clear_hash_map(&mut map)?;
-    if !dataplane_active {
-        return Ok(());
-    }
-    for entry in xsk_map_entries(config)? {
-        // EN-05: never resurrect a queue-scoped withdrawal — the faulted
-        // queue's traffic must keep taking the explicit dataplane fallback.
-        if withdrawn.contains(&(entry.ifindex, entry.queue)) {
-            continue;
+    let mut desired = std::collections::HashMap::new();
+    if dataplane_active {
+        for entry in xsk_map_entries(config)? {
+            // EN-05: never resurrect a queue-scoped withdrawal — the faulted
+            // queue's traffic must keep taking the explicit dataplane fallback.
+            if withdrawn.contains(&(entry.ifindex, entry.queue)) {
+                continue;
+            }
+            desired.insert(XdpQueueKey::new(entry.ifindex, entry.queue), entry.index);
         }
-        map.insert(XdpQueueKey::new(entry.ifindex, entry.queue), entry.index, 0)?;
     }
-    Ok(())
+    fill_then_prune(&mut map, &desired)
 }
 
 /// EN-05 queue-scoped withdrawal: remove one queue's XSK_INDEX entry and

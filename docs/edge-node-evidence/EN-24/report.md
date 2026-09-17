@@ -206,5 +206,62 @@ XDP drv/proxy, AF_XDP q0       TCP/UDP echo :18080/:18081 + HTTP
 EN-20/21/22 欠下的真实流量验证已补齐：外拨、OUT_CT、双端 socket、
 无 RST、detach/reattach、守卫生命周期、ICMP/PTB、双栈协议矩阵、
 Cubic 同轨迹对照全部有 wire/计数器级证据。唯一阻塞性发现为 F1
-reload 存量会话静默冻结，已按合同显式上报，待用户裁决修复方向
-（迁移 vs 明确终止语义）。
+reload 存量会话静默冻结，已按合同显式上报。
+
+## 附录 A — F1 跨代保连接实现与复验（本轮新增）
+
+用户裁决方向 (a)：连接保留式跨代移交。实现与复验结果如下。
+
+### 实现
+
+- **Lease 收养**：`AfXdpDataplaneLease` 由运行时持有、worker 共享；
+  reload commit 后新代 `adopt_af_xdp_runtime` 整体接管
+  runtime/registry/guard/withdrawn 状态，再 `lease.adopt(new_owner)`
+  换主。worker 退出门改为 `lease.is_retired()`——publish 换代不再杀
+  worker。
+- **兼容门禁**：`dataplane_shape_compatible` 比较 effective 数据面
+  形状（attach_mode/对象覆盖/解析后 stateTables/上游设置/接口/队列/
+  CPU）；不兼容在 commit 前显式拒绝，旧数据面继续服务。
+- **原子换 prog**：`BPF_LINK_UPDATE` + `BPF_F_REPLACE`（≥6.4）。
+  **6.1 无 XDP link_update op（实测 EINVAL）→ tag-fallback**：对比
+  pinned link 当前 prog 与新对象 `cloud_node_xdp` 的 insn hash tag，
+  相等即 dispatcher 字节码一致 → XDP_DISPATCH 槽位热换承担全部
+  worker 变更；不等则显式拒绝 reload（防语义静默漂移）。
+- **XDP_XSKS pin 共享**（关键修复）：XSKS 原为每代私有实例——收养
+  后新 dispatch worker 读新实例（空）→ RX 全灭、TX 存活、会话
+  RTO 假活。现 pin 至 `pin_dir/XDP_XSKS`，跨代共享活 socket 注册；
+  内核在 socket 关闭时自动清项，无死 fd 驻留。
+- **fill-then-prune** 统一所有 sync（消灭 missing-key 窗口）；
+  dispatch 槽位先捕获旧值再覆写，失败时逐槽恢复 +
+  `dataplane_restored` 标记 → 干净回滚不杀旧代；脏失败走
+  retire+drain+重建。worker 退出时显式 wire RST（`abort_all_sessions`）。
+
+### 复验（devin-build-90，kernel 6.1.0-41，drv attach）
+
+`xdp dial-smoke --reload-at-ms 5000 --payload-bytes 1000
+--send-interval-ms 500 --duration-ms 40000`（`dial-f1-v8.json` +
+`f1-peer3.pcap`）：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| sent/received | 冻结于 42000 | **74000/74000 全回声** |
+| reload 窗口 | publish 即断流 | wire 连续无断点 |
+| 新代状态 | fallback attach EINVAL | proxyReady/redirect/guard/xskReady=1 全绿 |
+| ioError | null（假活僵尸） | null（真活） |
+| wire RST | 0 | 0（仅进程退出时 1 个退役 RST，符合合同） |
+
+- reload 窗内观察到 ~3.4s 发送间隔拉长——smoke 单任务内联 poll
+  reload future 所致（应用层缓冲，TCP 无丢包）；daemon 中 reload 在
+  独立任务执行，无此效应。
+- dispatch-only 收养日志：
+  `entry program tag matches — dispatch-table swap adopted`。
+- `cargo test --lib`（Linux）：**757 pass / 0 fail**；
+  macOS `cargo test`：716 pass / 0 fail / 2 ignored。
+
+### 残余限制
+
+- 内核 <6.4 且 dispatcher 字节码变更的 reload 会被显式拒绝（数据面
+  换代需重启节点）；6.4+ 走 link_update 无此限制。
+- 不兼容形状 reload（队列/接口/对象变更）按合同显式拒绝。
+- `xdp stop`（新进程）不拆既有 guard——孤儿再认领模型，fail-closed
+  可接受，建议登记清理入口。

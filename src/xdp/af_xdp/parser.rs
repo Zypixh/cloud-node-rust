@@ -3,6 +3,11 @@ use super::*;
 pub fn parse_l4_packet(frame: &[u8]) -> Option<AfXdpL4Packet> {
     let (link, l3_offset) = parse_link_meta(frame)?;
     let ethertype = link.ethertype;
+    // AF_XDP RX has no checksum metadata — verify wire checksums in
+    // software before the frame is trusted (see ipv4_header_checksum_ok).
+    if ethertype == ETHERTYPE_IPV4 && !ipv4_header_checksum_ok(frame, l3_offset) {
+        return None;
+    }
     match ethertype {
         ETHERTYPE_IPV4 => parse_ipv4_l4(frame, l3_offset, link),
         ETHERTYPE_IPV6 => parse_ipv6_l4(frame, l3_offset, link),
@@ -18,6 +23,11 @@ pub fn parse_proxy_frame(
     frame: &[u8],
 ) -> Option<AfXdpProxyFrame> {
     let (link, l3_offset) = parse_link_meta(frame)?;
+    // Same RX integrity gate as parse_l4_packet: reject frames whose IPv4
+    // header checksum is corrupt before any tuple is trusted.
+    if link.ethertype == ETHERTYPE_IPV4 && !ipv4_header_checksum_ok(frame, l3_offset) {
+        return None;
+    }
     let protocol = transport_protocol_from_frame(frame, l3_offset, link.ethertype)?;
     let route = AfXdpRouteMeta {
         interface: interface.into(),
@@ -27,6 +37,12 @@ pub fn parse_proxy_frame(
     match protocol {
         IP_PROTO_TCP => {
             let (_, ip_packet) = extract_ip_frame(frame)?;
+            // RX integrity gate: verify the TCP checksum before any flow
+            // key or session state is derived from a corrupt segment.
+            let (source, destination, l4_offset) = ip_l4_span(&ip_packet)?;
+            if !tcp_checksum_ok(source, destination, &ip_packet[l4_offset..]) {
+                return None;
+            }
             let flow = tcp_flow_key_from_ip_packet(&ip_packet)?;
             Some(AfXdpProxyFrame::Tcp {
                 route,
@@ -37,6 +53,38 @@ pub fn parse_proxy_frame(
         IP_PROTO_UDP => {
             let packet = parse_l4_packet(frame)?;
             Some(AfXdpProxyFrame::Udp { route, packet })
+        }
+        _ => None,
+    }
+}
+
+/// Locate (source, destination, l4_offset) inside a bare IP packet — the
+/// TCP checksum needs the pseudo-header addresses plus the segment start,
+/// which for v6 is behind the extension-header chain.
+fn ip_l4_span(ip_packet: &[u8]) -> Option<(IpAddr, IpAddr, usize)> {
+    match ip_packet.first()? >> 4 {
+        4 => {
+            let base = ip_packet.get(..IPV4_MIN_HEADER_LEN)?;
+            let ihl = usize::from(base[0] & 0x0f) * 4;
+            if ihl < IPV4_MIN_HEADER_LEN || ip_packet.len() < ihl {
+                return None;
+            }
+            Some((
+                IpAddr::V4(Ipv4Addr::new(base[12], base[13], base[14], base[15])),
+                IpAddr::V4(Ipv4Addr::new(base[16], base[17], base[18], base[19])),
+                ihl,
+            ))
+        }
+        6 => {
+            let base = ip_packet.get(..IPV6_HEADER_LEN)?;
+            let source =
+                IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&base[8..24]).ok()?));
+            let destination =
+                IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&base[24..40]).ok()?));
+            let packet_end = ip_packet.len();
+            let (_, l4_offset) =
+                ipv6_transport_offset(ip_packet, base[6], IPV6_HEADER_LEN, packet_end)?;
+            Some((source, destination, l4_offset))
         }
         _ => None,
     }
@@ -193,6 +241,7 @@ pub struct AfXdpIcmpError {
 /// accepted; echo/info messages return `None` and stay on the kernel
 /// path (eBPF only redirects inner-tuple matches, but the userspace
 /// parse is the authoritative gate).
+#[cfg(any(test, target_os = "linux"))]
 pub fn parse_icmp_error_frame(frame: &[u8]) -> Option<AfXdpIcmpError> {
     let (link, l3_offset) = parse_link_meta(frame)?;
     match link.ethertype {
@@ -202,7 +251,11 @@ pub fn parse_icmp_error_frame(frame: &[u8]) -> Option<AfXdpIcmpError> {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn parse_icmpv4_error(frame: &[u8], ip_offset: usize) -> Option<AfXdpIcmpError> {
+    if !ipv4_header_checksum_ok(frame, ip_offset) {
+        return None;
+    }
     let base = frame.get(ip_offset..ip_offset + IPV4_MIN_HEADER_LEN)?;
     if base[0] >> 4 != 4 || base[9] != IP_PROTO_ICMP {
         return None;
@@ -213,6 +266,9 @@ fn parse_icmpv4_error(frame: &[u8], ip_offset: usize) -> Option<AfXdpIcmpError> 
     }
     let packet_end = ipv4_packet_end(frame, ip_offset)?;
     let icmp = frame.get(ip_offset + ihl..packet_end)?;
+    if !icmpv4_checksum_ok(icmp) {
+        return None;
+    }
     let icmp_type = icmp[0];
     let icmp_code = icmp[1];
     // Errors that quote the offending datagram: dest-unreach (3),
@@ -229,6 +285,7 @@ fn parse_icmpv4_error(frame: &[u8], ip_offset: usize) -> Option<AfXdpIcmpError> 
     Some(AfXdpIcmpError { flow, proto, mtu })
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn parse_icmpv6_error(frame: &[u8], ip_offset: usize) -> Option<AfXdpIcmpError> {
     let base = frame.get(ip_offset..ip_offset + IPV6_HEADER_LEN)?;
     if base[0] >> 4 != 6 || base[6] != IP_PROTO_ICMPV6 {
@@ -237,6 +294,12 @@ fn parse_icmpv6_error(frame: &[u8], ip_offset: usize) -> Option<AfXdpIcmpError> 
     let packet_end = ipv6_packet_end(frame, ip_offset)?;
     let icmp = frame.get(ip_offset + IPV6_HEADER_LEN..packet_end)?;
     if icmp.len() < 8 {
+        return None;
+    }
+    let source = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&base[8..24]).ok()?));
+    let destination =
+        IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&base[24..40]).ok()?));
+    if !icmpv6_checksum_ok(source, destination, icmp) {
         return None;
     }
     let icmp_type = icmp[0];
@@ -256,6 +319,7 @@ fn parse_icmpv6_error(frame: &[u8], ip_offset: usize) -> Option<AfXdpIcmpError> 
 /// Extract the dialed 5-tuple from a quoted inner IP datagram.
 /// `family` is 4 or 6; extension headers in a quoted IPv6 packet are
 /// walked the same way as live traffic.
+#[cfg(any(test, target_os = "linux"))]
 fn parse_quoted_tuple(inner: &[u8], family: u8) -> Option<(AfXdpTcpFlowKey, u8)> {
     let (proto, source, destination, l4_offset, l4_end) = if family == 4 {
         let base = inner.get(..IPV4_MIN_HEADER_LEN)?;
@@ -296,26 +360,129 @@ fn parse_quoted_tuple(inner: &[u8], family: u8) -> Option<(AfXdpTcpFlowKey, u8)>
     Some((flow, proto))
 }
 
-pub(crate) fn udp_checksum(source: IpAddr, destination: IpAddr, udp_packet: &[u8]) -> Option<u16> {
-    let pseudo_sum = match (source, destination) {
+/// Shared transport pseudo-header sum for checksum compute and verify.
+fn l4_pseudo_sum(
+    source: IpAddr,
+    destination: IpAddr,
+    protocol: u8,
+    l4_len: usize,
+) -> Option<u32> {
+    match (source, destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
             let mut pseudo_header = [0u8; 12];
             pseudo_header[0..4].copy_from_slice(&source.octets());
             pseudo_header[4..8].copy_from_slice(&destination.octets());
-            pseudo_header[9] = IP_PROTO_UDP;
-            pseudo_header[10..12].copy_from_slice(&(udp_packet.len() as u16).to_be_bytes());
-            checksum_sum(&pseudo_header)
+            pseudo_header[9] = protocol;
+            pseudo_header[10..12].copy_from_slice(&(l4_len as u16).to_be_bytes());
+            Some(checksum_sum(&pseudo_header))
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
             let mut pseudo_header = [0u8; 40];
             pseudo_header[0..16].copy_from_slice(&source.octets());
             pseudo_header[16..32].copy_from_slice(&destination.octets());
-            pseudo_header[32..36].copy_from_slice(&(udp_packet.len() as u32).to_be_bytes());
-            pseudo_header[39] = IP_PROTO_UDP;
-            checksum_sum(&pseudo_header)
+            pseudo_header[32..36].copy_from_slice(&(l4_len as u32).to_be_bytes());
+            pseudo_header[39] = protocol;
+            Some(checksum_sum(&pseudo_header))
         }
-        _ => return None,
+        _ => None,
+    }
+}
+
+/// A valid internet checksum makes the folded 16-bit total 0xffff —
+/// that includes the stored checksum field, so verification is a plain
+/// re-sum rather than a zeroed-field recompute.
+fn checksum_total_ok(total_sum: u32) -> bool {
+    finalize_checksum(total_sum) == 0xffff
+}
+
+/// RX integrity gate (correctness contract): AF_XDP hands us raw wire
+/// frames with no checksum metadata — the kernel's CHECKSUM_UNNECESSARY
+/// marking is not visible at this layer, so "the skb was verified"
+/// cannot be assumed. A real sender's NIC completes TX checksum offload
+/// before the frame hits the wire, so valid wire frames always carry
+/// complete checksums and only corrupt frames fail verification. Isolated
+/// veth test links are the exception: a veth peer's TX offload leaves
+/// the field partial in the bytes we receive — such test senders must
+/// run with checksum offload disabled (`ethtool -K <peer> tx off`),
+/// never by disabling verification here.
+pub(crate) fn ipv4_header_checksum_ok(frame: &[u8], ip_offset: usize) -> bool {
+    let Some(base) = frame.get(ip_offset..ip_offset + IPV4_MIN_HEADER_LEN) else {
+        return false;
     };
+    if base[0] >> 4 != 4 {
+        return false;
+    }
+    let ihl = usize::from(base[0] & 0x0f) * 4;
+    if ihl < IPV4_MIN_HEADER_LEN {
+        return false;
+    }
+    let Some(header) = frame.get(ip_offset..ip_offset + ihl) else {
+        return false;
+    };
+    checksum_total_ok(checksum_sum(header))
+}
+
+/// UDP datagram verification. `udp_packet` is the full datagram including
+/// its checksum field. IPv4 permits a zero checksum (sender computed
+/// none); IPv6 forbids it (RFC 8200 §8.1 — mandatory for UDP over v6).
+pub(crate) fn udp_checksum_ok(
+    source: IpAddr,
+    destination: IpAddr,
+    udp_packet: &[u8],
+) -> bool {
+    let Some(stored) = udp_packet
+        .get(6..8)
+        .map(|field| u16::from_be_bytes([field[0], field[1]]))
+    else {
+        return false;
+    };
+    if stored == 0 {
+        return source.is_ipv4() && destination.is_ipv4();
+    }
+    let Some(pseudo_sum) = l4_pseudo_sum(source, destination, IP_PROTO_UDP, udp_packet.len())
+    else {
+        return false;
+    };
+    checksum_total_ok(pseudo_sum.wrapping_add(checksum_sum(udp_packet)))
+}
+
+/// ICMPv4 message verification — the checksum covers the message body
+/// only (no pseudo-header).
+#[cfg(any(test, target_os = "linux"))]
+fn icmpv4_checksum_ok(icmp: &[u8]) -> bool {
+    checksum_total_ok(checksum_sum(icmp))
+}
+
+/// TCP segment verification — mandatory in both families; `segment` is
+/// the whole TCP datagram including its checksum field.
+pub(crate) fn tcp_checksum_ok(
+    source: IpAddr,
+    destination: IpAddr,
+    segment: &[u8],
+) -> bool {
+    if segment.len() < 18 {
+        return false;
+    }
+    let Some(pseudo_sum) = l4_pseudo_sum(source, destination, IP_PROTO_TCP, segment.len())
+    else {
+        return false;
+    };
+    checksum_total_ok(pseudo_sum.wrapping_add(checksum_sum(segment)))
+}
+
+/// ICMPv6 message verification — mandatory checksum over pseudo-header
+/// plus message (RFC 8200 §8.1).
+#[cfg(any(test, target_os = "linux"))]
+fn icmpv6_checksum_ok(source: IpAddr, destination: IpAddr, icmp: &[u8]) -> bool {
+    let Some(pseudo_sum) = l4_pseudo_sum(source, destination, IP_PROTO_ICMPV6, icmp.len())
+    else {
+        return false;
+    };
+    checksum_total_ok(pseudo_sum.wrapping_add(checksum_sum(icmp)))
+}
+
+pub(crate) fn udp_checksum(source: IpAddr, destination: IpAddr, udp_packet: &[u8]) -> Option<u16> {
+    let pseudo_sum = l4_pseudo_sum(source, destination, IP_PROTO_UDP, udp_packet.len())?;
     Some(finalize_checksum(
         pseudo_sum.wrapping_add(checksum_sum(udp_packet)),
     ))
@@ -590,6 +757,11 @@ pub(crate) fn parse_transport(
             if tcp_header_len < TCP_MIN_HEADER_LEN || l4_offset + tcp_header_len > packet_end {
                 return None;
             }
+            // Same RX integrity gate: a corrupt TCP checksum must drop the
+            // frame before any session state is created for it.
+            if !tcp_checksum_ok(source, destination, &frame[l4_offset..packet_end]) {
+                return None;
+            }
             Some(AfXdpL4Packet {
                 protocol: AfXdpTransportProtocol::Tcp,
                 local_addr: SocketAddr::new(destination, destination_port),
@@ -605,6 +777,13 @@ pub(crate) fn parse_transport(
             let destination_port = u16::from_be_bytes([header[2], header[3]]);
             let udp_len = usize::from(u16::from_be_bytes([header[4], header[5]]));
             if udp_len < UDP_HEADER_LEN || l4_offset + udp_len > packet_end {
+                return None;
+            }
+            if !udp_checksum_ok(
+                source,
+                destination,
+                &frame[l4_offset..l4_offset + udp_len],
+            ) {
                 return None;
             }
             Some(AfXdpL4Packet {

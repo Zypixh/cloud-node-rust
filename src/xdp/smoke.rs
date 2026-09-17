@@ -595,7 +595,12 @@ async fn dial_smoke_inner(
             "error": res.err().map(|err| format!("{err}")).unwrap_or_default(),
         }));
     }
-    let status = manager.status();
+    // After an adoption the reporting manager's bookkeeping was moved to
+    // the successor — its own status reads zeros. When the reload actually
+    // swapped the global manager, report status from the live successor so
+    // the outer fields stay meaningful.
+    let status_owner = manager_from_runtime();
+    let status = status_owner.status();
     Ok(serde_json::json!({
         "durationMillis": duration.as_millis(),
         "target": target.to_string(),
@@ -1521,6 +1526,7 @@ pub async fn dial_smoke(
     _ready_file: Option<std::path::PathBuf>,
     _payload: Vec<u8>,
     _send_interval: std::time::Duration,
+    _reload_at: Option<std::time::Duration>,
 ) -> anyhow::Result<serde_json::Value> {
     anyhow::bail!("XDP dial smoke is supported on Linux only")
 }

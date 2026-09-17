@@ -30,6 +30,12 @@ fn tcp_queue_budget_test_lock() -> &'static std::sync::Mutex<()> {
     &LOCK
 }
 
+fn test_dataplane_lease(
+    manager: &std::sync::Arc<XdpManager>,
+) -> std::sync::Arc<crate::xdp::AfXdpDataplaneLease> {
+    std::sync::Arc::new(crate::xdp::AfXdpDataplaneLease::new(manager.clone()))
+}
+
 fn mark_test_proxy_bridge_ready(manager: &std::sync::Arc<XdpManager>) {
     let interface = manager.config.interfaces[0].name.clone();
     let queue = manager.config.interfaces[0].queues[0];
@@ -287,7 +293,10 @@ fn xdp_runtime_disabled_replaces_stale_attached_manager() {
 
 #[cfg(any(test, target_os = "linux"))]
 #[test]
-fn xdp_proxy_bridge_lifecycle_stops_on_reload_detach_and_degrade() {
+fn xdp_proxy_bridge_lifecycle_survives_reload_and_stops_on_retire() {
+    // F1 contract: a manager generation swap must never stop a dataplane
+    // lease that still owns sessions. The lease only yields to a real
+    // teardown (retire) or a redirect shutdown on the *current* owner.
     let _guard = crate::runtime_mode::runtime_config_test_guard();
     RuntimeConfig::set_current(RuntimeConfig {
         xdp: test_proxy_config("eth-old"),
@@ -295,20 +304,33 @@ fn xdp_proxy_bridge_lifecycle_stops_on_reload_detach_and_degrade() {
     });
     let old_manager = replace_manager_from_runtime();
     mark_test_proxy_bridge_ready(&old_manager);
-    assert!(af_xdp::proxy_bridge_should_continue(&old_manager));
+    let lease = test_dataplane_lease(&old_manager);
+    assert!(af_xdp::proxy_bridge_should_continue(&lease));
 
+    // Manager publish alone must not stop the dataplane — this was the
+    // F1 freeze: workers exited at publish and orphaned live sessions.
     RuntimeConfig::set_current(RuntimeConfig {
         xdp: test_proxy_config("eth-new"),
         ..RuntimeConfig::default()
     });
     let new_manager = replace_manager_from_runtime();
     mark_test_proxy_bridge_ready(&new_manager);
+    assert!(af_xdp::proxy_bridge_should_continue(&lease));
 
-    assert!(!af_xdp::proxy_bridge_should_continue(&old_manager));
-    assert!(af_xdp::proxy_bridge_should_continue(&new_manager));
+    // Adoption repoints the lease owner to the new generation — still up.
+    lease.adopt(new_manager.clone());
+    assert!(af_xdp::proxy_bridge_should_continue(&lease));
+    assert_eq!(lease.adoptions(), 1);
 
+    // Degradation on the *current* owner stops the workers explicitly.
     new_manager.mark_proxy_dataplane_degraded("test forced degraded");
-    assert!(!af_xdp::proxy_bridge_should_continue(&new_manager));
+    assert!(!af_xdp::proxy_bridge_should_continue(&lease));
+
+    // Real teardown (lease retire) always stops them.
+    mark_test_proxy_bridge_ready(&new_manager);
+    assert!(af_xdp::proxy_bridge_should_continue(&lease));
+    lease.retire();
+    assert!(!af_xdp::proxy_bridge_should_continue(&lease));
 }
 
 #[test]
@@ -419,20 +441,21 @@ fn xdp_proxy_bridge_lifecycle_continues_only_when_ready() {
     });
     let new_manager = replace_manager_from_runtime();
     mark_test_proxy_bridge_ready(&new_manager);
-    assert!(af_xdp::proxy_bridge_should_continue(&new_manager));
+    let lease = test_dataplane_lease(&new_manager);
+    assert!(af_xdp::proxy_bridge_should_continue(&lease));
 
     new_manager.attached.write().clear();
     new_manager
         .proxy_redirect_enabled
         .store(false, Ordering::Relaxed);
-    assert!(!af_xdp::proxy_bridge_should_continue(&new_manager));
+    assert!(!af_xdp::proxy_bridge_should_continue(&lease));
 
     mark_test_proxy_bridge_ready(&new_manager);
-    assert!(af_xdp::proxy_bridge_should_continue(&new_manager));
+    assert!(af_xdp::proxy_bridge_should_continue(&lease));
     new_manager.mark_proxy_dataplane_degraded(
         "AF_XDP proxy bridge poll failed repeatedly; proxy redirect disabled, traffic will PASS",
     );
-    assert!(!af_xdp::proxy_bridge_should_continue(&new_manager));
+    assert!(!af_xdp::proxy_bridge_should_continue(&lease));
 }
 
 #[test]
@@ -1193,6 +1216,7 @@ fn af_xdp_proxy_frame_classifies_ipv6_tcp_with_destination_options() {
         0xcf, 0x08, 0x01, 0xbb, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x18, 0x40, 0, 0, 0, 0, 0,
     ]);
     frame.extend_from_slice(payload);
+    write_l4_checksum6(&mut frame, 14);
 
     let proxy_frame =
         af_xdp::parse_proxy_frame("eth0", 2, &frame).expect("valid IPv6 TCP proxy frame");
@@ -1225,6 +1249,10 @@ fn af_xdp_reply_flow_key_maps_reply_packet_to_original_flow() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_answers_syn_with_syn_ack() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     let frame = ipv4_tcp_syn_frame(false);
     let af_xdp::AfXdpProxyFrame::Tcp {
         route,
@@ -1265,6 +1293,10 @@ fn af_xdp_tcp_reactor_answers_syn_with_syn_ack() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_ignores_unknown_non_syn_flow() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     let frame = ipv4_tcp_frame(false, b"GET / HTTP/1.1\r\n\r\n");
     let af_xdp::AfXdpProxyFrame::Tcp {
         route,
@@ -1288,6 +1320,10 @@ fn af_xdp_tcp_reactor_ignores_unknown_non_syn_flow() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_requires_handler_for_new_syn() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     let frame = ipv4_tcp_syn_frame(false);
     let af_xdp::AfXdpProxyFrame::Tcp {
         route,
@@ -1311,6 +1347,10 @@ fn af_xdp_tcp_reactor_requires_handler_for_new_syn() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_refuses_new_sessions_at_limit() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     let first_frame = ipv4_tcp_syn_frame_with_source_port(false, 53000);
     let second_frame = ipv4_tcp_syn_frame_with_source_port(false, 53001);
     let af_xdp::AfXdpProxyFrame::Tcp {
@@ -1353,6 +1393,10 @@ fn af_xdp_tcp_reactor_refuses_new_sessions_at_limit() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_reaps_idle_sessions() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     let frame = ipv4_tcp_syn_frame(false);
     let af_xdp::AfXdpProxyFrame::Tcp {
         route,
@@ -1404,6 +1448,10 @@ fn af_xdp_tcp_reactor_reaps_closing_time_wait_sessions() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_resolves_egress_route_before_reaping_session() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     let frame = ipv4_tcp_syn_frame(false);
     let af_xdp::AfXdpProxyFrame::Tcp {
         route,
@@ -1469,6 +1517,10 @@ fn af_xdp_dial_route_meta() -> af_xdp::AfXdpRouteMeta {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_dial_emits_syn_and_resolves_on_syn_ack() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
     let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
     let local: std::net::SocketAddr = "198.51.100.5:39000".parse().unwrap();
@@ -1530,6 +1582,10 @@ fn af_xdp_tcp_reactor_dial_emits_syn_and_resolves_on_syn_ack() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_dial_fails_explicitly_on_rst() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
     let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
     let local: std::net::SocketAddr = "198.51.100.5:39000".parse().unwrap();
@@ -2211,6 +2267,10 @@ fn af_xdp_udp_ingress_failure_tracker_resets_after_delivery() {
 
 #[tokio::test]
 async fn af_xdp_tcp_stream_bridges_bounded_channels() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     use bytes::Bytes;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2245,6 +2305,10 @@ async fn af_xdp_tcp_stream_bridges_bounded_channels() {
 
 #[tokio::test]
 async fn af_xdp_tcp_stream_chunks_large_writes_with_backpressure() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     use tokio::io::AsyncWriteExt;
 
     let af_xdp::AfXdpTcpStreamParts {
@@ -2316,6 +2380,10 @@ async fn af_xdp_ingress_delivery_preserves_backpressured_chunk() {
 
 #[tokio::test]
 async fn af_xdp_tcp_stream_reports_broken_pipe_when_reactor_side_closes() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     use tokio::io::AsyncWriteExt;
 
     let af_xdp::AfXdpTcpStreamParts {
@@ -2332,6 +2400,10 @@ async fn af_xdp_tcp_stream_reports_broken_pipe_when_reactor_side_closes() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_hot_set_dedups_and_drains() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     let frame = ipv4_tcp_syn_frame(false);
     let af_xdp::AfXdpProxyFrame::Tcp {
         route,
@@ -2376,6 +2448,10 @@ fn af_xdp_tcp_reactor_hot_set_dedups_and_drains() {
 #[cfg(any(test, target_os = "linux"))]
 #[tokio::test]
 async fn af_xdp_tcp_stream_write_and_shutdown_signal_reactor_wake() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     use tokio::io::AsyncWriteExt;
 
     let frame = ipv4_tcp_syn_frame(false);
@@ -2425,6 +2501,10 @@ async fn af_xdp_tcp_stream_write_and_shutdown_signal_reactor_wake() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_ingress_queue_overflow_is_explicit_refusal() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     let frame = ipv4_tcp_syn_frame(false);
     let af_xdp::AfXdpProxyFrame::Tcp {
         route,
@@ -2580,6 +2660,10 @@ fn af_xdp_tcp_reactor_sweep_keeps_cadence_under_fast_polling() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_stream_drop_signals_reactor() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     // F4 contract: dropping the stream (proxy task exit / app drop) marks
     // the flow dirty so the closed channels are observed on the very next
     // pump round instead of waiting for the sweep backstop.
@@ -2606,6 +2690,10 @@ fn af_xdp_tcp_stream_drop_signals_reactor() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_ingress_budget_leaves_backlog_bounded() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     // RX flood: more queued packets than one round's ingress budget — the
     // poll must process exactly the budget and leave the rest for next
     // round (bounded per-round work under flood).
@@ -2654,6 +2742,10 @@ fn af_xdp_tcp_reactor_ingress_budget_leaves_backlog_bounded() {
 #[cfg(any(test, target_os = "linux"))]
 #[tokio::test]
 async fn af_xdp_tcp_wake_set_stays_bounded_under_write_storm() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     use tokio::io::AsyncWriteExt;
 
     let frame = ipv4_tcp_syn_frame(false);
@@ -2905,6 +2997,8 @@ fn af_xdp_parser_extracts_qinq_ipv4_tcp_payload() {
         0xcf, 0x08, 0x01, 0xbb, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x18, 0x40, 0, 0, 0, 0, 0,
     ]);
     frame.extend_from_slice(payload);
+    write_ipv4_checksum(&mut frame, 22);
+    write_tcp4_checksum(&mut frame, 22);
 
     let packet = af_xdp::parse_l4_packet(&frame).expect("valid QinQ TCP frame");
 
@@ -2995,6 +3089,7 @@ fn af_xdp_parser_skips_ipv6_destination_options() {
         0,
     ]);
     frame.extend_from_slice(udp_payload);
+    write_l4_checksum6(&mut frame, 14);
 
     let packet = af_xdp::parse_l4_packet(&frame).expect("valid IPv6 UDP frame");
     assert_eq!(packet.protocol, af_xdp::AfXdpTransportProtocol::Udp);
@@ -3151,6 +3246,9 @@ fn ipv4_udp_frame(vlan: bool, fragment: u16, payload: &[u8]) -> Vec<u8> {
     ]);
     frame.extend_from_slice(&[0xcf, 0x08, 0x01, 0xbb, 0, (8 + payload.len()) as u8, 0, 0]);
     frame.extend_from_slice(payload);
+    let ip_offset = if vlan { 18 } else { 14 };
+    write_ipv4_checksum(&mut frame, ip_offset);
+    write_udp4_checksum(&mut frame, ip_offset);
     frame
 }
 
@@ -3183,6 +3281,9 @@ fn ipv4_tcp_frame(vlan: bool, payload: &[u8]) -> Vec<u8> {
         0xcf, 0x08, 0x01, 0xbb, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x18, 0xff, 0xff, 0, 0, 0, 0,
     ]);
     frame.extend_from_slice(payload);
+    let ip_offset = if vlan { 18 } else { 14 };
+    write_ipv4_checksum(&mut frame, ip_offset);
+    write_tcp4_checksum(&mut frame, ip_offset);
     frame
 }
 
@@ -3273,6 +3374,8 @@ fn ipv4_tcp_reply_ip_packet() -> Vec<u8> {
     packet.extend_from_slice(&[
         0x01, 0xbb, 0xcf, 0x08, 0, 0, 0, 2, 0, 0, 0, 2, 0x50, 0x10, 0xff, 0xff, 0, 0, 0, 0,
     ]);
+    write_ipv4_checksum(&mut packet, 0);
+    write_tcp4_checksum(&mut packet, 0);
     packet
 }
 
@@ -3303,6 +3406,82 @@ fn write_tcp4_checksum(frame: &mut [u8], ip_offset: usize) {
     pseudo.extend_from_slice(&frame[tcp_offset..]);
     let checksum = test_internet_checksum(&pseudo);
     frame[tcp_offset + 16..tcp_offset + 18].copy_from_slice(&checksum.to_be_bytes());
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn write_udp4_checksum(frame: &mut [u8], ip_offset: usize) {
+    let udp_offset = ip_offset + 20;
+    let udp_len =
+        usize::from(u16::from_be_bytes([frame[udp_offset + 4], frame[udp_offset + 5]]));
+    frame[udp_offset + 6] = 0;
+    frame[udp_offset + 7] = 0;
+    let mut pseudo = Vec::with_capacity(12 + udp_len);
+    pseudo.extend_from_slice(&frame[ip_offset + 12..ip_offset + 20]);
+    pseudo.push(0);
+    pseudo.push(17);
+    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    pseudo.extend_from_slice(&frame[udp_offset..udp_offset + udp_len]);
+    let checksum = test_internet_checksum(&pseudo);
+    let checksum = if checksum == 0 { 0xffff } else { checksum };
+    frame[udp_offset + 6..udp_offset + 8].copy_from_slice(&checksum.to_be_bytes());
+}
+
+/// Walk an IPv6 extension-header chain and fill the final L4 checksum.
+/// Handles hop-by-hop/routing/destination options and fragment headers;
+/// computes for TCP, UDP and ICMPv6 (all mandatory under v6).
+#[cfg(any(test, target_os = "linux"))]
+fn write_l4_checksum6(frame: &mut [u8], ip_offset: usize) {
+    let src = frame[ip_offset + 8..ip_offset + 24].to_vec();
+    let dst = frame[ip_offset + 24..ip_offset + 40].to_vec();
+    let mut next = frame[ip_offset + 6];
+    let mut cursor = ip_offset + 40;
+    for _ in 0..16 {
+        if cursor + 2 > frame.len() {
+            return;
+        }
+        match next {
+            0 | 43 | 60 => {
+                let len = (usize::from(frame[cursor + 1]) + 1) * 8;
+                next = frame[cursor];
+                cursor += len;
+            }
+            44 => {
+                next = frame[cursor];
+                cursor += 8;
+            }
+            _ => break,
+        }
+    }
+    let checksum_offset = match next {
+        6 => cursor + 16,
+        17 => cursor + 6,
+        58 => cursor + 2,
+        _ => return,
+    };
+    if cursor >= frame.len() || checksum_offset + 2 > frame.len() {
+        return;
+    }
+    let l4_len = frame.len() - cursor;
+    frame[checksum_offset] = 0;
+    frame[checksum_offset + 1] = 0;
+    let mut pseudo = Vec::with_capacity(40 + l4_len);
+    pseudo.extend_from_slice(&src);
+    pseudo.extend_from_slice(&dst);
+    pseudo.extend_from_slice(&(l4_len as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, next]);
+    pseudo.extend_from_slice(&frame[cursor..]);
+    let checksum = test_internet_checksum(&pseudo);
+    let checksum = if checksum == 0 { 0xffff } else { checksum };
+    frame[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn write_icmpv4_checksum(frame: &mut [u8], ip_offset: usize) {
+    let icmp_offset = ip_offset + 20;
+    frame[icmp_offset + 2] = 0;
+    frame[icmp_offset + 3] = 0;
+    let checksum = test_internet_checksum(&frame[icmp_offset..]);
+    frame[icmp_offset + 2..icmp_offset + 4].copy_from_slice(&checksum.to_be_bytes());
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -3401,6 +3580,7 @@ fn ipv4_tcp_flags_frame(flags: u8, doff_words: u8) -> Vec<u8> {
     for _ in 20..tcp_len {
         frame.push(1); // option bytes (e.g. MSS/TFO cookie space)
     }
+    write_ipv4_checksum(&mut frame, 14);
     frame
 }
 
@@ -3430,6 +3610,7 @@ fn ipv4_proto_frame(proto: u8, payload: &[u8]) -> Vec<u8> {
         5,
     ]);
     frame.extend_from_slice(payload);
+    write_ipv4_checksum(&mut frame, 14);
     frame
 }
 
@@ -3450,6 +3631,7 @@ fn ipv6_ext_frame(next: u8, ext_chain: &[u8], l4: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
     frame.extend_from_slice(ext_chain);
     frame.extend_from_slice(l4);
+    write_l4_checksum6(&mut frame, 14);
     frame
 }
 
@@ -3784,20 +3966,21 @@ fn xdp_proxy_bridge_worker_lease_covers_startup_without_redirect() {
     });
     let manager = replace_manager_from_runtime();
     mark_test_proxy_bridge_ready(&manager);
+    let lease = test_dataplane_lease(&manager);
     // Redirect enabled but workers not starting: normal dataplane semantics.
     manager
         .proxy_redirect_enabled
         .store(false, Ordering::Relaxed);
-    assert!(!af_xdp::proxy_bridge_should_continue(&manager));
+    assert!(!af_xdp::proxy_bridge_should_continue(&lease));
 
     // Worker lease during startup keeps reactors alive before redirect opens.
     manager.set_proxy_workers_starting(true);
-    assert!(af_xdp::proxy_bridge_should_continue(&manager));
+    assert!(af_xdp::proxy_bridge_should_continue(&lease));
 
     // Degradation during startup releases the lease and stops the workers.
     manager.mark_proxy_dataplane_degraded("test forced degraded");
     assert!(!manager.proxy_workers_starting());
-    assert!(!af_xdp::proxy_bridge_should_continue(&manager));
+    assert!(!af_xdp::proxy_bridge_should_continue(&lease));
 }
 
 /// EN-10: lifecycle feedback is ordered by (incarnation, owner_epoch, seq) —
@@ -3906,6 +4089,8 @@ fn inner_ipv4_udp_packet(local_port: u16, peer_port: u16) -> Vec<u8> {
     packet.extend_from_slice(&local_port.to_be_bytes());
     packet.extend_from_slice(&peer_port.to_be_bytes());
     packet.extend_from_slice(&[0, 8, 0, 0]);
+    write_ipv4_checksum(&mut packet, 0);
+    write_udp4_checksum(&mut packet, 0);
     packet
 }
 
@@ -3938,6 +4123,8 @@ fn icmpv4_error_frame(icmp_type: u8, code: u8, mtu: u16, inner: &[u8]) -> Vec<u8
     frame.extend_from_slice(&[icmp_type, code, 0, 0, 0, 0]);
     frame.extend_from_slice(&mtu.to_be_bytes());
     frame.extend_from_slice(inner);
+    write_ipv4_checksum(&mut frame, 14);
+    write_icmpv4_checksum(&mut frame, 14);
     frame
 }
 
@@ -4007,6 +4194,7 @@ fn inner_ipv6_udp_packet(local_port: u16, peer_port: u16, ext_chain: &[u8]) -> V
     packet.extend_from_slice(&local_port.to_be_bytes());
     packet.extend_from_slice(&peer_port.to_be_bytes());
     packet.extend_from_slice(&[0, 8, 0, 0]);
+    write_l4_checksum6(&mut packet, 0);
     packet
 }
 
@@ -4028,6 +4216,7 @@ fn icmpv6_error_frame(icmp_type: u8, mtu: u32, inner: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&[icmp_type, 0, 0, 0]);
     frame.extend_from_slice(&mtu.to_be_bytes());
     frame.extend_from_slice(inner);
+    write_l4_checksum6(&mut frame, 14);
     frame
 }
 
@@ -4075,12 +4264,126 @@ fn af_xdp_icmpv6_non_error_and_malformed_rejected() {
     assert!(af_xdp::parse_icmp_error_frame(&frame).is_none());
 }
 
+// --- RX checksum verification (correctness contract) -------------------
+//
+// AF_XDP RX frames carry no checksum metadata, so the dataplane verifies
+// wire checksums in software before a frame is trusted. These tests prove
+// the gate accepts complete wire checksums and rejects corrupt ones —
+// without weakening production verification for test peers (offload-
+// enabled veth senders must instead run `ethtool -K <peer> tx off`).
+
+#[test]
+fn af_xdp_rx_checksum_accepts_valid_wire_frames() {
+    let syn = ipv4_tcp_syn_frame(false);
+    assert!(matches!(
+        af_xdp::parse_proxy_frame("eth0", 0, &syn),
+        Some(af_xdp::AfXdpProxyFrame::Tcp { .. })
+    ));
+    let tcp = ipv4_tcp_frame(false, b"GET / HTTP/1.1\r\n\r\n");
+    assert!(matches!(
+        af_xdp::parse_l4_packet(&tcp),
+        Some(af_xdp::AfXdpL4Packet {
+            protocol: af_xdp::AfXdpTransportProtocol::Tcp,
+            ..
+        })
+    ));
+    let udp = ipv4_udp_frame(false, 0, b"hello");
+    assert!(af_xdp::parse_l4_packet(&udp).is_some());
+    let inner4 = inner_ipv4_udp_packet(42_001, 443);
+    assert!(
+        af_xdp::parse_icmp_error_frame(&icmpv4_error_frame(3, 4, 1400, &inner4)).is_some()
+    );
+    let inner6 = inner_ipv6_udp_packet(43_002, 443, &[]);
+    assert!(af_xdp::parse_icmp_error_frame(&icmpv6_error_frame(2, 1280, &inner6)).is_some());
+}
+
+#[test]
+fn af_xdp_rx_checksum_drops_corrupt_ipv4_header() {
+    // Corrupt the stored IPv4 header checksum — the frame is untrusted
+    // before its tuple is read.
+    let mut frame = ipv4_tcp_syn_frame(false);
+    frame[14 + 10] ^= 0xff;
+    assert!(af_xdp::parse_proxy_frame("eth0", 0, &frame).is_none());
+    assert!(af_xdp::parse_l4_packet(&frame).is_none());
+
+    // Corrupting a header byte without fixing the checksum also fails.
+    let mut frame = ipv4_udp_frame(false, 0, b"hello");
+    frame[14 + 12] ^= 0xff; // source address — invalidates stored checksum
+    assert!(af_xdp::parse_l4_packet(&frame).is_none());
+}
+
+#[test]
+fn af_xdp_rx_checksum_drops_corrupt_tcp_segment() {
+    // A corrupt TCP checksum drops the frame before session state exists.
+    let mut frame = ipv4_tcp_syn_frame(false);
+    frame[14 + 20 + 16] ^= 0xff; // stored TCP checksum
+    assert!(af_xdp::parse_proxy_frame("eth0", 0, &frame).is_none());
+    assert!(af_xdp::parse_l4_packet(&frame).is_none());
+
+    let mut frame = ipv4_tcp_frame(false, b"x");
+    frame[14 + 20] ^= 0x01; // source port — invalidates stored checksum
+    assert!(af_xdp::parse_proxy_frame("eth0", 0, &frame).is_none());
+    assert!(af_xdp::parse_l4_packet(&frame).is_none());
+}
+
+#[test]
+fn af_xdp_rx_checksum_drops_corrupt_udp4_datagram() {
+    let mut frame = ipv4_udp_frame(false, 0, b"hello");
+    frame[14 + 20 + 6] ^= 0xff; // stored UDP checksum
+    assert!(af_xdp::parse_l4_packet(&frame).is_none());
+    let mut frame = ipv4_udp_frame(false, 0, b"hello");
+    frame[14 + 20 + 8] ^= 0x01; // payload byte — invalidates stored checksum
+    assert!(af_xdp::parse_l4_packet(&frame).is_none());
+}
+
+#[test]
+fn af_xdp_rx_checksum_udp4_zero_field_is_legal() {
+    // RFC 768: a zero UDP checksum over IPv4 means "no checksum computed".
+    let mut frame = ipv4_udp_frame(false, 0, b"hello");
+    frame[14 + 20 + 6] = 0;
+    frame[14 + 20 + 7] = 0;
+    assert!(af_xdp::parse_l4_packet(&frame).is_some());
+}
+
+#[test]
+fn af_xdp_rx_checksum_udp6_requires_checksum() {
+    let udp = [
+        0xcf, 0x08, 0x01, 0xbb, 0, 11, 0, 0, b'h', b'i', b'!',
+    ];
+    let frame = ipv6_ext_frame(17, &[], &udp);
+    // Valid v6 UDP parses.
+    assert!(af_xdp::parse_l4_packet(&frame).is_some());
+
+    // RFC 8200 §8.1: a zero UDP checksum is forbidden over IPv6.
+    let mut frame = frame;
+    frame[14 + 40 + 6] = 0;
+    frame[14 + 40 + 7] = 0;
+    assert!(af_xdp::parse_l4_packet(&frame).is_none());
+}
+
+#[test]
+fn af_xdp_rx_checksum_drops_corrupt_icmp() {
+    let inner4 = inner_ipv4_udp_packet(42_001, 443);
+    let mut frame = icmpv4_error_frame(3, 4, 1400, &inner4);
+    frame[14 + 20 + 2] ^= 0xff; // ICMPv4 message checksum
+    assert!(af_xdp::parse_icmp_error_frame(&frame).is_none());
+
+    let inner6 = inner_ipv6_udp_packet(43_002, 443, &[]);
+    let mut frame = icmpv6_error_frame(2, 1280, &inner6);
+    frame[14 + 40 + 2] ^= 0xff; // ICMPv6 message checksum
+    assert!(af_xdp::parse_icmp_error_frame(&frame).is_none());
+}
+
 /// T4-7: `apply_pmtu` routes the ICMP-derived cap into the owning
 /// session's smoltcp socket; non-PTB (None) and unknown flows are
 /// explicit no-ops that never disturb live sessions.
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_apply_pmtu_clamps_dialed_session() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
     let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
     let local: std::net::SocketAddr = "198.51.100.5:39000".parse().unwrap();
@@ -4122,4 +4425,96 @@ fn af_xdp_tcp_reactor_apply_pmtu_clamps_dialed_session() {
     };
     reactor.apply_pmtu(&unknown, Some(900));
     assert_eq!(reactor.session_path_mtu(&unknown), None);
+}
+
+#[test]
+fn xdp_f1_shape_gate_accepts_compatible_reload() {
+    let manager = XdpManager::new(test_proxy_config("eth0"));
+    // Map-content-only changes must not trip the shape gate.
+    let mut new_config = manager.config.clone();
+    new_config.admission = Some(crate::runtime_mode::XdpAdmissionSettings::default());
+    new_config.proxy.ports[0].port = 8443;
+    new_config.rate_limit = Some(crate::runtime_mode::XdpRateLimitSettings::default());
+    assert!(dataplane_shape_compatible(&manager, &new_config).is_ok());
+}
+
+#[test]
+fn xdp_f1_shape_gate_rejects_socket_shape_changes() {
+    let manager = XdpManager::new(test_proxy_config("eth0"));
+
+    let mut mode_change = manager.config.clone();
+    mode_change.attach_mode = crate::runtime_mode::XdpAttachMode::Skb;
+    assert!(dataplane_shape_compatible(&manager, &mode_change).is_err());
+
+    let mut object_change = manager.config.clone();
+    object_change.ebpf_object = Some("/tmp/other.o".into());
+    assert!(dataplane_shape_compatible(&manager, &object_change).is_err());
+
+    let mut upstream_change = manager.config.clone();
+    upstream_change.upstream = Some(crate::runtime_mode::XdpUpstreamSettings {
+        mode: crate::runtime_mode::XdpUpstreamMode::Afxdp,
+        ..Default::default()
+    });
+    assert!(dataplane_shape_compatible(&manager, &upstream_change).is_err());
+
+    let mut iface_change = manager.config.clone();
+    iface_change.interfaces[0].queues = vec![0, 1];
+    assert!(dataplane_shape_compatible(&manager, &iface_change).is_err());
+
+    let mut rename = manager.config.clone();
+    rename.interfaces[0].name = "eth1".to_string();
+    assert!(dataplane_shape_compatible(&manager, &rename).is_err());
+}
+
+#[test]
+fn xdp_f1_shape_gate_compares_resolved_state_tables() {
+    let manager = XdpManager::new(test_proxy_config("eth0"));
+    // Old generation auto-scaled (config None → effective Some).
+    let resolved = crate::runtime_mode::XdpStateTables {
+        ct_max_entries: Some(8192),
+        ..Default::default()
+    };
+    *manager.effective_state_tables.write() = Some(resolved.clone());
+
+    // Pinning the resolved values is compatible.
+    let mut pinned = manager.config.clone();
+    pinned.state_tables = Some(resolved);
+    assert!(dataplane_shape_compatible(&manager, &pinned).is_ok());
+
+    // A genuinely different sizing is rejected.
+    let mut different = manager.config.clone();
+    different.state_tables = Some(crate::runtime_mode::XdpStateTables {
+        ct_max_entries: Some(16384),
+        ..Default::default()
+    });
+    assert!(dataplane_shape_compatible(&manager, &different).is_err());
+}
+
+#[test]
+fn xdp_f1_lease_adoption_repoints_owner_and_counts() {
+    let old_manager = std::sync::Arc::new(XdpManager::new(test_proxy_config("eth0")));
+    let new_manager = std::sync::Arc::new(XdpManager::new(test_proxy_config("eth0")));
+    let lease = test_dataplane_lease(&old_manager);
+    assert!(std::sync::Arc::ptr_eq(&lease.owner(), &old_manager));
+    assert_eq!(lease.adoptions(), 0);
+
+    lease.adopt(new_manager.clone());
+    assert!(std::sync::Arc::ptr_eq(&lease.owner(), &new_manager));
+    assert_eq!(lease.adoptions(), 1);
+    assert!(!lease.is_retired());
+
+    lease.retire();
+    assert!(lease.is_retired());
+}
+
+#[test]
+fn xdp_f1_lease_worker_drain_tracks_exit() {
+    let manager = std::sync::Arc::new(XdpManager::new(test_proxy_config("eth0")));
+    let lease = test_dataplane_lease(&manager);
+    lease.worker_started();
+    lease.worker_started();
+    assert_eq!(lease.live_workers.load(Ordering::Relaxed), 2);
+    lease.worker_exited();
+    lease.worker_exited();
+    assert_eq!(lease.live_workers.load(Ordering::Relaxed), 0);
 }

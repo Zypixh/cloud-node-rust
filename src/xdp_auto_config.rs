@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::config_models::{NetworkAddressConfig, ServerConfig};
 use crate::runtime_mode::{
-    RuntimeConfig, XdpAttachMode, XdpConfig, XdpFallbackMode, XdpInterfaceConfig, XdpProxyConfig,
+    RuntimeConfig, XdpAttachMode, XdpConfig, XdpFallbackMode, XdpInterfaceConfig,
     XdpProxyPortConfig, XdpProxyProtocol, XdpRuntimeMode,
 };
 
