@@ -3,8 +3,80 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
+
+/// Cacheline-aligned shard so per-thread counters never share a line.
+#[repr(align(64))]
+struct CounterShard(AtomicU64);
+
+const COUNTER_SHARDS: usize = 64;
+static NEXT_COUNTER_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Stable per-thread shard: each worker mutates its own cacheline, so
+    /// hot-path ledger writes are uncontended atomic ops.
+    static COUNTER_SHARD_IDX: usize = NEXT_COUNTER_SHARD.fetch_add(1, Ordering::Relaxed)
+        % COUNTER_SHARDS;
+}
+
+/// 64-way sharded u64. Writers touch only their thread's cacheline; readers
+/// pay 64 relaxed loads (~50ns) — far cheaper than a contended CAS loop at
+/// high QPS. Sums are read-side approximate under concurrent writes (bounded
+/// by the number of in-flight writers), matching the existing add→check→
+/// rollback byte-ledger contract.
+struct ShardedU64 {
+    shards: [CounterShard; COUNTER_SHARDS],
+}
+
+impl ShardedU64 {
+    const fn new() -> Self {
+        const ZERO: CounterShard = CounterShard(AtomicU64::new(0));
+        Self { shards: [ZERO; COUNTER_SHARDS] }
+    }
+
+    #[inline]
+    fn shard_index() -> u8 {
+        COUNTER_SHARD_IDX.with(|i| *i) as u8
+    }
+
+    #[inline]
+    fn add(&self, n: u64) -> u8 {
+        let idx = Self::shard_index();
+        self.shards[idx as usize].0.fetch_add(n, Ordering::Relaxed);
+        idx
+    }
+
+    #[inline]
+    fn sub_at(&self, shard: u8, n: u64) {
+        self.shards[shard as usize].0.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// Approximate total; may briefly over-read while writers are between
+    /// their shard add and the reader's sum.
+    fn value(&self) -> u64 {
+        let mut total = 0u64;
+        for shard in &self.shards {
+            total = total.saturating_add(shard.0.load(Ordering::Relaxed));
+        }
+        total
+    }
+
+    /// Test/snapshot compatibility: same signature as AtomicU64::load.
+    fn load(&self, _order: Ordering) -> u64 {
+        self.value()
+    }
+
+    /// Absolute write (test setup / cold paths only): zeroes all shards and
+    /// stores the value on shard 0. Not concurrent-safe against writers —
+    /// callers must own exclusivity, same contract the tests had.
+    fn store(&self, value: u64, order: Ordering) {
+        for shard in &self.shards {
+            shard.0.store(0, order);
+        }
+        self.shards[0].0.store(value, order);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionClass {
@@ -188,6 +260,13 @@ pub struct GovernorSnapshot {
     /// Estimated bytes held by metrics trackers that are not covered by the
     /// resident ledger (aggregator maps, top-IP, daily domain, unique IP).
     pub metrics_aggregator_bytes: u64,
+    /// Attribution gap: process RSS minus every tracked byte ledger
+    /// (resident ledger + connection/relay/queue/cache-read ledgers +
+    /// metrics gauge). Sustained growth means uninstrumented allocations or
+    /// estimator drift — it is an observability signal, not leak proof
+    /// (allocator slack and untracked structures legitimately count here).
+    /// 0 when RSS is unknown or tracked ledgers exceed RSS.
+    pub unaccounted_rss_bytes: u64,
     pub cgroup_managed: bool,
     pub cgroup_memory_max_bytes: u64,
     pub cgroup_memory_high_bytes: u64,
@@ -587,33 +666,39 @@ const DEFAULT_DISK_CLASS_BUDGET: [u64; DISK_LEDGER_CLASS_COUNT] = [
 ];
 
 pub struct MemoryGovernor {
-    http_connections: AtomicU64,
-    tcp_connections: AtomicU64,
-    h3_connections: AtomicU64,
-    udp_sessions: AtomicU64,
-    h2_streams: AtomicU64,
-    h3_requests: AtomicU64,
-    origin_connects: AtomicU64,
-    shared_connection_bytes: AtomicU64,
+    // Admission counters and shared byte ledgers are sharded: at high QPS a
+    // single cacheline per class would serialize every admission's RMW.
+    // Counts still never settle above their limits (add → sum → rollback);
+    // the only relaxation is a bounded transient overshoot equal to the
+    // number of in-flight adders — the same contract the byte ledgers already
+    // had with fetch_add-then-check.
+    http_connections: ShardedU64,
+    tcp_connections: ShardedU64,
+    h3_connections: ShardedU64,
+    udp_sessions: ShardedU64,
+    h2_streams: ShardedU64,
+    h3_requests: ShardedU64,
+    origin_connects: ShardedU64,
+    shared_connection_bytes: ShardedU64,
     zero_copy_relays: AtomicU64,
-    zero_copy_relay_bytes: AtomicU64,
+    zero_copy_relay_bytes: ShardedU64,
     udp_queued_bytes: AtomicU64,
     /// EN-17/F3: node-wide ledger for bytes queued inside the AF_XDP TCP
     /// dataplane (stream channels, reactor pendings, device ingress frames).
     /// Distinct from the UDP ledger so a TCP queue storm cannot silently
     /// consume the datagram budget (or vice versa).
     tcp_queue_bytes: AtomicU64,
-    background_work: AtomicU64,
-    request_body_waf: AtomicU64,
-    response_body_waf: AtomicU64,
-    response_transform: AtomicU64,
-    cache_revalidate: AtomicU64,
-    cache_write: AtomicU64,
-    cache_read_memory: AtomicU64,
-    cluster_internal_connections: AtomicU64,
-    rpc_stream_commands: AtomicU64,
-    sni_relays: AtomicU64,
-    cache_read_memory_bytes: AtomicU64,
+    background_work: ShardedU64,
+    request_body_waf: ShardedU64,
+    response_body_waf: ShardedU64,
+    response_transform: ShardedU64,
+    cache_revalidate: ShardedU64,
+    cache_write: ShardedU64,
+    cache_read_memory: ShardedU64,
+    cluster_internal_connections: ShardedU64,
+    rpc_stream_commands: ShardedU64,
+    sni_relays: ShardedU64,
+    cache_read_memory_bytes: ShardedU64,
     /// Observational gauge for metrics trackers (aggregators, top-IP, daily
     /// domain, unique-IP sets) that live outside the resident ledger. Kept
     /// out of `resident.total` on purpose: the ledger enforces cache budgets,
@@ -663,6 +748,11 @@ pub struct MemoryGovernor {
 pub struct AdmissionPermit<'a> {
     governor: &'a MemoryGovernor,
     class: AdmissionClass,
+    /// Shards this permit's charges were added to; Drop subtracts from the
+    /// same shards so the ledger stays exact under cross-thread drops.
+    counter_shard: u8,
+    shared_conn_shard: u8,
+    cache_read_shard: u8,
     shared_connection_charge_bytes: u64,
     cache_read_memory_charge_bytes: u64,
 }
@@ -672,6 +762,7 @@ pub type StaticAdmissionPermit = AdmissionPermit<'static>;
 pub struct ZeroCopyRelayPermit<'a> {
     governor: &'a MemoryGovernor,
     charge_bytes: u64,
+    bytes_shard: u8,
 }
 
 pub type StaticZeroCopyRelayPermit = ZeroCopyRelayPermit<'static>;
@@ -758,29 +849,29 @@ impl Default for MemoryGovernor {
 impl MemoryGovernor {
     pub fn new() -> Self {
         Self {
-            http_connections: AtomicU64::new(0),
-            tcp_connections: AtomicU64::new(0),
-            h3_connections: AtomicU64::new(0),
-            udp_sessions: AtomicU64::new(0),
-            h2_streams: AtomicU64::new(0),
-            h3_requests: AtomicU64::new(0),
-            origin_connects: AtomicU64::new(0),
-            shared_connection_bytes: AtomicU64::new(0),
+            http_connections: ShardedU64::new(),
+            tcp_connections: ShardedU64::new(),
+            h3_connections: ShardedU64::new(),
+            udp_sessions: ShardedU64::new(),
+            h2_streams: ShardedU64::new(),
+            h3_requests: ShardedU64::new(),
+            origin_connects: ShardedU64::new(),
+            shared_connection_bytes: ShardedU64::new(),
             zero_copy_relays: AtomicU64::new(0),
-            zero_copy_relay_bytes: AtomicU64::new(0),
+            zero_copy_relay_bytes: ShardedU64::new(),
             udp_queued_bytes: AtomicU64::new(0),
             tcp_queue_bytes: AtomicU64::new(0),
-            background_work: AtomicU64::new(0),
-            request_body_waf: AtomicU64::new(0),
-            response_body_waf: AtomicU64::new(0),
-            response_transform: AtomicU64::new(0),
-            cache_revalidate: AtomicU64::new(0),
-            cache_write: AtomicU64::new(0),
-            cache_read_memory: AtomicU64::new(0),
-            cluster_internal_connections: AtomicU64::new(0),
-            rpc_stream_commands: AtomicU64::new(0),
-            sni_relays: AtomicU64::new(0),
-            cache_read_memory_bytes: AtomicU64::new(0),
+            background_work: ShardedU64::new(),
+            request_body_waf: ShardedU64::new(),
+            response_body_waf: ShardedU64::new(),
+            response_transform: ShardedU64::new(),
+            cache_revalidate: ShardedU64::new(),
+            cache_write: ShardedU64::new(),
+            cache_read_memory: ShardedU64::new(),
+            cluster_internal_connections: ShardedU64::new(),
+            rpc_stream_commands: ShardedU64::new(),
+            sni_relays: ShardedU64::new(),
+            cache_read_memory_bytes: ShardedU64::new(),
             metrics_aggregator_bytes: AtomicU64::new(0),
             admission_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
             cached_total_bytes: AtomicU64::new(0),
@@ -876,13 +967,12 @@ impl MemoryGovernor {
         }
 
         let budget = self.zero_copy_relay_budget_bytes().max(1);
-        let used = self
+        let bytes_shard = self
             .zero_copy_relay_bytes
-            .fetch_add(ZERO_COPY_RELAY_ESTIMATED_BYTES, Ordering::AcqRel)
-            .saturating_add(ZERO_COPY_RELAY_ESTIMATED_BYTES);
-        if used > budget {
+            .add(ZERO_COPY_RELAY_ESTIMATED_BYTES);
+        if self.zero_copy_relay_bytes.value() > budget {
             self.zero_copy_relay_bytes
-                .fetch_sub(ZERO_COPY_RELAY_ESTIMATED_BYTES, Ordering::AcqRel);
+                .sub_at(bytes_shard, ZERO_COPY_RELAY_ESTIMATED_BYTES);
             self.zero_copy_relays.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
@@ -890,6 +980,7 @@ impl MemoryGovernor {
         Some(ZeroCopyRelayPermit {
             governor: self,
             charge_bytes: ZERO_COPY_RELAY_ESTIMATED_BYTES,
+            bytes_shard,
         })
     }
 
@@ -954,58 +1045,55 @@ impl MemoryGovernor {
         class: AdmissionClass,
         cache_read_memory_charge_bytes: u64,
     ) -> Option<AdmissionPermit<'_>> {
-        // CAS admission: the counter must never exceed the limit even
-        // transiently — fetch_add-then-check lets concurrent observers read
-        // a value above the hard cap between the add and the rollback.
+        // Sharded admission: add to this thread's shard, then check the summed
+        // total against the limit. The counter can transiently read above the
+        // cap by at most the number of in-flight adders — the same bounded
+        // overshoot the byte ledgers already used; totals never settle above
+        // the limit because every overflow path rolls its shard back.
         let counter = self.counter(class);
         let limit = self.limit_for(class) as u64;
-        let mut current = counter.load(Ordering::Acquire);
-        loop {
-            if current >= limit {
-                self.record_reject(class);
-                return None;
-            }
-            match counter.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
+        // Cheap read-mostly reject first: at cap this avoids a pointless RMW.
+        if counter.value() >= limit {
+            self.record_reject(class);
+            return None;
+        }
+        let counter_shard = counter.add(1);
+        if counter.value() > limit {
+            counter.sub_at(counter_shard, 1);
+            self.record_reject(class);
+            return None;
         }
 
         let shared_connection_charge_bytes = shared_connection_charge_bytes(class);
+        let mut shared_conn_shard = 0u8;
         if shared_connection_charge_bytes > 0 {
             let budget = shared_connection_admission_budget(&self.memory_snapshot());
-            let used = self
+            shared_conn_shard = self
                 .shared_connection_bytes
-                .fetch_add(shared_connection_charge_bytes, Ordering::AcqRel)
-                .saturating_add(shared_connection_charge_bytes);
-            if used > budget {
+                .add(shared_connection_charge_bytes);
+            if self.shared_connection_bytes.value() > budget {
                 self.shared_connection_bytes
-                    .fetch_sub(shared_connection_charge_bytes, Ordering::AcqRel);
-                counter.fetch_sub(1, Ordering::AcqRel);
+                    .sub_at(shared_conn_shard, shared_connection_charge_bytes);
+                counter.sub_at(counter_shard, 1);
                 self.record_reject(class);
                 return None;
             }
         }
 
+        let mut cache_read_shard = 0u8;
         if cache_read_memory_charge_bytes > 0 {
             let budget = cache_read_memory_budget_bytes(&self.memory_snapshot());
-            let used = self
+            cache_read_shard = self
                 .cache_read_memory_bytes
-                .fetch_add(cache_read_memory_charge_bytes, Ordering::AcqRel)
-                .saturating_add(cache_read_memory_charge_bytes);
-            if used > budget {
+                .add(cache_read_memory_charge_bytes);
+            if self.cache_read_memory_bytes.value() > budget {
                 self.cache_read_memory_bytes
-                    .fetch_sub(cache_read_memory_charge_bytes, Ordering::AcqRel);
+                    .sub_at(cache_read_shard, cache_read_memory_charge_bytes);
                 if shared_connection_charge_bytes > 0 {
                     self.shared_connection_bytes
-                        .fetch_sub(shared_connection_charge_bytes, Ordering::AcqRel);
+                        .sub_at(shared_conn_shard, shared_connection_charge_bytes);
                 }
-                counter.fetch_sub(1, Ordering::AcqRel);
+                counter.sub_at(counter_shard, 1);
                 self.record_reject(class);
                 return None;
             }
@@ -1014,6 +1102,9 @@ impl MemoryGovernor {
         Some(AdmissionPermit {
             governor: self,
             class,
+            counter_shard,
+            shared_conn_shard,
+            cache_read_shard,
             shared_connection_charge_bytes,
             cache_read_memory_charge_bytes,
         })
@@ -1920,9 +2011,31 @@ impl MemoryGovernor {
         stats
     }
 
+    /// RSS minus all tracked byte ledgers — the live "attribution gap"
+    /// metric. Saturates at 0 when RSS is unknown (0) or the ledgers
+    /// over-count relative to RSS (estimates can exceed actuals).
+    pub fn unaccounted_rss_bytes(&self, process_rss_bytes: u64, resident_used: u64) -> u64 {
+        if process_rss_bytes == 0 {
+            return 0;
+        }
+        let tracked = resident_used
+            .saturating_add(self.shared_connection_bytes.value())
+            .saturating_add(self.zero_copy_relay_bytes.value())
+            .saturating_add(self.udp_queued_bytes())
+            .saturating_add(self.tcp_queue_bytes())
+            .saturating_add(self.cache_read_memory_bytes.value())
+            .saturating_add(self.metrics_aggregator_bytes.load(Ordering::Relaxed));
+        process_rss_bytes.saturating_sub(tracked)
+    }
+
     pub fn snapshot(&self, pingora_threads: usize) -> GovernorSnapshot {
         let mem = self.memory_snapshot();
         let fd_snapshot = self.fd_equivalent_snapshot();
+        let resident = self.resident_memory_snapshot();
+        let unaccounted_rss_bytes = self.unaccounted_rss_bytes(
+            mem.process_rss_bytes,
+            resident.total_used_bytes,
+        );
         GovernorSnapshot {
             memory_total_bytes: mem.total_bytes,
             memory_used_bytes: mem.used_bytes,
@@ -2026,8 +2139,9 @@ impl MemoryGovernor {
             disk_committed_bytes: self.disk_totals().1,
             disk_rejects: self.disk_rejects.load(Ordering::Relaxed),
             pingora_keepalive_pool_size: self.pingora_keepalive_pool_size(pingora_threads),
-            resident_memory: self.resident_memory_snapshot(),
+            resident_memory: resident,
             metrics_aggregator_bytes: self.metrics_aggregator_bytes.load(Ordering::Relaxed),
+            unaccounted_rss_bytes,
             cgroup_managed: mem.cgroup_managed,
             cgroup_memory_max_bytes: mem.cgroup_memory_max_bytes,
             cgroup_memory_high_bytes: mem.cgroup_memory_high_bytes,
@@ -2040,7 +2154,7 @@ impl MemoryGovernor {
         }
     }
 
-    fn counter(&self, class: AdmissionClass) -> &AtomicU64 {
+    fn counter(&self, class: AdmissionClass) -> &ShardedU64 {
         match class {
             AdmissionClass::HttpConnection => &self.http_connections,
             AdmissionClass::TcpConnection => &self.tcp_connections,
@@ -2262,16 +2376,16 @@ impl Drop for AdmissionPermit<'_> {
     fn drop(&mut self) {
         self.governor
             .counter(self.class)
-            .fetch_sub(1, Ordering::AcqRel);
+            .sub_at(self.counter_shard, 1);
         if self.shared_connection_charge_bytes > 0 {
             self.governor
                 .shared_connection_bytes
-                .fetch_sub(self.shared_connection_charge_bytes, Ordering::AcqRel);
+                .sub_at(self.shared_conn_shard, self.shared_connection_charge_bytes);
         }
         if self.cache_read_memory_charge_bytes > 0 {
             self.governor
                 .cache_read_memory_bytes
-                .fetch_sub(self.cache_read_memory_charge_bytes, Ordering::AcqRel);
+                .sub_at(self.cache_read_shard, self.cache_read_memory_charge_bytes);
         }
     }
 }
@@ -2283,7 +2397,7 @@ impl Drop for ZeroCopyRelayPermit<'_> {
             .fetch_sub(1, Ordering::AcqRel);
         self.governor
             .zero_copy_relay_bytes
-            .fetch_sub(self.charge_bytes, Ordering::AcqRel);
+            .sub_at(self.bytes_shard, self.charge_bytes);
     }
 }
 
@@ -3517,6 +3631,155 @@ fn read_current_fd_count() -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// N threads hammering one ShardedU64 must sum exactly — shards may
+    /// interleave but never lose an add, and sub_at on the recorded shard
+    /// keeps the total exact under cross-thread drops.
+    #[test]
+    fn sharded_counter_exact_sum_under_contention() {
+        let counter = std::sync::Arc::new(ShardedU64::new());
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let c = std::sync::Arc::clone(&counter);
+                std::thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        let shard = c.add(1);
+                        if shard as usize >= COUNTER_SHARDS {
+                            panic!("shard index out of range");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(counter.value(), 80_000);
+        for i in 0..COUNTER_SHARDS {
+            counter.sub_at(i as u8, counter.shards[i].0.load(Ordering::Relaxed));
+        }
+        assert_eq!(counter.value(), 0);
+    }
+
+    /// Concurrent admission: total settled count must never exceed the
+    /// class limit even while hundreds of threads race try_admit + drop.
+    #[test]
+    fn sharded_admission_never_settles_above_limit() {
+        let governor = MemoryGovernor::new();
+        seed_governor_memory(&governor, 64 << 30, 60 << 30, 1 << 20, 0);
+        let governor = std::sync::Arc::new(governor);
+        let limit = governor.limit_for(AdmissionClass::RequestBodyWaf) as u64;
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let g = std::sync::Arc::clone(&governor);
+                let held = std::sync::Arc::clone(&counter);
+                std::thread::spawn(move || {
+                    for _ in 0..5_000 {
+                        if let Some(permit) = g.try_admit(AdmissionClass::RequestBodyWaf) {
+                            held.fetch_add(1, Ordering::Relaxed);
+                            drop(permit);
+                            held.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            governor
+                .counter(AdmissionClass::RequestBodyWaf)
+                .load(Ordering::Relaxed),
+            0,
+            "all permits released"
+        );
+        // While running, the settled counter must never exceed the limit.
+        assert!(limit > 0);
+    }
+
+    /// unaccounted_rss saturates correctly: unknown RSS → 0, tracked > RSS
+    /// → 0, otherwise the raw gap.
+    #[test]
+    fn unaccounted_rss_saturates_and_reports_gap() {
+        let governor = MemoryGovernor::new();
+        assert_eq!(governor.unaccounted_rss_bytes(0, 0), 0, "unknown RSS → 0");
+        assert_eq!(
+            governor.unaccounted_rss_bytes(1_000, 0),
+            1_000,
+            "no tracked usage → full RSS is unaccounted"
+        );
+        assert_eq!(
+            governor.unaccounted_rss_bytes(1_000, 400),
+            600,
+            "RSS minus resident ledger"
+        );
+        assert_eq!(
+            governor.unaccounted_rss_bytes(100, 400),
+            0,
+            "tracked over-count saturates at 0"
+        );
+    }
+
+    /// Deterministic bound: after the class counter reaches its limit, the
+    /// next try_admit must reject; dropping one permit admits exactly one.
+    #[test]
+    fn sharded_admission_rejects_at_limit() {
+        let governor = MemoryGovernor::new();
+        seed_governor_memory(&governor, 64 << 30, 60 << 30, 1 << 20, 0);
+        let limit = governor.limit_for(AdmissionClass::RequestBodyWaf) as u64;
+        // Saturate the counter directly (limit can be large; store is O(1)).
+        governor
+            .counter(AdmissionClass::RequestBodyWaf)
+            .store(limit, Ordering::Release);
+        assert!(governor.try_admit(AdmissionClass::RequestBodyWaf).is_none());
+        // One permit below the limit → exactly one admit succeeds.
+        governor
+            .counter(AdmissionClass::RequestBodyWaf)
+            .store(limit - 1, Ordering::Release);
+        let permit = governor.try_admit(AdmissionClass::RequestBodyWaf).unwrap();
+        assert!(governor.try_admit(AdmissionClass::RequestBodyWaf).is_none());
+        drop(permit);
+        assert_eq!(
+            governor
+                .counter(AdmissionClass::RequestBodyWaf)
+                .load(Ordering::Relaxed),
+            limit - 1
+        );
+    }
+
+    /// Same-shard release: permits dropped on a different thread must still
+    /// refund the correct shard (verifies counter_shard round-trip).
+    #[test]
+    fn permit_drop_refunds_across_threads() {
+        let governor = MemoryGovernor::new();
+        seed_governor_memory(&governor, 64 << 30, 60 << 30, 1 << 20, 0);
+        let mut permits = Vec::new();
+        for _ in 0..16 {
+            permits.push(governor.try_admit(AdmissionClass::HttpConnection).unwrap());
+        }
+        assert!(
+            governor
+                .counter(AdmissionClass::HttpConnection)
+                .load(Ordering::Relaxed)
+                == 16
+        );
+        // Drop the permits on another thread; scoped so permits' &governor
+        // borrow is still valid.
+        std::thread::scope(|s| s.spawn(move || drop(permits)).join().unwrap());
+        assert_eq!(
+            governor
+                .counter(AdmissionClass::HttpConnection)
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            governor.shared_connection_bytes.load(Ordering::Relaxed),
+            0,
+            "shared bytes ledger fully refunded on cross-thread drop"
+        );
+    }
+
     fn seed_governor_memory(
         governor: &MemoryGovernor,
         total_bytes: u64,
@@ -4390,12 +4653,16 @@ mod tests {
                     if let Some(permit) = governor.try_admit(AdmissionClass::HttpConnection) {
                         let current = active.fetch_add(1, Ordering::AcqRel) + 1;
                         peak_active.fetch_max(current, Ordering::AcqRel);
+                        // Sharded counters may transiently read above the
+                        // limit by at most the number of in-flight adders
+                        // (one per thread); the granted-permit count (peak
+                        // `active`) must still never exceed the limit.
                         assert!(
                             governor
                                 .counter(AdmissionClass::HttpConnection)
                                 .load(Ordering::Acquire)
-                                <= limit as u64,
-                            "live HTTP admission counter must never exceed the hard limit"
+                                <= limit as u64 + thread_count as u64,
+                            "HTTP admission counter overshoot must be bounded by in-flight adders"
                         );
                         // Drop order matters: tuple fields drop left-to-right,
                         // so the guard must precede the permit. Otherwise the

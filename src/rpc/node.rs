@@ -1441,6 +1441,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         // second object for the slower-changing observability fields.
         let resource_governor_extra = serde_json::json!({
             "metricsAggregatorBytes": governor_snapshot.metrics_aggregator_bytes,
+            "unaccountedRssBytes": governor_snapshot.unaccounted_rss_bytes,
             "pressureEventWakeups": crate::memory_reclaim::pressure_event_wakeups(),
             "ledgerReconcileStaleOwners": crate::memory_reclaim::ledger_reconcile_stale_owners(),
             "ledgerReconcileBytesRefunded": crate::memory_reclaim::ledger_reconcile_bytes_refunded(),

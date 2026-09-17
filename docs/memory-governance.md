@@ -265,6 +265,40 @@ Mace storage capacity is selected cgroup-first: `memory.max`, then
 `memory.high`, then host total. A small cgroup limit can no longer pick a
 host-sized storage tier.
 
+## Hot-Path Contention (Sharded Counters + RCU WAF Reads)
+
+Admission counters and the shared byte ledgers (`shared_connection_bytes`,
+`cache_read_memory_bytes`, `zero_copy_relay_bytes`) are 64-way
+cacheline-sharded (`ShardedU64`): each thread mutates its own cacheline, so
+per-request admission is an uncontended `fetch_add` plus a 64-lane relaxed
+sum instead of a shared CAS loop. Permits record their shard and subtract
+from it on drop, keeping totals exact at quiescence. The settled count still
+never exceeds the class limit — the add→sum→rollback protocol may
+transiently read up to `limit + in-flight adders` but grants never exceed
+the limit. `udp_queued_bytes`/`tcp_queue_bytes` keep strict CAS because
+their never-exceed-semantics contract is load-bearing for queue budgets.
+
+WAF scoped-IP reads (`is_blocked`/`is_whitelisted`/`is_graylisted`) go
+through an RCU read path: an immutable per-kind union snapshot
+(`blocks∪list_blocks`, `whitelists∪list_whitelists`, `graylists∪
+list_graylists`) published via `ArcSwap`, plus a small delta map carrying
+every mutation since the last snapshot build. Writers still mutate the
+source DashMaps (the authority), then publish the resolved union value into
+the delta; when the delta reaches `IP_DELTA_CAP` (262144) a single-flight
+rebuild installs a fresh delta, folds the source maps into a new snapshot,
+and swaps it in. A SeqCst fence on both sides makes a lost write impossible:
+either the snapshot scan observes the map mutation, or the delta insert
+lands in the post-swap delta. Delta entries carrying `IP_DELTA_REMOVED`
+shadow stale snapshot entries, so evicted/removed keys disappear instantly.
+Reads are instant-consistent (no enforcement gap) and wait-free — no shard
+locks over the multi-million-entry maps.
+
+`unaccountedRssBytes` on the node status resourceGovernor section reports
+`process RSS − (resident ledger + connection/relay/queue/cache-read ledgers
++ metrics gauge)`, saturating at 0. It is an attribution-gap signal, not
+leak proof — allocator slack and uninstrumented structures legitimately
+count there; sustained growth means estimator drift or missing ledgers.
+
 The node pressure signal propagated over `X-Cloud-Node-Pressure` now includes
 a memory component (elevated memory pressure raises the score alongside the
 existing connection/CPU mix), so L1/L2 peers see memory stress instead of an
