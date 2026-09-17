@@ -1704,8 +1704,11 @@ impl WafStateManager {
     /// Upper bound on earliest-expiring entries one capacity eviction removes.
     /// The actual batch is `over.max(capacity / 16)` clamped to this: small
     /// maps evict exactly what is needed, large maps free ~6% headroom per
-    /// scan so a sustained insert storm amortizes the O(map) pass.
-    const WAF_STATE_EVICT_BATCH_MAX: usize = 512;
+    /// scan so a sustained insert storm amortizes the O(map) pass — with a
+    /// 512-slot batch a 1.6M-entry map would rescan ~2700 times under a 1.4M
+    /// insert storm (minutes of CPU). 256k caps the transient victim Vec at
+    /// ~8MiB.
+    const WAF_STATE_EVICT_BATCH_MAX: usize = 262_144;
 
     fn scoped_state_map_capacity() -> usize {
         crate::memory_governor::MEMORY_GOVERNOR

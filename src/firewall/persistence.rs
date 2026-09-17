@@ -153,8 +153,9 @@ fn trim_pending_upserts_with_capacity(pending: &mut PendingState, capacity: usiz
         return 0;
     }
     // Small queues evict exactly `over`; large queues free ~6% headroom per
-    // scan so a sustained enqueue storm amortizes the O(n) pass.
-    let batch = over.max(capacity / 16).min(1024).min(pending.upserts.len());
+    // scan so a sustained enqueue storm amortizes the O(n) pass. The 256k
+    // clamp bounds the transient victim Vec (~12MiB of String keys).
+    let batch = over.max(capacity / 16).min(262_144).min(pending.upserts.len());
     let mut heap: BinaryHeap<EarliestPending> = BinaryHeap::with_capacity(batch + 1);
     for (key, record) in pending.upserts.iter() {
         heap.push(EarliestPending {
