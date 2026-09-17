@@ -23,19 +23,31 @@
 //! The EdgeCC decision layer (§2.4) is T5; this crate deliberately ships
 //! the model/inference/envelope foundation first.
 
+pub mod accecn;
+pub mod aggregate;
 pub mod cc;
+pub mod codel;
+pub mod edgecc;
 pub mod envelope;
 mod instant;
 pub mod inference;
 pub mod model;
+pub mod path_table;
 pub mod rate_sample;
 pub mod rtt;
+pub mod sched;
 pub mod sim;
 
+pub use accecn::{AccEcn, EcnMode, Flags as AccEcnFlags};
+pub use aggregate::{Aggregate, AggregateStats};
 pub use cc::{CcSnapshot, CongestionController};
+pub use codel::{Codel, CodelAction};
+pub use edgecc::{AggregateLease, EdgeCc, PathPrior, Tier};
 pub use envelope::Envelope;
 pub use inference::{Inference, SbdStats, SharedBottleneckJudge};
 pub use instant::TransportInstant;
 pub use model::PathModel;
+pub use path_table::{PathKey, PathSample, PathTable};
 pub use rate_sample::{RateSample, RateSampler, TxRecord};
 pub use rtt::RttState;
+pub use sched::{Admit, Lease, Scheduler, TimingWheel};

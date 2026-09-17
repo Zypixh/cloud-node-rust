@@ -20,7 +20,7 @@ use std::time::Duration;
 pub mod parts;
 pub mod reference;
 
-pub use reference::{CubicRef, NewRenoRef};
+pub use reference::{Bbr3Ref, CubicRef, LossBlindRef, NewRenoRef};
 
 /// Status payload exported into /status and per-session logs (F8).
 ///
@@ -123,4 +123,10 @@ pub trait CongestionController {
     fn pacing_rate(&self) -> Option<u64>;
 
     fn snapshot(&self) -> CcSnapshot;
+
+    /// §5 path-migration hook (quinn `clone_box`): rebuild meaningful
+    /// state from a prior snapshot — window, pacing and model priors
+    /// carry; per-round episode machinery restarts. Default no-op for
+    /// controllers that start fresh.
+    fn seed_from_snapshot(&mut self, _snap: &CcSnapshot) {}
 }

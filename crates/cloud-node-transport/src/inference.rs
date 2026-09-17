@@ -125,6 +125,10 @@ pub struct Inference {
     /// Classic-ECN flag for the current path: CE events arrive as
     /// once-per-window events rather than byte counts.
     classic_ecn: bool,
+    /// Ablation (§7.4): force the random-loss baseline to zero so every
+    /// quiet loss counts as congestion evidence — classic-CC behavior.
+    /// Production never sets it.
+    pub prand_off: bool,
 }
 
 impl Default for Inference {
@@ -145,6 +149,7 @@ impl Inference {
             trusted_ecn,
             sbd: SbdStats::default(),
             classic_ecn: false,
+            prand_off: false,
         }
     }
 
@@ -249,15 +254,21 @@ impl Inference {
                 // baseline: weight = (loss_rate − p_rand)+ × scale.
                 let total = (rs.delivered + rs.lost).max(1) as f64;
                 let rate = rs.lost as f64 / total;
-                let excess = (rate - model.p_rand().unwrap_or(0.0)).max(0.0);
+                let baseline = if self.prand_off {
+                    0.0
+                } else {
+                    model.p_rand().unwrap_or(0.0)
+                };
+                let excess = (rate - baseline).max(0.0);
                 w += weights::LOSS_QUIET_SCALE * excess;
             }
         }
 
-        // inflight rising while delivery plateaus.
+        // inflight rising while delivery plateaus — compare the same
+        // per-sample rate the model filtered.
         if in_flight_delta > 0 && rs.delivered > 0 {
             if let Some(est) = model.bw_est() {
-                let rate = rs.delivery_rate_bps();
+                let rate = model.bw_last_sample();
                 if rate <= est + est / 20 {
                     w += weights::PLATEAU_INFLIGHT_UP;
                 }

@@ -200,6 +200,10 @@ pub struct PathModel {
     bw_dev: Ewma,
     bw_samples: u64,
     bw_last_us: u64,
+    /// The most recent delivery-rate sample (B/s) — inference compares
+    /// plateau evidence against this per-sample rate, not a fresh
+    /// recomputation.
+    bw_last_sample: f64,
     /// `bw_hi` / `bw_lo` — dose-response bounds (BBRv3 concept): the
     /// decision layer sets them from probe/response outcomes.
     bw_hi: Option<u64>,
@@ -285,6 +289,7 @@ impl PathModel {
             bw_dev: Ewma::default(),
             bw_samples: 0,
             bw_last_us: 0,
+            bw_last_sample: 0.0,
             bw_hi: None,
             bw_lo: None,
             base_rtt: WinFilter::new_min(BASE_RTT_WINDOW),
@@ -401,6 +406,7 @@ impl PathModel {
         // --- bandwidth ---
         if rs.delivered > 0 {
             let rate = rs.delivery_rate_bps() as f64;
+            self.bw_last_sample = rate;
             if rate > 0.0 {
                 if let Some(srtt) = rtt.srtt {
                     self.bw_max
@@ -537,6 +543,11 @@ impl PathModel {
     /// `bw_est` — EWMA point estimate of non-app-limited delivery rate.
     pub fn bw_est(&self) -> Option<u64> {
         self.bw_est.get().map(|v| v as u64)
+    }
+
+    /// Most recent delivery-rate sample (B/s) as fed to the filters.
+    pub fn bw_last_sample(&self) -> u64 {
+        self.bw_last_sample as u64
     }
 
     /// `bw_sigma` — mean-deviation EWMA scaled to a σ estimate (√(π/2)

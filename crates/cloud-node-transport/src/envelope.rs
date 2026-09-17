@@ -13,7 +13,10 @@ pub const DEFAULT_HEADROOM_MILLI: u32 = 300;
 
 /// REFILL gate: belief (milli) must stay under this for
 /// `REFILL_AFTER_ROUNDS` consecutive rounds before the ceiling grows.
-pub const REFILL_BELIEF_MILLI: u32 = 250;
+/// Refill gate — *below* the belief sigmoid's neutral point (0.5) plus
+/// margin: refills run at neutral/weak evidence, hold under real
+/// evidence, and stop entirely past EdgeCC's response threshold.
+pub const REFILL_BELIEF_MILLI: u32 = 600;
 
 /// Consecutive low-belief rounds before each REFILL step (§2.5 "K 轮").
 pub const REFILL_AFTER_ROUNDS: u32 = 2;
