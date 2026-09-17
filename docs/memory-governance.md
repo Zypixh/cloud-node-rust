@@ -286,7 +286,11 @@ budgets) is built once per generation and published through `ArcSwap`. A
 `cached_generation` counter is bumped on every write to the cached memory
 inputs (snapshot refresh, invalidation, test reseeds); the hot path loads
 one `Arc` and reads fields — zero snapshot reads, zero division/clamp
-recomputation. Stale generations trigger an idempotent rebuild (concurrent
+recomputation. `limits()` also re-checks the snapshot TTL clock on every
+call, because admit paths no longer call `memory_snapshot()` — without
+that check nothing would re-arm the periodic refresh and pressure
+classification would freeze. Stale generations/TTL trigger an idempotent
+rebuild (concurrent
 rebuilds race, last store wins; the generation is sampled before the
 snapshot read so a mid-refresh input write invalidates the result rather
 than publishing a mixed-input table). A test pins the table to always
