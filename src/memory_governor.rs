@@ -634,6 +634,11 @@ struct GovernorLimits {
     zero_copy_relay_budget_bytes: u64,
     udp_queue_budget_bytes: u64,
     tcp_queue_budget_bytes: u64,
+    /// Snapshot-derived pressure signals so hot paths never re-run the
+    /// classification chain (PSI ratios, budget fractions) per call.
+    fd_soft_limit: u64,
+    memory_pressure_high: bool,
+    memory_pressure_level: MemoryPressureLevel,
 }
 
 pub struct MemoryGovernor {
@@ -888,6 +893,10 @@ impl MemoryGovernor {
                 zero_copy_relay_budget_bytes: 0,
                 udp_queue_budget_bytes: 0,
                 tcp_queue_budget_bytes: 0,
+                fd_soft_limit: 0,
+                // Fail-closed until the first real snapshot lands.
+                memory_pressure_high: true,
+                memory_pressure_level: MemoryPressureLevel::Critical,
             }),
             #[cfg(test)]
             fd_count_reads: AtomicU64::new(0),
@@ -926,8 +935,17 @@ impl MemoryGovernor {
     }
 
     pub fn try_admit_zero_copy_relay(&self) -> Option<ZeroCopyRelayPermit<'_>> {
-        if self.is_connection_admission_pressure_high()
-            || self.fd_equivalent_snapshot().pressure_level >= MemoryPressureLevel::High
+        // One limits table + one fd snapshot for all three pressure gates;
+        // previously this called fd_equivalent_snapshot twice.
+        let limits = self.limits();
+        let fd_level = self.fd_equivalent_snapshot().pressure_level;
+        if limits.memory_pressure_high
+            || fd_level >= MemoryPressureLevel::High
+            || self.connection_admission_used_bytes().saturating_mul(100)
+                >= limits
+                    .shared_connection_budget_bytes
+                    .max(1)
+                    .saturating_mul(80)
         {
             return None;
         }
@@ -935,7 +953,6 @@ impl MemoryGovernor {
         // CAS admission so the relay counter never exceeds the limit even
         // transiently (see try_admit_with_charges). Limit and byte budget
         // come from the materialized table (same values, no recompute).
-        let limits = self.limits();
         let limit = limits.zero_copy_relay_limit;
         let mut current = self.zero_copy_relays.load(Ordering::Acquire);
         loop {
@@ -1093,7 +1110,7 @@ impl MemoryGovernor {
     ) -> Option<ListenerPoolPermit<'_>> {
         let class_id = class as u8;
         let pool_key = (key, class_id);
-        let node_limit = self.limit_for(class) as u64;
+        let node_limit = self.limits().class_limit[class_index(class)];
         let mut pools = lock_recover(&self.listener_pools);
         let current = pools.get(&pool_key).copied().unwrap_or(0);
         if current == 0 && pools.len() >= MAX_LISTENER_POOL_ENTRIES {
@@ -1340,12 +1357,11 @@ impl MemoryGovernor {
     }
 
     pub fn is_memory_pressure_high(&self) -> bool {
-        let snapshot = self.memory_snapshot();
-        memory_pressure_high(&snapshot)
+        self.limits().memory_pressure_high
     }
 
     pub fn current_memory_pressure_level(&self) -> MemoryPressureLevel {
-        memory_pressure_level(&self.memory_snapshot())
+        self.limits().memory_pressure_level
     }
 
     pub fn config_sync_budget(&self) -> ConfigSyncBudget {
@@ -1604,7 +1620,6 @@ impl MemoryGovernor {
     }
 
     pub fn fd_equivalent_snapshot(&self) -> FdEquivalentSnapshot {
-        let snapshot = self.memory_snapshot();
         let live_fd_count = self.live_fd_count();
         let estimated_extra = self.origin_connects.load(Ordering::Relaxed).saturating_add(
             self.zero_copy_relays
@@ -1612,7 +1627,7 @@ impl MemoryGovernor {
                 .saturating_mul(ZERO_COPY_RELAY_FD_EQUIVALENT),
         );
         let used = live_fd_count.saturating_add(estimated_extra);
-        let soft_limit = snapshot.fd_soft_limit.max(1);
+        let soft_limit = self.limits().fd_soft_limit.max(1);
         let used_pct = used.saturating_mul(100).saturating_div(soft_limit);
         FdEquivalentSnapshot {
             soft_limit,
@@ -1643,24 +1658,25 @@ impl MemoryGovernor {
     }
 
     pub fn is_connection_admission_pressure_high(&self) -> bool {
-        let snapshot = self.memory_snapshot();
-        memory_pressure_high(&snapshot)
+        let limits = self.limits();
+        limits.memory_pressure_high
             || self.fd_equivalent_snapshot().pressure_level >= MemoryPressureLevel::High
             || self.connection_admission_used_bytes().saturating_mul(100)
-                >= shared_connection_admission_budget(&snapshot)
+                >= limits
+                    .shared_connection_budget_bytes
                     .max(1)
                     .saturating_mul(80)
     }
 
     pub fn tcp_relay_pressure_idle_timeout(&self) -> Option<Duration> {
-        let snapshot = self.memory_snapshot();
-        let budget = shared_connection_admission_budget(&snapshot).max(1);
+        let limits = self.limits();
+        let budget = limits.shared_connection_budget_bytes.max(1);
         let used_pct = self
             .connection_admission_used_bytes()
             .saturating_mul(100)
             .saturating_div(budget);
         let fd_level = self.fd_equivalent_snapshot().pressure_level;
-        match memory_pressure_level(&snapshot).max(fd_level) {
+        match limits.memory_pressure_level.max(fd_level) {
             MemoryPressureLevel::Critical => Some(Duration::from_secs(2)),
             MemoryPressureLevel::High => Some(Duration::from_secs(5)),
             MemoryPressureLevel::Elevated => Some(Duration::from_secs(15)),
@@ -2160,20 +2176,32 @@ impl MemoryGovernor {
         }
     }
 
-    /// Hot-path accessor for the materialized limits table. Two atomic ops on
-    /// the common path (generation load + ArcSwap guard); a rebuild happens at
-    /// most once per snapshot generation.
+    /// Hot-path accessor for the materialized limits table. The common path
+    /// is a generation compare + ArcSwap load + a TTL check on the snapshot
+    /// clock (~2 atomics + 1 vDSO read). The TTL check is required, not
+    /// optional: admit paths no longer call `memory_snapshot()`, so without
+    /// it nothing would ever trigger the periodic refresh and pressure
+    /// classification would freeze after the first build.
     fn limits(&self) -> arc_swap::Guard<std::sync::Arc<GovernorLimits>> {
         let generation = self.cached_generation.load(Ordering::Acquire);
         let lim = self.cached_limits.load();
         // generation 0 means no snapshot refresh has ever completed; the
         // placeholder table also carries 0, so require nonzero to force the
         // first refresh instead of matching two zeros.
-        if generation != 0 && lim.generation == generation {
+        if generation != 0 && lim.generation == generation && self.snapshot_fresh() {
             return lim;
         }
         drop(lim);
         self.refresh_limits()
+    }
+
+    /// Mirrors the freshness test inside `memory_snapshot()`: the cached
+    /// inputs are usable for at most SNAPSHOT_TTL_MS, after which the table
+    /// must be rebuilt from re-read kernel counters.
+    fn snapshot_fresh(&self) -> bool {
+        let now = crate::utils::time::system_timestamp_millis();
+        let cached_at = self.cached_at_millis.load(Ordering::Relaxed) as i64;
+        cached_at > 0 && now.saturating_sub(cached_at) < SNAPSHOT_TTL_MS
     }
 
     /// Rebuild is idempotent: concurrent rebuilds may race to store, last one
@@ -2201,6 +2229,9 @@ impl MemoryGovernor {
             zero_copy_relay_budget_bytes: zero_copy_relay_budget_bytes(&snapshot),
             udp_queue_budget_bytes: udp_queued_bytes_budget(&snapshot),
             tcp_queue_budget_bytes: tcp_queue_bytes_budget(&snapshot),
+            fd_soft_limit: snapshot.fd_soft_limit,
+            memory_pressure_high: memory_pressure_high(&snapshot),
+            memory_pressure_level: memory_pressure_level(&snapshot),
         }));
         self.cached_limits.load()
     }
@@ -3809,6 +3840,31 @@ mod tests {
             .counter(AdmissionClass::HttpConnection)
             .store(small_table, Ordering::Release);
         assert!(governor.try_admit(AdmissionClass::HttpConnection).is_none());
+    }
+
+    /// Admit paths no longer call `memory_snapshot()`, so the limits table
+    /// must itself notice TTL expiry and rebuild — otherwise pressure
+    /// classification would freeze after the first build.
+    #[test]
+    fn limits_table_rebuilds_on_snapshot_ttl_expiry() {
+        let governor = MemoryGovernor::new();
+        seed_governor_memory(&governor, 64 << 30, 60 << 30, 1 << 20, 0);
+        let g1 = governor.limits().generation;
+        assert!(g1 > 0);
+        // Expire the snapshot clock without touching the generation: this
+        // models the steady-state TTL boundary with no explicit writes.
+        governor.cached_at_millis.store(1, Ordering::Release);
+        // The first call rebuilds from a fresh kernel read; because the
+        // generation is sampled before the snapshot, that refresh bumps the
+        // generation under the in-flight rebuild and the table is stamped
+        // with the previous generation. The next call installs the final
+        // table — mixed-input tables are never accepted as current.
+        let _ = governor.limits();
+        let g2 = governor.limits().generation;
+        assert!(
+            g2 > g1,
+            "TTL expiry must trigger a rebuild: g1={g1} g2={g2}"
+        );
     }
 
     /// Deterministic bound: after the class counter reaches its limit, the
