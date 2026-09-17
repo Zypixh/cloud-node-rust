@@ -162,6 +162,56 @@ silently disable the whole subsystem:
   `panic = "abort"`, where containment is moot; these guards protect debug
   builds and tests.
 
+### Preemptive in-flight shed (`memory_shed`)
+
+Cooperative reclaim cannot touch work already in flight — a long download or
+lingering keepalive connection holds its buffers until it finishes, which can
+lose the race against the OOM killer at `Critical`. `observe_pressure` is
+called from `on_memory_pressure_observed` on every pressure sample and
+escalates through two tiers:
+
+- `High` → keepalive suppression: `early_request_filter` writes responses
+  with `set_keepalive(None)`, so idle connections drain at the next request
+  boundary instead of holding buffers open. Cost when inactive: one relaxed
+  atomic load per request.
+- `Critical` → keepalive suppression plus a drain pass over
+  `L4_CONNECTION_REGISTRY`: connections older than an age threshold are
+  cancelled with `ConnectionCancelReason::MemoryPressureShed` through the
+  existing watch-channel machinery (the same path L4 defense drains use).
+  Each consecutive Critical observation steps down an age ladder
+  (300s → 120s → 60s → 30s → all), so a sustained critical period sheds
+  progressively younger connections. De-escalation below `High` lifts the
+  flag and resets the ladder.
+
+New-connection refusal is deliberately not added: admission already
+collapses toward its critical floor via `pressure_adjusted_min_limit`, and a
+hard-refused connection produces no response at all — shed connections at
+least finish their in-flight response or get a clean close. Shed activity is
+exported on the node-status `resourceGovernor.shed` object
+(`drainedConnectionsTotal`, `keepaliveMarkedTotal`, `criticalStreak`,
+`lastDrainAgeMs`, `keepaliveShedActive`).
+
+### Bounded scoped-IP state (`firewall::bounded_map`)
+
+The seven attacker-driven scoped-IP maps (`blocks`, `kernel_blocks`,
+`list_blocks`, `whitelists`, `list_whitelists`, `graylists`,
+`list_graylists`) moved from `DashMap` to `BoundedScopedMap`: physical
+capacity is allocated once at construction from the governor's state
+capacity, so an IP flood cannot grow the table past its budget. 64 mutexed
+segments × a fixed 8-slot probe window make insert/update/lookup O(PROBES)
+with no global scan; hashing uses a per-instance `ahash::RandomState` so
+precomputed-collision floods do not apply.
+
+At the soft cap, an insert evicts the earliest-expiry entry *inside the
+sampled probe window* (with a rare cross-segment fallback scan when the
+window holds no live victim). Eviction is therefore **sampled, not global
+earliest-expiry** — a deliberate trade for constant-time inserts under
+sustained floods. Expired entries are preferred for reuse inside the window,
+and the periodic GC/`retain` pass still reclaims expired rows exactly.
+Lookup, update, removal, expiry, persistence, RCU union snapshots, and
+eviction metrics are unchanged; network/range maps stay `DashMap` (they are
+bounded by config cardinality, not attacker-floodable).
+
 ## Resident Ledger Consistency
 
 Every map that charges the resident ledger refunds its owner on every removal

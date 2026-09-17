@@ -33,6 +33,7 @@ pub enum ConnectionCancelReason {
     ManagementShutdown,
     ServiceExit,
     ExplicitIdleReclaim,
+    MemoryPressureShed,
 }
 
 impl ConnectionCancelReason {
@@ -43,6 +44,7 @@ impl ConnectionCancelReason {
             Self::ManagementShutdown => "management_shutdown",
             Self::ServiceExit => "service_exit",
             Self::ExplicitIdleReclaim => "explicit_idle_reclaim",
+            Self::MemoryPressureShed => "memory_pressure_shed",
         }
     }
 }
@@ -252,6 +254,12 @@ pub fn snapshot() -> L4ConnectionRegistrySnapshot {
     L4_CONNECTION_REGISTRY.snapshot()
 }
 
+/// Serializes tests that touch the shared `L4_CONNECTION_REGISTRY` — global
+/// drains (e.g. memory-shed age ladders) can cancel connections registered
+/// by another test running in parallel.
+#[cfg(test)]
+pub(crate) static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +267,7 @@ mod tests {
 
     #[test]
     fn registry_drains_matching_ip() {
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap();
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
         let other = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
         let guard = register(ip, L4ConnectionProtocol::Http2);
@@ -276,6 +285,7 @@ mod tests {
 
     #[test]
     fn switch_protocol_carries_cancel_that_raced_before_the_swap() {
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap();
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
         let guard = register(ip, L4ConnectionProtocol::Http1);
 
@@ -289,6 +299,7 @@ mod tests {
 
     #[test]
     fn switch_protocol_keeps_new_entry_cancellable_and_noop_without_cancel() {
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap();
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12));
         let (guard, mut rx) =
             register(ip, L4ConnectionProtocol::Http1).switch_protocol(L4ConnectionProtocol::SniTcp);

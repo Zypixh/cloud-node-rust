@@ -444,6 +444,7 @@ pub fn on_memory_pressure_observed(level: MemoryPressureLevel) {
     }
     drop(coordinator);
     LAST_OBSERVED_PRESSURE.store(level_to_u8(level), Ordering::Relaxed);
+    crate::memory_shed::observe_pressure(level);
 }
 
 pub fn periodic_reclaim_check() {

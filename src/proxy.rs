@@ -8679,6 +8679,13 @@ impl ProxyHttp for EdgeProxy {
         if write_timeout.is_some() {
             session.as_mut().set_write_timeout(write_timeout);
         }
+        if crate::memory_shed::shed_keepalive_active() {
+            // Memory-pressure shed: finish this response, then close the
+            // connection instead of letting it idle on keepalive holding
+            // buffers. One relaxed atomic load when inactive.
+            session.as_downstream_mut().set_keepalive(None);
+            crate::memory_shed::note_keepalive_shed();
+        }
         Ok(())
     }
 

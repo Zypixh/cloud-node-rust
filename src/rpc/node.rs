@@ -1439,12 +1439,20 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         });
         // The json! macro hits the recursion limit past ~50 fields; merge a
         // second object for the slower-changing observability fields.
+        let shed = crate::memory_shed::shed_stats();
         let resource_governor_extra = serde_json::json!({
             "metricsAggregatorBytes": governor_snapshot.metrics_aggregator_bytes,
             "unaccountedRssBytes": governor_snapshot.unaccounted_rss_bytes,
             "pressureEventWakeups": crate::memory_reclaim::pressure_event_wakeups(),
             "ledgerReconcileStaleOwners": crate::memory_reclaim::ledger_reconcile_stale_owners(),
             "ledgerReconcileBytesRefunded": crate::memory_reclaim::ledger_reconcile_bytes_refunded(),
+            "shed": serde_json::json!({
+                "keepaliveShedActive": shed.keepalive_shed_active,
+                "criticalStreak": shed.critical_streak,
+                "drainedConnectionsTotal": shed.drained_connections_total,
+                "keepaliveMarkedTotal": shed.keepalive_marked_total,
+                "lastDrainAgeMs": shed.last_drain_age_ms
+            }),
             "ledgerOwnerCapRejections": governor_snapshot.resident_memory.owner_cap_rejections,
             "ledgerTrackedOwners": governor_snapshot.resident_memory.tracked_owners,
             "lastReclaim": crate::memory_reclaim::last_reclaim_stats().map(|s| serde_json::json!({
