@@ -291,6 +291,17 @@ struct ResidentMemoryAccounting {
     mutation: Mutex<()>,
 }
 
+/// Poison-tolerant `std::sync::Mutex` lock. Every mutex in the governor
+/// guards either plain counters, a `HashMap` whose operations are individually
+/// consistent, or a fan-out of atomic stores — a panic mid-hold can leave
+/// bounded drift (which the reconcile sweep absorbs) but never an
+/// inconsistent structure. `expect` on a poisoned lock would instead panic
+/// every subsequent call forever, turning one transient fault into a
+/// permanent accounting outage in unwind builds.
+fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl ResidentMemoryAccounting {
     fn new() -> Self {
         Self {
@@ -680,11 +691,7 @@ pub type StaticListenerPoolPermit = ListenerPoolPermit<'static>;
 
 impl Drop for ListenerPoolPermit<'_> {
     fn drop(&mut self) {
-        let mut pools = self
-            .governor
-            .listener_pools
-            .lock()
-            .expect("listener pool lock poisoned");
+        let mut pools = lock_recover(&self.governor.listener_pools);
         if let Some(active) = pools.get_mut(&self.key) {
             *active -= 1;
             if *active == 0 {
@@ -1015,10 +1022,7 @@ impl MemoryGovernor {
         let class_id = class as u8;
         let pool_key = (key, class_id);
         let node_limit = self.limit_for(class) as u64;
-        let mut pools = self
-            .listener_pools
-            .lock()
-            .expect("listener pool lock poisoned");
+        let mut pools = lock_recover(&self.listener_pools);
         let current = pools.get(&pool_key).copied().unwrap_or(0);
         if current == 0 && pools.len() >= MAX_LISTENER_POOL_ENTRIES {
             // Bounded map: reclaim idle pools first; if everything is in
@@ -1104,19 +1108,14 @@ impl MemoryGovernor {
     }
 
     fn listener_pool_active_slots(&self) -> u64 {
-        self.listener_pools
-            .lock()
-            .expect("listener pool lock poisoned")
+        lock_recover(&self.listener_pools)
             .values()
             .copied()
             .sum()
     }
 
     fn listener_pool_tracked(&self) -> usize {
-        self.listener_pools
-            .lock()
-            .expect("listener pool lock poisoned")
-            .len()
+        lock_recover(&self.listener_pools).len()
     }
 
     fn disk_totals(&self) -> (u64, u64) {
@@ -1738,11 +1737,7 @@ impl MemoryGovernor {
         old_bytes: u64,
         new_bytes: u64,
     ) -> bool {
-        let _mutation = self
-            .resident
-            .mutation
-            .lock()
-            .expect("resident accounting lock poisoned");
+        let _mutation = lock_recover(&self.resident.mutation);
         let slot = &self.resident.used[category.index()];
         let total = &self.resident.total;
         if old_bytes == new_bytes {
@@ -1808,11 +1803,7 @@ impl MemoryGovernor {
             }
             let _reset = InProgressReset(in_progress);
             let result = (|| {
-                let mut owners = self
-                    .resident
-                    .owners
-                    .lock()
-                    .expect("resident accounting lock poisoned");
+                let mut owners = lock_recover(&self.resident.owners);
                 let key = (category, owner.to_string());
                 let old_bytes = owners.get(&key).copied().unwrap_or(0);
                 // The owners map itself is charge-bearing memory; bound it.
@@ -1846,10 +1837,7 @@ impl MemoryGovernor {
     /// Per-owner lookup used by tests and by the periodic ledger
     /// reconciliation sweep.
     pub fn resident_owner_bytes(&self, category: ResidentCategory, owner: &str) -> u64 {
-        self.resident
-            .owners
-            .lock()
-            .expect("resident accounting lock poisoned")
+        lock_recover(&self.resident.owners)
             .get(&(category, owner.to_string()))
             .copied()
             .unwrap_or(0)
@@ -1867,11 +1855,7 @@ impl MemoryGovernor {
         is_live: &mut dyn FnMut(&str) -> bool,
     ) -> ResidentReconcileStats {
         let (owners, truncated) = {
-            let guard = self
-                .resident
-                .owners
-                .lock()
-                .expect("resident accounting lock poisoned");
+            let guard = lock_recover(&self.resident.owners);
             let mut collected = Vec::new();
             let mut truncated = false;
             for (cat, owner) in guard.keys() {
@@ -2134,10 +2118,7 @@ impl MemoryGovernor {
         // Serialize refreshers: without this lock, two readers that both see
         // an expired TTL can interleave their per-field stores and leave a
         // permanently torn cached snapshot until the next refresh.
-        let _update = self
-            .snapshot_update
-            .lock()
-            .expect("memory snapshot update lock poisoned");
+        let _update = lock_recover(&self.snapshot_update);
         let now = crate::utils::time::system_timestamp_millis();
         let cached_at = self.cached_at_millis.load(Ordering::Relaxed) as i64;
         if cached_at > 0 && now.saturating_sub(cached_at) < SNAPSHOT_TTL_MS {
