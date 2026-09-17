@@ -1,3 +1,4 @@
+pub mod bounded_map;
 pub mod compiled;
 pub mod kernel;
 pub mod lists;
