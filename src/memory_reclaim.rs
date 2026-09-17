@@ -629,10 +629,12 @@ pub fn start_reclaim_monitor() {
 }
 
 static PRESSURE_EVENT_WAKEUPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
 static LAST_EVENT_WAKE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Kernel wakes can arrive in bursts under sustained stall; snapshot re-reads
 /// are cheap but not free, so coalesce wakes closer than this into one.
+#[cfg(target_os = "linux")]
 const MIN_EVENT_WAKE_INTERVAL_MS: u64 = 250;
 
 /// How many kernel pressure events have forced an early snapshot refresh.
@@ -642,6 +644,7 @@ pub fn pressure_event_wakeups() -> u64 {
     PRESSURE_EVENT_WAKEUPS.load(Ordering::Relaxed)
 }
 
+#[cfg(target_os = "linux")]
 fn on_pressure_event_wake(source: &'static str, floor: MemoryPressureLevel) {
     let now = monotonic_elapsed_ms();
     let last = LAST_EVENT_WAKE_MS.load(Ordering::Relaxed);
