@@ -1874,7 +1874,7 @@ pub fn configure_relay_tcp_socket(stream: &TcpStream) {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn apply_tcp_keepalive_timers(fd: std::os::unix::io::RawFd) {
-    let keepalive = *RELAY_KEEPALIVE_CACHE.read().unwrap();
+    let keepalive = *RELAY_KEEPALIVE_CACHE.read().unwrap_or_else(|e| e.into_inner());
     let idle = keepalive.0 as libc::c_int;
     #[cfg(target_os = "linux")]
     let intvl = keepalive.1 as libc::c_int;
@@ -1922,7 +1922,7 @@ fn apply_tcp_keepalive_timers(fd: std::os::unix::io::RawFd) {
 /// Refresh cached relay keepalive timers after config reload.
 pub fn refresh_relay_keepalive_cache(config: &crate::api_config::RelayConfig) {
     let relay = config.normalized();
-    *RELAY_KEEPALIVE_CACHE.write().unwrap() = (
+    *RELAY_KEEPALIVE_CACHE.write().unwrap_or_else(|e| e.into_inner()) = (
         relay.tcp_keepalive_idle_secs,
         relay.tcp_keepalive_interval_secs,
         relay.tcp_keepalive_probes,

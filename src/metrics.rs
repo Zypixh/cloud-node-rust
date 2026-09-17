@@ -919,13 +919,13 @@ impl<T: Clone + Default> TimeCache<T> {
         F: FnOnce() -> T,
     {
         {
-            let read = self.data.read().unwrap();
+            let read = self.data.read().unwrap_or_else(|e| e.into_inner());
             if read.0 == current_tick {
                 return read.1.clone();
             }
         }
 
-        let mut write = self.data.write().unwrap();
+        let mut write = self.data.write().unwrap_or_else(|e| e.into_inner());
         if write.0 == current_tick {
             return write.1.clone();
         }

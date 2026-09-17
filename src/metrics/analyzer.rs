@@ -175,7 +175,7 @@ impl<K: Hash + Eq, V: Clone> ShardedLru<K, V> {
 
     fn clear(&self) {
         for shard in &self.shards {
-            shard.lock().unwrap().clear();
+            shard.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
     }
 
@@ -183,7 +183,7 @@ impl<K: Hash + Eq, V: Clone> ShardedLru<K, V> {
         self.shards
             .iter()
             .map(|shard| {
-                let mut cache = shard.lock().unwrap();
+                let mut cache = shard.lock().unwrap_or_else(|e| e.into_inner());
                 let removed = cache.len();
                 cache.clear();
                 removed
@@ -225,7 +225,7 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
     // Fast path: skip Mutex lock when GeoIP database is unavailable
     let geo = if GEO_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
         let mutex = GEO_CACHE.get_shard(&ip);
-        let mut cache = mutex.lock().unwrap();
+        let mut cache = mutex.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = cache.get(&ip) {
             cached.clone()
         } else {
@@ -241,7 +241,7 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
         (Arc::from(""), Arc::from(""), Arc::from(""), Arc::from(""))
     } else {
         let mutex = UA_CACHE.get_shard_by(ua);
-        let mut cache = mutex.lock().unwrap();
+        let mut cache = mutex.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = cache.get(ua) {
             cached.clone()
         } else {
