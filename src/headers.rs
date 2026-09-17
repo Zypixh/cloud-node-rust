@@ -14,13 +14,18 @@ use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
 
 static HEADER_NAME_CACHE: Lazy<DashMap<String, Option<HeaderName>>> = Lazy::new(DashMap::new);
+/// Keys come from operator config, so growth is naturally bounded — this cap
+/// is pure defense-in-depth against a pathological config blob.
+const HEADER_NAME_CACHE_MAX: usize = 65_536;
 
 fn cached_header_name(name: &str) -> Option<HeaderName> {
     if let Some(cached) = HEADER_NAME_CACHE.get(name) {
         return cached.clone();
     }
     let parsed = HeaderName::from_str(name).ok();
-    HEADER_NAME_CACHE.insert(name.to_string(), parsed.clone());
+    if HEADER_NAME_CACHE.len() < HEADER_NAME_CACHE_MAX {
+        HEADER_NAME_CACHE.insert(name.to_string(), parsed.clone());
+    }
     parsed
 }
 

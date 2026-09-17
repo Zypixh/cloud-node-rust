@@ -155,7 +155,18 @@ impl AggregatedValue {
         bytes_sent: i64,
         bytes_received: i64,
         is_attack: bool,
+        capacity: usize,
     ) {
+        if !self.request_samples.contains_key(&request_attrs) {
+            if self.request_samples.len() >= capacity {
+                crate::pipeline_metrics::note_cardinality_drop(
+                    "metric_request_samples",
+                    self.request_samples.len(),
+                    capacity,
+                );
+                return;
+            }
+        }
         self.request_samples.entry(request_attrs).or_default().add(
             bytes_sent,
             bytes_received,
@@ -187,6 +198,27 @@ impl MetricAggregator {
         }
     }
 
+    fn cardinality_capacity() -> usize {
+        crate::memory_governor::MEMORY_GOVERNOR.metrics_cardinality_capacity()
+    }
+
+    /// Admit a new aggregation key only below the cardinality cap — existing
+    /// keys always accumulate so tracked totals stay exact.
+    fn admit_new_key(&self, key: &AggregationKey, capacity: usize) -> bool {
+        if self.data.contains_key(key) {
+            return true;
+        }
+        if self.data.len() >= capacity {
+            crate::pipeline_metrics::note_cardinality_drop(
+                "metric_aggregator",
+                self.data.len(),
+                capacity,
+            );
+            return false;
+        }
+        true
+    }
+
     pub fn record(
         &self,
         key: AggregationKey,
@@ -194,13 +226,39 @@ impl MetricAggregator {
         bytes_received: i64,
         is_attack: bool,
     ) {
+        self.record_with_capacity(
+            key,
+            bytes_sent,
+            bytes_received,
+            is_attack,
+            Self::cardinality_capacity(),
+        );
+    }
+
+    fn record_with_capacity(
+        &self,
+        key: AggregationKey,
+        bytes_sent: i64,
+        bytes_received: i64,
+        is_attack: bool,
+        capacity: usize,
+    ) {
         let request_attrs = self
             .preserve_request_samples
             .then(|| Arc::clone(&key.request_attrs));
+        if !self.admit_new_key(&key, capacity) {
+            return;
+        }
         let mut entry = self.data.entry(key).or_default();
         entry.add(bytes_sent, bytes_received, is_attack);
         if let Some(request_attrs) = request_attrs {
-            entry.add_request_sample(request_attrs, bytes_sent, bytes_received, is_attack);
+            entry.add_request_sample(
+                request_attrs,
+                bytes_sent,
+                bytes_received,
+                is_attack,
+                capacity,
+            );
         }
     }
 
@@ -216,7 +274,18 @@ impl MetricAggregator {
     }
 
     pub fn restore(&self, samples: Vec<(AggregationKey, AggregatedValue)>) {
+        self.restore_with_capacity(samples, Self::cardinality_capacity());
+    }
+
+    fn restore_with_capacity(
+        &self,
+        samples: Vec<(AggregationKey, AggregatedValue)>,
+        capacity: usize,
+    ) {
         for (key, value) in samples {
+            if !self.admit_new_key(&key, capacity) {
+                continue;
+            }
             let mut entry = self.data.entry(key).or_default();
             entry.count += value.count;
             entry.count_attack += value.count_attack;
@@ -224,6 +293,16 @@ impl MetricAggregator {
             entry.bytes_received += value.bytes_received;
             entry.attack_bytes += value.attack_bytes;
             for (attrs, request_value) in value.request_samples {
+                if !entry.request_samples.contains_key(&attrs) {
+                    if entry.request_samples.len() >= capacity {
+                        crate::pipeline_metrics::note_cardinality_drop(
+                            "metric_request_samples",
+                            entry.request_samples.len(),
+                            capacity,
+                        );
+                        continue;
+                    }
+                }
                 let target = entry.request_samples.entry(attrs).or_default();
                 target.count += request_value.count;
                 target.count_attack += request_value.count_attack;
@@ -443,5 +522,59 @@ mod tests {
         assert_eq!(restored[0].1.bytes_sent, 11);
         assert_eq!(restored[0].1.bytes_received, 7);
         assert_eq!(restored[0].1.count_attack, 1);
+    }
+
+    fn test_key(server_id: i64, tag: &str) -> AggregationKey {
+        AggregationKey {
+            category: Arc::from(crate::metrics::METRIC_CATEGORY_HTTP),
+            server_id,
+            country: Arc::from(""),
+            country_id: 0,
+            province: Arc::from(""),
+            province_id: 0,
+            city: Arc::from(tag),
+            city_id: 0,
+            provider: Arc::from("Unknown"),
+            browser: Arc::from(""),
+            os: Arc::from(""),
+            waf_group_id: 0,
+            waf_action: Arc::from(""),
+            provider_id: 0,
+            browser_version: Arc::from(""),
+            os_version: Arc::from(""),
+            request_attrs: Arc::new(BTreeMap::new()),
+        }
+    }
+
+    #[test]
+    fn cardinality_cap_rejects_new_keys_but_keeps_existing() {
+        let aggregator = MetricAggregator::new();
+        aggregator.record_with_capacity(test_key(1, "a"), 10, 0, false, 2);
+        aggregator.record_with_capacity(test_key(1, "b"), 10, 0, false, 2);
+        // Existing keys still accumulate at the cap.
+        aggregator.record_with_capacity(test_key(1, "a"), 5, 0, false, 2);
+        let before = crate::pipeline_metrics::snapshot().metrics_cardinality_dropped;
+        aggregator.record_with_capacity(test_key(1, "c"), 99, 0, false, 2);
+        assert!(
+            crate::pipeline_metrics::snapshot().metrics_cardinality_dropped > before
+        );
+
+        let rows = aggregator.flush();
+        assert_eq!(rows.len(), 2);
+        let total: i64 = rows.iter().map(|r| r.1.bytes_sent).sum();
+        assert_eq!(total, 25);
+
+        // Restoring flushed rows beyond the cap merges into survivors only.
+        let mut surplus = MetricAggregator::new();
+        surplus.record_with_capacity(test_key(1, "x"), 1, 0, false, 2);
+        surplus.record_with_capacity(test_key(1, "y"), 1, 0, false, 2);
+        surplus.restore_with_capacity(
+            vec![
+                (test_key(1, "z"), Default::default()),
+                (test_key(1, "w"), Default::default()),
+            ],
+            2,
+        );
+        assert_eq!(surplus.data.len(), 2);
     }
 }

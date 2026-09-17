@@ -27,6 +27,10 @@ pub struct PipelineMetricsSnapshot {
     pub config_task_ack_failed: u64,
     pub config_task_deferred: u64,
     pub tcp_relay_buffer_shrunk: u64,
+    pub negative_cache_admission_rejected: u64,
+    pub waf_state_evicted: u64,
+    pub firewall_pending_dropped: u64,
+    pub metrics_cardinality_dropped: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +60,10 @@ pub enum PipelineCounter {
     ConfigTaskAckFailed,
     ConfigTaskDeferred,
     TcpRelayBufferShrunk,
+    NegativeCacheAdmissionRejected,
+    WafStateEvicted,
+    FirewallPendingDropped,
+    MetricsCardinalityDropped,
 }
 
 struct PipelineMetrics {
@@ -84,6 +92,10 @@ struct PipelineMetrics {
     config_task_ack_failed: AtomicU64,
     config_task_deferred: AtomicU64,
     tcp_relay_buffer_shrunk: AtomicU64,
+    negative_cache_admission_rejected: AtomicU64,
+    waf_state_evicted: AtomicU64,
+    firewall_pending_dropped: AtomicU64,
+    metrics_cardinality_dropped: AtomicU64,
 }
 
 impl PipelineMetrics {
@@ -114,6 +126,10 @@ impl PipelineMetrics {
             config_task_ack_failed: AtomicU64::new(0),
             config_task_deferred: AtomicU64::new(0),
             tcp_relay_buffer_shrunk: AtomicU64::new(0),
+            negative_cache_admission_rejected: AtomicU64::new(0),
+            waf_state_evicted: AtomicU64::new(0),
+            firewall_pending_dropped: AtomicU64::new(0),
+            metrics_cardinality_dropped: AtomicU64::new(0),
         }
     }
 
@@ -144,6 +160,12 @@ impl PipelineMetrics {
             PipelineCounter::ConfigTaskAckFailed => &self.config_task_ack_failed,
             PipelineCounter::ConfigTaskDeferred => &self.config_task_deferred,
             PipelineCounter::TcpRelayBufferShrunk => &self.tcp_relay_buffer_shrunk,
+            PipelineCounter::NegativeCacheAdmissionRejected => {
+                &self.negative_cache_admission_rejected
+            }
+            PipelineCounter::WafStateEvicted => &self.waf_state_evicted,
+            PipelineCounter::FirewallPendingDropped => &self.firewall_pending_dropped,
+            PipelineCounter::MetricsCardinalityDropped => &self.metrics_cardinality_dropped,
         }
     }
 
@@ -178,6 +200,14 @@ impl PipelineMetrics {
             config_task_ack_failed: self.config_task_ack_failed.load(Ordering::Relaxed),
             config_task_deferred: self.config_task_deferred.load(Ordering::Relaxed),
             tcp_relay_buffer_shrunk: self.tcp_relay_buffer_shrunk.load(Ordering::Relaxed),
+            negative_cache_admission_rejected: self
+                .negative_cache_admission_rejected
+                .load(Ordering::Relaxed),
+            waf_state_evicted: self.waf_state_evicted.load(Ordering::Relaxed),
+            firewall_pending_dropped: self.firewall_pending_dropped.load(Ordering::Relaxed),
+            metrics_cardinality_dropped: self
+                .metrics_cardinality_dropped
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -200,4 +230,22 @@ pub fn add(counter: PipelineCounter, value: u64) -> u64 {
 
 pub fn snapshot() -> PipelineMetricsSnapshot {
     PIPELINE_METRICS.snapshot()
+}
+
+/// Bump `MetricsCardinalityDropped` and emit a rate-limited warning naming the
+/// tracker that refused a new key.
+pub fn note_cardinality_drop(tracker: &'static str, len: usize, capacity: usize) {
+    add(PipelineCounter::MetricsCardinalityDropped, 1);
+    static LAST_WARN: AtomicU64 = AtomicU64::new(0);
+    let now = crate::utils::time::now_timestamp() as u64;
+    let last = LAST_WARN.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 60
+        && LAST_WARN
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        tracing::warn!(
+            "metrics cardinality full for {tracker}; len={len} capacity={capacity}, new keys dropped"
+        );
+    }
 }

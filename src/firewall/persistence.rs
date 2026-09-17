@@ -1,12 +1,20 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::LazyLock as Lazy;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tracing::warn;
 
 const BLOCK_PREFIX: &str = "FWBLK_V1_";
 const FLUSH_THRESHOLD: usize = 1024;
+/// Pending-queue records are ~4x a scoped-state entry (~400B vs ~96B), so the
+/// queue takes a quarter of the same governor-derived budget.
+const PENDING_CAPACITY_DIVISOR: usize = 4;
+const PENDING_CAPACITY_MIN: usize = 4_096;
+const PENDING_CAPACITY_MAX: usize = 2_000_000;
+const PENDING_CAPACITY_WARN_INTERVAL_SECS: i64 = 60;
+static PENDING_CAPACITY_WARN_AT: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,11 +98,129 @@ pub fn enqueue_delete(scope: &str, server_id: i64, target: &str) {
     });
 }
 
+fn pending_queue_capacity() -> usize {
+    (crate::memory_governor::MEMORY_GOVERNOR.firewall_state_map_capacity()
+        / PENDING_CAPACITY_DIVISOR)
+        .clamp(PENDING_CAPACITY_MIN, PENDING_CAPACITY_MAX)
+}
+
+fn warn_pending_capacity_full(area: &str, len: usize, capacity: usize) {
+    let now = crate::utils::time::now_timestamp();
+    let last = PENDING_CAPACITY_WARN_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < PENDING_CAPACITY_WARN_INTERVAL_SECS {
+        return;
+    }
+    if PENDING_CAPACITY_WARN_AT
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        warn!(
+            "firewall persistence pending queue full for {}; len={} capacity={}, dropping entries",
+            area, len, capacity
+        );
+    }
+}
+
+/// Max-heap entry ordered by `expires_at` so the earliest-expiring pending
+/// upserts can be evicted without `Ord` on the record type.
+struct EarliestPending {
+    expires_at: i64,
+    key: String,
+}
+impl PartialEq for EarliestPending {
+    fn eq(&self, other: &Self) -> bool {
+        self.expires_at == other.expires_at
+    }
+}
+impl Eq for EarliestPending {}
+impl PartialOrd for EarliestPending {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for EarliestPending {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.expires_at.cmp(&other.expires_at)
+    }
+}
+
+/// Evict the earliest-expiring pending upserts until the queue is back under
+/// `capacity`. A dropped upsert only loses on-disk persistence — enforcement
+/// still lives in `WafStateManager`'s in-memory maps.
+fn trim_pending_upserts_with_capacity(pending: &mut PendingState, capacity: usize) -> usize {
+    let over = pending.upserts.len().saturating_sub(capacity);
+    if over == 0 {
+        return 0;
+    }
+    // Small queues evict exactly `over`; large queues free ~6% headroom per
+    // scan so a sustained enqueue storm amortizes the O(n) pass. The 256k
+    // clamp bounds the transient victim Vec (~12MiB of String keys).
+    let batch = over.max(capacity / 16).min(262_144).min(pending.upserts.len());
+    let mut heap: BinaryHeap<EarliestPending> = BinaryHeap::with_capacity(batch + 1);
+    for (key, record) in pending.upserts.iter() {
+        heap.push(EarliestPending {
+            expires_at: record.expires_at,
+            key: key.clone(),
+        });
+        if heap.len() > batch {
+            heap.pop();
+        }
+    }
+    let mut dropped = 0usize;
+    for victim in heap {
+        if pending.upserts.remove(&victim.key).is_some() {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        crate::pipeline_metrics::add(
+            crate::pipeline_metrics::PipelineCounter::FirewallPendingDropped,
+            dropped as u64,
+        );
+        warn_pending_capacity_full("upserts", pending.upserts.len(), capacity);
+    }
+    dropped
+}
+
+fn trim_pending_deletes_with_capacity(pending: &mut PendingState, capacity: usize) -> usize {
+    let over = pending.deletes.len().saturating_sub(capacity);
+    if over == 0 {
+        return 0;
+    }
+    // A dropped tombstone means a deleted block can resurrect on restart —
+    // bounded by `cleanup_expired` since every record carries expires_at.
+    // Drop arbitrary excess; all pending deletes are equally droppable.
+    let victims: Vec<String> = pending.deletes.iter().take(over).cloned().collect();
+    let mut dropped = 0usize;
+    for key in victims {
+        if pending.deletes.remove(&key) {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        crate::pipeline_metrics::add(
+            crate::pipeline_metrics::PipelineCounter::FirewallPendingDropped,
+            dropped as u64,
+        );
+        warn_pending_capacity_full("deletes", pending.deletes.len(), capacity);
+    }
+    dropped
+}
+
+fn trim_pending_with_capacity(pending: &mut PendingState, capacity: usize) {
+    trim_pending_upserts_with_capacity(pending, capacity);
+    trim_pending_deletes_with_capacity(pending, capacity);
+}
+
+fn lock_pending() -> std::sync::MutexGuard<'static, PendingState> {
+    // Pending state stays internally consistent across a panic — recover the
+    // guard instead of silently dropping the persistence operation.
+    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn enqueue(op: PendingOp) {
     let should_flush = {
-        let Ok(mut pending) = PENDING.lock() else {
-            return;
-        };
+        let mut pending = lock_pending();
         match op {
             PendingOp::Upsert(record) => {
                 let key = record.key();
@@ -111,6 +237,7 @@ fn enqueue(op: PendingOp) {
                 pending.deletes.insert(key);
             }
         }
+        trim_pending_with_capacity(&mut pending, pending_queue_capacity());
         pending.upserts.len() + pending.deletes.len() >= FLUSH_THRESHOLD
     };
     if should_flush {
@@ -120,9 +247,7 @@ fn enqueue(op: PendingOp) {
 
 pub fn flush_pending() -> bool {
     let (upserts, deletes) = {
-        let Ok(mut pending) = PENDING.lock() else {
-            return false;
-        };
+        let mut pending = lock_pending();
         if pending.upserts.is_empty() && pending.deletes.is_empty() {
             return true;
         }
@@ -144,7 +269,8 @@ pub fn flush_pending() -> bool {
     let ok = crate::metrics::storage::STORAGE.write_raw_batch(puts, delete_records.clone());
     if !ok {
         warn!("failed to flush firewall block records to storage");
-        if let Ok(mut pending) = PENDING.lock() {
+        {
+            let mut pending = lock_pending();
             for (key, record) in upsert_records {
                 if !pending.deletes.contains(&key) {
                     pending.upserts.insert(key, record);
@@ -154,6 +280,10 @@ pub fn flush_pending() -> bool {
                 pending.upserts.remove(&key);
                 pending.deletes.insert(key);
             }
+            // Re-queued records plus whatever arrived during the failed write
+            // can exceed the cap — trim so a dead storage backend plus a
+            // block storm cannot grow the queue without bound.
+            trim_pending_with_capacity(&mut pending, pending_queue_capacity());
         }
     }
     ok
@@ -219,5 +349,44 @@ mod tests {
             true,
         );
         assert_eq!(record.key(), "FWBLK_V1_server_42_192.0.2.1");
+    }
+
+    #[test]
+    fn pending_upserts_trim_evicts_earliest_expiry() {
+        let mut pending = PendingState::default();
+        // cap 4, insert 6 records — ip(1) and ip(2) expire earliest.
+        for n in 1..=6u8 {
+            let record = FirewallBlockRecord {
+                expires_at: n as i64,
+                ..FirewallBlockRecord::runtime(
+                    format!("192.0.2.{n}"),
+                    7,
+                    "server".to_string(),
+                    1000,
+                    false,
+                )
+            };
+            pending.upserts.insert(record.key(), record);
+        }
+        let dropped = trim_pending_upserts_with_capacity(&mut pending, 4);
+        assert_eq!(dropped, 2);
+        assert_eq!(pending.upserts.len(), 4);
+        // The two earliest-expiring records must be gone.
+        assert!(!pending.upserts.contains_key("FWBLK_V1_server_7_192.0.2.1"));
+        assert!(!pending.upserts.contains_key("FWBLK_V1_server_7_192.0.2.2"));
+        assert!(pending.upserts.contains_key("FWBLK_V1_server_7_192.0.2.6"));
+    }
+
+    #[test]
+    fn pending_deletes_trim_bounds_tombstones() {
+        let mut pending = PendingState::default();
+        for n in 0..8u8 {
+            pending
+                .deletes
+                .insert(block_key("server", 7, &format!("192.0.2.{n}")));
+        }
+        let dropped = trim_pending_deletes_with_capacity(&mut pending, 4);
+        assert_eq!(dropped, 4);
+        assert_eq!(pending.deletes.len(), 4);
     }
 }

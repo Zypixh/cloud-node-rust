@@ -921,7 +921,7 @@ impl HttpProxyManager {
                         return;
                     }
                     let connection_guard = l4_connection_registry::register(
-                        effective_addr.ip(),
+                        effective_addr,
                         L4ConnectionProtocol::Http1,
                     );
                     // Shadow counter for physical downstream transports.
@@ -984,7 +984,7 @@ impl HttpProxyManager {
                     return;
                 }
                 let connection_guard =
-                    l4_connection_registry::register(client_addr.ip(), L4ConnectionProtocol::Http1);
+                    l4_connection_registry::register(client_addr, L4ConnectionProtocol::Http1);
                 // Shadow counter for physical downstream transports; held for
                 // the whole connection, across protocol switches.
                 let _downstream_transport = crate::metrics::transport_metrics_guard(
@@ -1589,7 +1589,7 @@ impl HttpProxyManager {
                 };
                 if let Some(server) = route.sni_passthrough_server {
                     let sni_connection_guard = l4_connection_registry::register(
-                        client_addr.ip(),
+                        client_addr,
                         L4ConnectionProtocol::SniTcp,
                     );
                     let sni_cancel_rx = sni_connection_guard.cancel_receiver();
@@ -1745,7 +1745,7 @@ impl HttpProxyManager {
             crate::l4_defense::current_pressure_level(),
         );
         let connection_guard =
-            l4_connection_registry::register(client_addr.ip(), L4ConnectionProtocol::Http1);
+            l4_connection_registry::register(client_addr, L4ConnectionProtocol::Http1);
         let _downstream_transport = crate::metrics::transport_metrics_guard(
             crate::metrics::ShadowTransportKind::DownstreamTcp,
         );
@@ -2398,6 +2398,10 @@ async fn process_h2_stream(args: ProcessH2StreamArgs) {
                 port,
                 crate::l4_defense::current_pressure_level(),
             );
+            // Per-connection admission ticket: stream admissions draw from a
+            // local pool instead of the global counter — one registry lookup
+            // per connection instead of one global RMW per stream.
+            let stream_ticket = crate::l4_connection_registry::ticket_for(&client_addr);
             loop {
                 let idle_deadline = h2_state.next_idle_deadline();
                 let lifetime_deadline = h2_state.lifetime_deadline();
@@ -2509,9 +2513,13 @@ async fn process_h2_stream(args: ProcessH2StreamArgs) {
                                 break;
                             }
                         };
-                        let global_stream_permit = match MEMORY_GOVERNOR
-                            .try_admit(AdmissionClass::Http2Stream)
-                        {
+                        let global_stream_permit = match crate::memory_ticket::admit_pooled(
+                            stream_ticket.as_ref(),
+                            AdmissionClass::Http2Stream,
+                            crate::memory_governor::class_estimated_bytes(
+                                AdmissionClass::Http2Stream,
+                            ),
+                        ) {
                             Some(permit) => permit,
                             None => {
                                 h2_state.record_reject();

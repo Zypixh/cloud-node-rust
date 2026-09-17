@@ -571,12 +571,43 @@ pub fn reclaim_waf_regex_caches(clear_all: bool) -> u64 {
     if clear_all {
         WAF_RE_CACHE.invalidate_all();
         WAF_BYTES_RE_CACHE.invalidate_all();
+        // moka invalidation is lazy: entries are marked but stay resident
+        // until maintenance. Force it so Critical reclaim frees the pages
+        // now and the removed-count below reflects reality.
+        WAF_RE_CACHE.run_pending_tasks();
+        WAF_BYTES_RE_CACHE.run_pending_tasks();
+    } else {
+        // Partial reclaim: evict a deterministic ~half of each cache by key
+        // hash parity. Uniform over the key space, so hot patterns recompile
+        // on next use while the resident footprint roughly halves.
+        evict_hash_parity(&WAF_RE_CACHE);
+        evict_hash_parity(&WAF_BYTES_RE_CACHE);
+        WAF_RE_CACHE.run_pending_tasks();
+        WAF_BYTES_RE_CACHE.run_pending_tasks();
     }
     before.saturating_sub(
         WAF_RE_CACHE
             .entry_count()
             .saturating_add(WAF_BYTES_RE_CACHE.entry_count()),
     )
+}
+
+fn evict_hash_parity<K, V>(cache: &moka::sync::Cache<K, V>)
+where
+    K: std::hash::Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    let victims: Vec<K> = cache
+        .iter()
+        .filter_map(|(key, _)| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hasher);
+            (std::hash::Hasher::finish(&hasher) & 1 == 0).then(|| (*key).clone())
+        })
+        .collect();
+    for key in victims {
+        cache.invalidate(&key);
+    }
 }
 
 #[cfg(test)]

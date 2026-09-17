@@ -86,6 +86,11 @@ ahash = "0.8.12"
 cloud-node-xdp-common = { path = "crates/cloud-node-xdp-common", features = ["aya"] }
 cloud-node-transport = { path = "crates/cloud-node-transport" }
 mimalloc = "0.1.52"
+# Pinned to the exact version mimalloc links so `mi_collect` resolves to the
+# same statically linked allocator instance instead of a second copy.
+# `extended` exposes mi_collect/mi_option_set; feature unification merges it
+# into the single libmimalloc-sys build shared with the `mimalloc` crate.
+libmimalloc-sys = { version = "=0.1.49", features = ["extended"] }
 memmap2 = "0.9.11"
 
 [target.'cfg(target_os = "linux")'.dependencies]

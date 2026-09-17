@@ -359,6 +359,37 @@ impl InflightUdpDnsLookup {
     }
 }
 
+/// Leader-side cleanup for an in-flight DNS lookup. If the leader future is
+/// cancelled mid-lookup (outer timeout, session abort), the inflight entry
+/// would stay in the map forever with `result == None` and every follower on
+/// the same key would wait indefinitely. Dropping the guard always publishes
+/// an outcome, removes the map entry, and wakes the waiters.
+struct InflightLeaderGuard<'a> {
+    inflight: &'a DashMap<UdpDnsCacheKey, Arc<InflightUdpDnsLookup>>,
+    key: &'a UdpDnsCacheKey,
+    flight: Arc<InflightUdpDnsLookup>,
+}
+
+impl Drop for InflightLeaderGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut result = self
+                .flight
+                .result
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if result.is_none() {
+                *result = Some(Err(Arc::new(anyhow::anyhow!(
+                    "UDP DNS lookup cancelled before completing"
+                ))));
+            }
+        }
+        self.inflight
+            .remove_if(self.key, |_, current| Arc::ptr_eq(current, &self.flight));
+        self.flight.notify.notify_waiters();
+    }
+}
+
 struct UdpDnsResolutionCache {
     cache: Cache<UdpDnsCacheKey, Arc<Vec<SocketAddr>>>,
     inflight: DashMap<UdpDnsCacheKey, Arc<InflightUdpDnsLookup>>,
@@ -400,39 +431,61 @@ impl UdpDnsResolutionCache {
         };
 
         if is_leader {
-            let result = lookup(lookup_addr.clone())
-                .await
-                .and_then(|addrs| {
-                    if addrs.is_empty() {
-                        Err(anyhow::anyhow!(
-                            "UDP backend address {} resolved no addresses",
-                            lookup_addr
-                        ))
-                    } else {
-                        Ok(Arc::new(addrs))
-                    }
-                })
-                .map_err(Arc::new);
+            // Held until the result is published; on cancellation it posts a
+            // failure, removes the inflight entry, and wakes followers.
+            let leader_guard = InflightLeaderGuard {
+                inflight: &self.inflight,
+                key: &key,
+                flight: flight.clone(),
+            };
+            // Bound a blackholed resolver: getaddrinfo retries can otherwise
+            // pin the inflight entry (and every follower) for tens of seconds.
+            let result = tokio::time::timeout(
+                Duration::from_secs(15),
+                lookup(lookup_addr.clone()),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("UDP backend address {} resolution timed out", lookup_addr)
+            })
+            .and_then(|outcome| outcome)
+            .and_then(|addrs| {
+                if addrs.is_empty() {
+                    Err(anyhow::anyhow!(
+                        "UDP backend address {} resolved no addresses",
+                        lookup_addr
+                    ))
+                } else {
+                    Ok(Arc::new(addrs))
+                }
+            })
+            .map_err(Arc::new);
             if let Ok(addrs) = &result {
                 self.cache.insert(key.clone(), addrs.clone());
             }
-            *flight.result.lock().unwrap() = Some(result.clone());
-            self.inflight
-                .remove_if(&key, |_, current| Arc::ptr_eq(current, &flight));
-            flight.notify.notify_waiters();
+            *flight.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.clone());
+            drop(leader_guard);
             match result {
                 Ok(addrs) => select_udp_backend_addr(&addrs, &lookup_addr, client_ip),
                 Err(err) => Err(anyhow::anyhow!(err.to_string())),
             }
         } else {
             loop {
-                if let Some(result) = flight.result.lock().unwrap().clone() {
+                if let Some(result) = flight.result.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                     return match result {
                         Ok(addrs) => select_udp_backend_addr(&addrs, &lookup_addr, client_ip),
                         Err(err) => Err(anyhow::anyhow!(err.to_string())),
                     };
                 }
-                flight.notify.notified().await;
+                // `notify_waiters` only wakes already-registered waiters, so a
+                // result published between the check above and our first poll
+                // of `notified()` would sleep forever. Re-check on a bounded
+                // interval instead of trusting the wake alone.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    flight.notify.notified(),
+                )
+                .await;
             }
         }
     }
@@ -1186,7 +1239,7 @@ impl UdpProxyManager {
         if !is_creator {
             loop {
                 let notified = flight.notify.notified();
-                if let Some(result) = flight.result.lock().unwrap().clone() {
+                if let Some(result) = flight.result.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                     return result.map_err(|err| anyhow::anyhow!(err.to_string()));
                 }
                 notified.await;
@@ -1214,7 +1267,7 @@ impl UdpProxyManager {
             })
             .await
             .map_err(Arc::new);
-        *flight.result.lock().unwrap() = Some(result.clone());
+        *flight.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.clone());
         flight.notify.notify_waiters();
         result.map_err(|err| anyhow::anyhow!(err.to_string()))
     }
@@ -2048,6 +2101,76 @@ mod tests {
         assert_eq!(second.unwrap(), "127.0.0.1:18443".parse().unwrap());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(cache.cache.get(&key).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dns_cache_leader_cancellation_releases_followers_and_entry() {
+        let cache = Arc::new(UdpDnsResolutionCache::new());
+        let key = UdpDnsCacheKey {
+            origin_id: 9,
+            host: "cancelled.example".to_string(),
+            port: 18443,
+            prefer_ipv4: true,
+            runtime_reload_generation: 5,
+        };
+
+        // Leader blocks on a channel that is never signalled, then its task is
+        // aborted — the inflight entry must still be removed and followers
+        // must observe a published failure instead of hanging forever.
+        // `_block_tx` stays alive so the leader never resolves on its own.
+        let (_block_tx, block_rx) = tokio::sync::oneshot::channel::<()>();
+        let leader = {
+            let cache = cache.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                cache
+                    .resolve(
+                        key,
+                        "cancelled.example:18443".to_string(),
+                        "127.0.0.1".parse().unwrap(),
+                        move |_| async move {
+                            let _ = block_rx.await;
+                            Ok(vec!["127.0.0.1:18443".parse().unwrap()])
+                        },
+                    )
+                    .await
+            })
+        };
+
+        // Let the leader publish the inflight entry before the follower joins.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(cache.inflight.len(), 1);
+
+        let follower = {
+            let cache = cache.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                cache
+                    .resolve(
+                        key,
+                        "cancelled.example:18443".to_string(),
+                        "127.0.0.1".parse().unwrap(),
+                        |_| async {
+                            panic!("follower must not become leader mid-flight")
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        leader.abort();
+        // The follower must complete (with an error) well under any realistic
+        // hang: it polls the result on a bounded interval.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), follower)
+            .await
+            .expect("follower must not hang after leader cancellation")
+            .expect("follower task must not panic");
+        assert!(outcome.is_err(), "cancelled lookup must surface an error");
+        assert!(
+            cache.inflight.is_empty(),
+            "leader cancellation must remove the inflight entry"
+        );
     }
 
     #[tokio::test]

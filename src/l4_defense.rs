@@ -225,6 +225,10 @@ impl ActiveIpTracker {
         loop {
             let current = counter.load(Ordering::Acquire);
             if current >= limit {
+                // Rejected acquisitions must not strand the counter entry we
+                // just created — an IP-spoofed flood would otherwise grow the
+                // tracker without bound.
+                self.remove_if_idle(ip, &counter);
                 return None;
             }
             if counter
@@ -2116,6 +2120,27 @@ mod tests {
         assert!(try_acquire_tcp_active_ip(ip, 1).is_none());
         drop(permit);
         assert!(try_acquire_tcp_active_ip(ip, 1).is_some());
+    }
+
+    #[test]
+    fn active_ip_tracker_rejected_acquire_leaves_no_entry() {
+        // Permits drop against the global tracker, so exercise it directly.
+        let ip: IpAddr = "198.51.100.99".parse().unwrap();
+        {
+            let permit = try_acquire_tcp_active_ip(ip, 1).expect("first permit");
+            assert!(try_acquire_tcp_active_ip(ip, 1).is_none());
+            // A rejected acquire must not strand a fresh counter entry —
+            // an IP-spoofed flood would otherwise grow the tracker without
+            // bound. The live permit legitimately keeps its entry here.
+            assert!(TCP_ACTIVE_IP_TRACKER.active_by_ip.contains_key(&ip));
+            drop(permit);
+        }
+        assert!(
+            !TCP_ACTIVE_IP_TRACKER.active_by_ip.contains_key(&ip),
+            "tracker must release the entry after the last permit drops"
+        );
+        let permit = try_acquire_tcp_active_ip(ip, 1).expect("re-acquire after cleanup");
+        drop(permit);
     }
 
     fn test_firewall_policy(

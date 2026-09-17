@@ -82,6 +82,10 @@ pub fn insert_snapshot(snapshot: ReplicaStatsSnapshot) {
 
 pub fn aggregate() -> AggregatedReplicaStats {
     let now = crate::utils::time::now_timestamp();
+    // Shrink the map to live pods — the read-side staleness filter already
+    // ignores dead entries, but without removal the map would accumulate one
+    // row per pod ever seen across rolling restarts.
+    REPLICA_STATS.retain(|_, snapshot| now - snapshot.created_at <= 30);
     let mut by_pod: HashMap<String, ReplicaStatsSnapshot> = HashMap::new();
     for entry in REPLICA_STATS.iter() {
         if now - entry.value().created_at <= 30 {

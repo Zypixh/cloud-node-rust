@@ -1,10 +1,11 @@
+use crate::firewall::bounded_map::BoundedScopedMap;
 use crate::firewall::kernel::{KernelFilter, KernelFilterRange, KernelFilterSnapshot, NoopFilter};
 use crate::firewall::persistence::FirewallBlockRecord;
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, mapref::entry::Entry};
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::{InMemoryState, NotKeyed}};
 use ipnet::IpNet;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -156,6 +157,7 @@ const STATE_CAPACITY_WARN_INTERVAL_SECS: i64 = 60;
 static IP_LIMITER_CAPACITY_WARN_AT: AtomicI64 = AtomicI64::new(0);
 static COUNTER_CAPACITY_WARN_AT: AtomicI64 = AtomicI64::new(0);
 static IP_BW_CAPACITY_WARN_AT: AtomicI64 = AtomicI64::new(0);
+static SCOPED_STATE_CAPACITY_WARN_AT: AtomicI64 = AtomicI64::new(0);
 
 /// Wraps a RateLimiter with a last-seen timestamp for GC and the QPS value the
 /// quota was built from, so hot-reload can detect and replace stale limiters.
@@ -187,6 +189,30 @@ impl TrackedLimiter {
 
     fn is_idle(&self, now: i64) -> bool {
         now.saturating_sub(self.last_seen.load(Ordering::Relaxed)) >= LIMITER_IDLE_SECS
+    }
+}
+
+/// Heap entry ordered by expiry alone so the eviction heap can rank scoped
+/// keys without requiring `Ord` on the key type.
+struct EarliestExpiry<K> {
+    expiry: i64,
+    key: K,
+}
+
+impl<K> PartialEq for EarliestExpiry<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.expiry == other.expiry
+    }
+}
+impl<K> Eq for EarliestExpiry<K> {}
+impl<K> PartialOrd for EarliestExpiry<K> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<K> Ord for EarliestExpiry<K> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.expiry.cmp(&other.expiry)
     }
 }
 
@@ -223,6 +249,27 @@ const CANDIDATE_STATS_IDLE_SECS: i64 = 6 * 3600;
 
 type NetworkSnapshot = HashMap<i64, Arc<NetworkScopeSnapshot>>;
 type RangeSnapshot = HashMap<i64, Arc<Vec<(IpAddrRange, i64)>>>;
+
+/// Scoped-IP read path (RCU): readers hit one immutable union snapshot plus
+/// a small `delta` carrying every mutation since the snapshot was built.
+/// Writers mutate the source DashMaps (still the authority), then publish a
+/// resolved union entry into the delta — so reads stay instant-consistent
+/// without per-request DashMap lookups over the multi-million-entry maps.
+const IP_DELTA_CAP: usize = 262_144;
+const IP_DELTA_REMOVED: i64 = i64::MIN;
+const KIND_BLOCK: u8 = 0;
+const KIND_WHITE: u8 = 1;
+const KIND_GRAY: u8 = 2;
+
+/// Immutable per-kind union view: (server_id, ip) -> max expiry across the
+/// two source maps for that kind. Built single-flight from the source maps.
+struct IpReadSnapshot {
+    blocked: HashMap<(i64, IpAddr), i64>,
+    whitelisted: HashMap<(i64, IpAddr), i64>,
+    graylisted: HashMap<(i64, IpAddr), i64>,
+}
+
+type IpDelta = DashMap<(u8, i64, IpAddr), i64>;
 
 #[derive(Clone, Debug, Default)]
 struct NetworkScopeSnapshot {
@@ -407,24 +454,28 @@ impl RollingCounter {
 }
 
 pub struct WafStateManager {
-    pub blocks: DashMap<(i64, IpAddr), i64>,
-    kernel_blocks: DashMap<(i64, IpAddr), i64>,
+    // Scoped-IP maps are bounded slot tables: physical memory is fixed at
+    // construction from the governor's state capacity, inserts are an
+    // 8-slot probe with in-window earliest-expiry eviction, and flood CPU
+    // stays O(1). Network/range maps stay DashMap (much lower cardinality).
+    pub blocks: BoundedScopedMap<(i64, IpAddr)>,
+    kernel_blocks: BoundedScopedMap<(i64, IpAddr)>,
     pub block_networks: DashMap<(i64, IpNet), i64>,
     kernel_block_networks: DashMap<(i64, IpNet), i64>,
     block_network_snapshots: ArcSwap<NetworkSnapshot>,
-    list_blocks: DashMap<(i64, IpAddr), i64>,
+    list_blocks: BoundedScopedMap<(i64, IpAddr)>,
     list_block_networks: DashMap<(i64, IpNet), i64>,
     list_block_network_snapshots: ArcSwap<NetworkSnapshot>,
-    pub whitelists: DashMap<(i64, IpAddr), i64>,
+    pub whitelists: BoundedScopedMap<(i64, IpAddr)>,
     whitelist_networks: DashMap<(i64, IpNet), i64>,
     whitelist_network_snapshots: ArcSwap<NetworkSnapshot>,
-    list_whitelists: DashMap<(i64, IpAddr), i64>,
+    list_whitelists: BoundedScopedMap<(i64, IpAddr)>,
     list_whitelist_networks: DashMap<(i64, IpNet), i64>,
     list_whitelist_network_snapshots: ArcSwap<NetworkSnapshot>,
-    graylists: DashMap<(i64, IpAddr), i64>,
+    graylists: BoundedScopedMap<(i64, IpAddr)>,
     gray_networks: DashMap<(i64, IpNet), i64>,
     gray_network_snapshots: ArcSwap<NetworkSnapshot>,
-    list_graylists: DashMap<(i64, IpAddr), i64>,
+    list_graylists: BoundedScopedMap<(i64, IpAddr)>,
     list_gray_networks: DashMap<(i64, IpNet), i64>,
     list_gray_network_snapshots: ArcSwap<NetworkSnapshot>,
     server_limiters: DashMap<i64, TrackedLimiter>,
@@ -442,6 +493,12 @@ pub struct WafStateManager {
     list_gray_range_snapshots: ArcSwap<RangeSnapshot>,
     ip_bw_counters: IpBandwidthCounters,
     ip_bw_counter_reservations: AtomicU64,
+    /// RCU read path for scoped-IP block/white/gray lookups: `ip_read` is the
+    /// immutable union snapshot; `ip_delta` holds every post-snapshot
+    /// mutation and is swapped out wholesale by the single-flight rebuilder.
+    ip_read: ArcSwap<IpReadSnapshot>,
+    ip_delta: ArcSwap<IpDelta>,
+    ip_rebuild: std::sync::Mutex<()>,
     kernel_filter: RwLock<Arc<dyn KernelFilter>>,
     candidate_stats: DashMap<(i64, i64), Arc<CandidateRulesetStats>>,
     candidate_stats_reservations: AtomicU64,
@@ -455,25 +512,29 @@ impl Default for WafStateManager {
 
 impl WafStateManager {
     pub fn new() -> Self {
+        // Slot tables are sized once from the governor's state capacity —
+        // machine memory is fixed for the process lifetime, so the physical
+        // bound is decided here and enforced by construction.
+        let ip_table_cap = Self::scoped_state_map_capacity();
         Self {
-            blocks: DashMap::new(),
-            kernel_blocks: DashMap::new(),
+            blocks: BoundedScopedMap::new(ip_table_cap),
+            kernel_blocks: BoundedScopedMap::new(ip_table_cap),
             block_networks: DashMap::new(),
             kernel_block_networks: DashMap::new(),
             block_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
-            list_blocks: DashMap::new(),
+            list_blocks: BoundedScopedMap::new(ip_table_cap),
             list_block_networks: DashMap::new(),
             list_block_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
-            whitelists: DashMap::new(),
+            whitelists: BoundedScopedMap::new(ip_table_cap),
             whitelist_networks: DashMap::new(),
             whitelist_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
-            list_whitelists: DashMap::new(),
+            list_whitelists: BoundedScopedMap::new(ip_table_cap),
             list_whitelist_networks: DashMap::new(),
             list_whitelist_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
-            graylists: DashMap::new(),
+            graylists: BoundedScopedMap::new(ip_table_cap),
             gray_networks: DashMap::new(),
             gray_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
-            list_graylists: DashMap::new(),
+            list_graylists: BoundedScopedMap::new(ip_table_cap),
             list_gray_networks: DashMap::new(),
             list_gray_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
             server_limiters: DashMap::new(),
@@ -491,6 +552,13 @@ impl WafStateManager {
             list_gray_range_snapshots: ArcSwap::from_pointee(HashMap::new()),
             ip_bw_counters: DashMap::with_shard_amount(64),
             ip_bw_counter_reservations: AtomicU64::new(0),
+            ip_read: ArcSwap::from_pointee(IpReadSnapshot {
+                blocked: HashMap::new(),
+                whitelisted: HashMap::new(),
+                graylisted: HashMap::new(),
+            }),
+            ip_delta: ArcSwap::from_pointee(DashMap::new()),
+            ip_rebuild: std::sync::Mutex::new(()),
             kernel_filter: RwLock::new(Arc::new(NoopFilter)),
             candidate_stats: DashMap::new(),
             candidate_stats_reservations: AtomicU64::new(0),
@@ -561,13 +629,18 @@ impl WafStateManager {
         }
     }
 
-    fn snapshot_global_ips(map: &DashMap<(i64, IpAddr), i64>, now: i64) -> Vec<(IpAddr, i64)> {
-        map.iter()
-            .filter_map(|entry| {
-                let expiry = *entry.value();
-                (entry.key().0 == 0 && expiry > now).then_some((entry.key().1, expiry))
-            })
-            .collect()
+    fn snapshot_global_ips(
+        map: &BoundedScopedMap<(i64, IpAddr)>,
+        now: i64,
+    ) -> Vec<(IpAddr, i64)> {
+        let mut out = Vec::new();
+        map.for_each(|(scope, ip), expiry| {
+            if scope == 0 && expiry > now {
+                out.push((ip, expiry));
+            }
+            true
+        });
+        out
     }
 
     fn snapshot_global_networks(map: &DashMap<(i64, IpNet), i64>, now: i64) -> Vec<(IpNet, i64)> {
@@ -598,16 +671,18 @@ impl WafStateManager {
     }
 
     fn max_global_ip_expiry(
-        map: &DashMap<(i64, IpAddr), i64>,
+        map: &BoundedScopedMap<(i64, IpAddr)>,
         ip: IpAddr,
         now: i64,
     ) -> Option<i64> {
-        map.iter()
-            .filter_map(|entry| {
-                let expiry = *entry.value();
-                (entry.key().0 == 0 && entry.key().1 == ip && expiry > now).then_some(expiry)
-            })
-            .max()
+        let mut best: Option<i64> = None;
+        map.for_each(|(scope, entry_ip), expiry| {
+            if scope == 0 && entry_ip == ip && expiry > now {
+                best = Some(best.map_or(expiry, |b| b.max(expiry)));
+            }
+            true
+        });
+        best
     }
 
     fn max_global_network_expiry(
@@ -689,8 +764,9 @@ impl WafStateManager {
     pub fn is_whitelisted(&self, ip: IpAddr, server_id: i64) -> bool {
         let ip = canonical_lookup_ip(ip);
         let now = crate::utils::time::now_timestamp();
-        Self::contains_scoped_ip(&self.whitelists, ip, server_id, now)
-            || Self::contains_scoped_ip(&self.list_whitelists, ip, server_id, now)
+        let delta = self.ip_delta.load();
+        let snap = self.ip_read.load();
+        self.contains_ip_kind(&delta, &snap.whitelisted, KIND_WHITE, ip, server_id, now)
             || Self::contains_scoped_network(&self.whitelist_network_snapshots, ip, server_id, now)
             || Self::contains_scoped_network(
                 &self.list_whitelist_network_snapshots,
@@ -734,15 +810,20 @@ impl WafStateManager {
 
     fn whitelist_ip_overlaps_network(
         &self,
-        map: &DashMap<(i64, IpAddr), i64>,
+        map: &BoundedScopedMap<(i64, IpAddr)>,
         net: IpNet,
         server_id: i64,
         now: i64,
     ) -> bool {
-        map.iter().any(|entry| {
-            let (scope, ip) = *entry.key();
-            now < *entry.value() && (scope == 0 || scope == server_id) && net.contains(&ip)
-        })
+        let mut found = false;
+        map.for_each(|(scope, ip), expiry| {
+            if now < expiry && (scope == 0 || scope == server_id) && net.contains(&ip) {
+                found = true;
+                return false;
+            }
+            true
+        });
+        found
     }
 
     fn scoped_range_snapshot_overlaps(
@@ -774,22 +855,22 @@ impl WafStateManager {
         server_id: i64,
         now: i64,
     ) -> bool {
-        snapshots
-            .load()
+        let snapshot = snapshots.load();
+        snapshot
             .get(&0)
-            .is_some_and(|snapshot| snapshot.overlaps(net, now))
+            .is_some_and(|s| s.overlaps(net, now))
             || (server_id != 0
-                && snapshots
-                    .load()
+                && snapshot
                     .get(&server_id)
-                    .is_some_and(|snapshot| snapshot.overlaps(net, now)))
+                    .is_some_and(|s| s.overlaps(net, now)))
     }
 
     pub fn is_blocked(&self, ip: IpAddr, server_id: i64) -> bool {
         let ip = canonical_lookup_ip(ip);
         let now = crate::utils::time::now_timestamp();
-        Self::contains_scoped_ip(&self.blocks, ip, server_id, now)
-            || Self::contains_scoped_ip(&self.list_blocks, ip, server_id, now)
+        let delta = self.ip_delta.load();
+        let snap = self.ip_read.load();
+        self.contains_ip_kind(&delta, &snap.blocked, KIND_BLOCK, ip, server_id, now)
             || Self::contains_scoped_network(&self.block_network_snapshots, ip, server_id, now)
             || Self::contains_scoped_network(&self.list_block_network_snapshots, ip, server_id, now)
             || Self::contains_scoped_range(&self.list_block_range_snapshots, ip, server_id, now)
@@ -808,8 +889,9 @@ impl WafStateManager {
     pub fn is_graylisted(&self, ip: IpAddr, server_id: i64) -> bool {
         let ip = canonical_lookup_ip(ip);
         let now = crate::utils::time::now_timestamp();
-        Self::contains_scoped_ip(&self.graylists, ip, server_id, now)
-            || Self::contains_scoped_ip(&self.list_graylists, ip, server_id, now)
+        let delta = self.ip_delta.load();
+        let snap = self.ip_read.load();
+        self.contains_ip_kind(&delta, &snap.graylisted, KIND_GRAY, ip, server_id, now)
             || Self::contains_scoped_network(&self.gray_network_snapshots, ip, server_id, now)
             || Self::contains_scoped_network(&self.list_gray_network_snapshots, ip, server_id, now)
             || Self::contains_scoped_range(&self.list_gray_range_snapshots, ip, server_id, now)
@@ -817,26 +899,52 @@ impl WafStateManager {
 
     pub fn apply_black_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
         let ip = canonical_lookup_ip(ip);
-        Self::apply_scoped_ip(&self.blocks, server_id, ip, expiry);
-        Self::apply_scoped_ip(&self.kernel_blocks, server_id, ip, expiry);
+        let evicted =
+            self.mutate_ip_kind(KIND_BLOCK, &self.blocks, "blocks", server_id, ip, expiry);
+        for (evict_server_id, evict_ip) in &evicted {
+            // blocks and kernel_blocks are paired: drop the victim from the
+            // kernel-side mirror too so the two maps stay consistent.
+            self.kernel_blocks.remove(&(*evict_server_id, *evict_ip));
+            self.reconcile_kernel_ip(*evict_ip);
+        }
+        let evicted =
+            Self::apply_scoped_ip(&self.kernel_blocks, "kernel_blocks", server_id, ip, expiry);
+        for (_, evict_ip) in evicted {
+            self.reconcile_kernel_ip(evict_ip);
+        }
         self.reconcile_kernel_ip(ip);
     }
 
     pub fn apply_black_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
-        Self::insert_scoped_network(
+        let evicted = Self::insert_scoped_network(
             &self.block_networks,
             &self.block_network_snapshots,
+            "block_networks",
             server_id,
             net,
             expiry,
         );
-        Self::apply_scoped_network_map(&self.kernel_block_networks, server_id, net, expiry);
+        for (evict_server_id, evict_net) in &evicted {
+            self.kernel_block_networks
+                .remove(&(*evict_server_id, *evict_net));
+            self.reconcile_kernel_network(*evict_net);
+        }
+        let evicted = Self::apply_scoped_network_map(
+            &self.kernel_block_networks,
+            "kernel_block_networks",
+            server_id,
+            net,
+            expiry,
+        );
+        for (_, evict_net) in evicted {
+            self.reconcile_kernel_network(evict_net);
+        }
         self.reconcile_kernel_network(net);
     }
 
     pub fn remove_black_ip(&self, server_id: i64, ip: IpAddr) {
         let ip = canonical_lookup_ip(ip);
-        Self::remove_scoped_ip(&self.blocks, server_id, ip);
+        self.remove_ip_kind(KIND_BLOCK, &self.blocks, server_id, ip);
         Self::remove_scoped_ip(&self.kernel_blocks, server_id, ip);
         crate::firewall::persistence::enqueue_delete(
             scope_label(server_id),
@@ -864,24 +972,32 @@ impl WafStateManager {
 
     pub fn apply_list_black_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
         let ip = canonical_lookup_ip(ip);
-        Self::apply_scoped_ip(&self.list_blocks, server_id, ip, expiry);
+        let evicted =
+            self.mutate_ip_kind(KIND_BLOCK, &self.list_blocks, "list_blocks", server_id, ip, expiry);
+        for (_, evict_ip) in evicted {
+            self.reconcile_kernel_ip(evict_ip);
+        }
         self.reconcile_kernel_ip(ip);
     }
 
     pub fn apply_list_black_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
-        Self::insert_scoped_network(
+        let evicted = Self::insert_scoped_network(
             &self.list_block_networks,
             &self.list_block_network_snapshots,
+            "list_block_networks",
             server_id,
             net,
             expiry,
         );
+        for (_, evict_net) in evicted {
+            self.reconcile_kernel_network(evict_net);
+        }
         self.reconcile_kernel_network(net);
     }
 
     pub fn remove_list_black_ip(&self, server_id: i64, ip: IpAddr) {
         let ip = canonical_lookup_ip(ip);
-        Self::remove_scoped_ip(&self.list_blocks, server_id, ip);
+        self.remove_ip_kind(KIND_BLOCK, &self.list_blocks, server_id, ip);
         self.reconcile_kernel_ip(ip);
     }
 
@@ -897,24 +1013,32 @@ impl WafStateManager {
 
     pub fn apply_white_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
         let ip = canonical_lookup_ip(ip);
-        Self::apply_scoped_ip(&self.whitelists, server_id, ip, expiry);
+        let evicted =
+            self.mutate_ip_kind(KIND_WHITE, &self.whitelists, "whitelists", server_id, ip, expiry);
+        for (_, evict_ip) in evicted {
+            self.reconcile_kernel_ip(evict_ip);
+        }
         self.reconcile_kernel_ip(ip);
     }
 
     pub fn apply_white_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
-        Self::insert_scoped_network(
+        let evicted = Self::insert_scoped_network(
             &self.whitelist_networks,
             &self.whitelist_network_snapshots,
+            "whitelist_networks",
             server_id,
             net,
             expiry,
         );
+        for (_, evict_net) in evicted {
+            self.reconcile_kernel_network(evict_net);
+        }
         self.reconcile_kernel_network(net);
     }
 
     pub fn remove_white_ip(&self, server_id: i64, ip: IpAddr) {
         let ip = canonical_lookup_ip(ip);
-        Self::remove_scoped_ip(&self.whitelists, server_id, ip);
+        self.remove_ip_kind(KIND_WHITE, &self.whitelists, server_id, ip);
         self.reconcile_kernel_ip(ip);
     }
 
@@ -929,24 +1053,38 @@ impl WafStateManager {
     }
 
     pub fn apply_list_white_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
-        Self::apply_scoped_ip(&self.list_whitelists, server_id, ip, expiry);
+        let evicted = self.mutate_ip_kind(
+            KIND_WHITE,
+            &self.list_whitelists,
+            "list_whitelists",
+            server_id,
+            ip,
+            expiry,
+        );
+        for (_, evict_ip) in evicted {
+            self.reconcile_kernel_ip(evict_ip);
+        }
         self.reconcile_kernel_ip(ip);
     }
 
     pub fn apply_list_white_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
-        Self::insert_scoped_network(
+        let evicted = Self::insert_scoped_network(
             &self.list_whitelist_networks,
             &self.list_whitelist_network_snapshots,
+            "list_whitelist_networks",
             server_id,
             net,
             expiry,
         );
+        for (_, evict_net) in evicted {
+            self.reconcile_kernel_network(evict_net);
+        }
         self.reconcile_kernel_network(net);
     }
 
     pub fn remove_list_white_ip(&self, server_id: i64, ip: IpAddr) {
         let ip = canonical_lookup_ip(ip);
-        Self::remove_scoped_ip(&self.list_whitelists, server_id, ip);
+        self.remove_ip_kind(KIND_WHITE, &self.list_whitelists, server_id, ip);
         self.reconcile_kernel_ip(ip);
     }
 
@@ -961,13 +1099,16 @@ impl WafStateManager {
     }
 
     pub fn apply_gray_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
-        Self::apply_scoped_ip(&self.graylists, server_id, ip, expiry);
+        // Graylists do not feed the kernel filter — evictions need no reconcile.
+        let _ =
+            self.mutate_ip_kind(KIND_GRAY, &self.graylists, "graylists", server_id, ip, expiry);
     }
 
     pub fn apply_gray_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
-        Self::insert_scoped_network(
+        let _ = Self::insert_scoped_network(
             &self.gray_networks,
             &self.gray_network_snapshots,
+            "gray_networks",
             server_id,
             net,
             expiry,
@@ -975,7 +1116,7 @@ impl WafStateManager {
     }
 
     pub fn remove_gray_ip(&self, server_id: i64, ip: IpAddr) {
-        Self::remove_scoped_ip(&self.graylists, server_id, ip);
+        self.remove_ip_kind(KIND_GRAY, &self.graylists, server_id, ip);
     }
 
     pub fn remove_gray_network(&self, server_id: i64, net: IpNet) {
@@ -988,13 +1129,21 @@ impl WafStateManager {
     }
 
     pub fn apply_list_gray_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
-        Self::apply_scoped_ip(&self.list_graylists, server_id, ip, expiry);
+        let _ = self.mutate_ip_kind(
+            KIND_GRAY,
+            &self.list_graylists,
+            "list_graylists",
+            server_id,
+            ip,
+            expiry,
+        );
     }
 
     pub fn apply_list_gray_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
-        Self::insert_scoped_network(
+        let _ = Self::insert_scoped_network(
             &self.list_gray_networks,
             &self.list_gray_network_snapshots,
+            "list_gray_networks",
             server_id,
             net,
             expiry,
@@ -1002,7 +1151,7 @@ impl WafStateManager {
     }
 
     pub fn remove_list_gray_ip(&self, server_id: i64, ip: IpAddr) {
-        Self::remove_scoped_ip(&self.list_graylists, server_id, ip);
+        self.remove_ip_kind(KIND_GRAY, &self.list_graylists, server_id, ip);
     }
 
     pub fn remove_list_gray_network(&self, server_id: i64, net: IpNet) {
@@ -1030,13 +1179,19 @@ impl WafStateManager {
         };
         let kernel_filter = self.kernel_filter();
         let kernel_filter_available = kernel_filter.available();
-        Self::insert_scoped_network(
+        let evicted = Self::insert_scoped_network(
             &self.block_networks,
             &self.block_network_snapshots,
+            "block_networks",
             key_server_id,
             net,
             expiry,
         );
+        for (evict_server_id, evict_net) in &evicted {
+            self.kernel_block_networks
+                .remove(&(*evict_server_id, *evict_net));
+            self.reconcile_kernel_network(*evict_net);
+        }
         crate::firewall::persistence::enqueue_upsert(FirewallBlockRecord::runtime(
             net.to_string(),
             key_server_id,
@@ -1045,7 +1200,16 @@ impl WafStateManager {
             use_local_firewall,
         ));
         if use_local_firewall {
-            Self::apply_scoped_network_map(&self.kernel_block_networks, key_server_id, net, expiry);
+            let evicted = Self::apply_scoped_network_map(
+                &self.kernel_block_networks,
+                "kernel_block_networks",
+                key_server_id,
+                net,
+                expiry,
+            );
+            for (_, evict_net) in evicted {
+                self.reconcile_kernel_network(evict_net);
+            }
         } else {
             Self::remove_scoped_network_map(&self.kernel_block_networks, key_server_id, net);
         }
@@ -1078,13 +1242,19 @@ impl WafStateManager {
 
         if block_c_class {
             if let Ok(net) = self.get_c_class_net(ip) {
-                Self::insert_scoped_network(
+                let evicted = Self::insert_scoped_network(
                     &self.block_networks,
                     &self.block_network_snapshots,
+                    "block_networks",
                     key_server_id,
                     net,
                     expiry,
                 );
+                for (evict_server_id, evict_net) in &evicted {
+                    self.kernel_block_networks
+                        .remove(&(*evict_server_id, *evict_net));
+                    self.reconcile_kernel_network(*evict_net);
+                }
                 crate::firewall::persistence::enqueue_upsert(FirewallBlockRecord::runtime(
                     net.to_string(),
                     key_server_id,
@@ -1093,12 +1263,16 @@ impl WafStateManager {
                     use_local_firewall,
                 ));
                 if use_local_firewall {
-                    Self::apply_scoped_network_map(
+                    let evicted = Self::apply_scoped_network_map(
                         &self.kernel_block_networks,
+                        "kernel_block_networks",
                         key_server_id,
                         net,
                         expiry,
                     );
+                    for (_, evict_net) in evicted {
+                        self.reconcile_kernel_network(evict_net);
+                    }
                 } else {
                     Self::remove_scoped_network_map(
                         &self.kernel_block_networks,
@@ -1114,7 +1288,12 @@ impl WafStateManager {
                 }
             }
         } else {
-            Self::apply_scoped_ip(&self.blocks, key_server_id, ip, expiry);
+            let evicted =
+                self.mutate_ip_kind(KIND_BLOCK, &self.blocks, "blocks", key_server_id, ip, expiry);
+            for (evict_server_id, evict_ip) in &evicted {
+                self.kernel_blocks.remove(&(*evict_server_id, *evict_ip));
+                self.reconcile_kernel_ip(*evict_ip);
+            }
             crate::firewall::persistence::enqueue_upsert(FirewallBlockRecord::runtime(
                 ip.to_string(),
                 key_server_id,
@@ -1129,7 +1308,16 @@ impl WafStateManager {
 
         if !block_c_class {
             if use_local_firewall {
-                Self::apply_scoped_ip(&self.kernel_blocks, key_server_id, ip, expiry);
+                let evicted = Self::apply_scoped_ip(
+                    &self.kernel_blocks,
+                    "kernel_blocks",
+                    key_server_id,
+                    ip,
+                    expiry,
+                );
+                for (_, evict_ip) in evicted {
+                    self.reconcile_kernel_ip(evict_ip);
+                }
             } else {
                 Self::remove_scoped_ip(&self.kernel_blocks, key_server_id, ip);
             }
@@ -1230,18 +1418,18 @@ impl WafStateManager {
     pub fn blocked_snapshot_items(&self) -> Vec<(String, i64, u64)> {
         let now = crate::utils::time::now_timestamp();
         let mut items = Vec::new();
-        for entry in self.blocks.iter() {
-            let ((server_id, ip), expiry) = (*entry.key(), *entry.value());
+        self.blocks.for_each(|(server_id, ip), expiry| {
             if now < expiry {
                 items.push((ip.to_string(), server_id, expiry as u64));
             }
-        }
-        for entry in self.list_blocks.iter() {
-            let ((server_id, ip), expiry) = (*entry.key(), *entry.value());
+            true
+        });
+        self.list_blocks.for_each(|(server_id, ip), expiry| {
             if now < expiry {
                 items.push((ip.to_string(), server_id, expiry as u64));
             }
-        }
+            true
+        });
         for entry in self.block_networks.iter() {
             let ((server_id, net), expiry) = (*entry.key(), *entry.value());
             if now < expiry {
@@ -1279,10 +1467,21 @@ impl WafStateManager {
             }
             if let Ok(ip) = record.target.parse::<IpAddr>() {
                 let ip = canonical_lookup_ip(ip);
-                Self::apply_scoped_ip(&self.blocks, record.server_id, ip, record.expires_at);
+                let evicted = self.mutate_ip_kind(
+                    KIND_BLOCK,
+                    &self.blocks,
+                    "blocks",
+                    record.server_id,
+                    ip,
+                    record.expires_at,
+                );
+                for (evict_server_id, evict_ip) in &evicted {
+                    self.kernel_blocks.remove(&(*evict_server_id, *evict_ip));
+                }
                 if record.kernel_wanted {
-                    Self::apply_scoped_ip(
+                    let _ = Self::apply_scoped_ip(
                         &self.kernel_blocks,
+                        "kernel_blocks",
                         record.server_id,
                         ip,
                         record.expires_at,
@@ -1293,16 +1492,22 @@ impl WafStateManager {
             }
             if let Ok(net) = record.target.parse::<IpNet>() {
                 let net = net.trunc();
-                Self::insert_scoped_network(
+                let evicted = Self::insert_scoped_network(
                     &self.block_networks,
                     &self.block_network_snapshots,
+                    "block_networks",
                     record.server_id,
                     net,
                     record.expires_at,
                 );
+                for (evict_server_id, evict_net) in &evicted {
+                    self.kernel_block_networks
+                        .remove(&(*evict_server_id, *evict_net));
+                }
                 if record.kernel_wanted {
-                    Self::apply_scoped_network_map(
+                    let _ = Self::apply_scoped_network_map(
                         &self.kernel_block_networks,
+                        "kernel_block_networks",
                         record.server_id,
                         net,
                         record.expires_at,
@@ -1569,75 +1774,392 @@ impl WafStateManager {
         self.retain_active_counters(now);
     }
 
-    fn apply_scoped_ip(map: &DashMap<(i64, IpAddr), i64>, server_id: i64, ip: IpAddr, expiry: i64) {
-        if crate::utils::time::now_timestamp() >= expiry {
-            map.remove(&(server_id, ip));
-        } else {
-            map.insert((server_id, ip), expiry);
+    /// Upper bound on earliest-expiring entries one capacity eviction removes.
+    /// The actual batch is `over.max(capacity / 16)` clamped to this: small
+    /// maps evict exactly what is needed, large maps free ~6% headroom per
+    /// scan so a sustained insert storm amortizes the O(map) pass — with a
+    /// 512-slot batch a 1.6M-entry map would rescan ~2700 times under a 1.4M
+    /// insert storm (minutes of CPU). 256k caps the transient victim Vec at
+    /// ~8MiB.
+    const WAF_STATE_EVICT_BATCH_MAX: usize = 262_144;
+
+    fn scoped_state_map_capacity() -> usize {
+        crate::memory_governor::MEMORY_GOVERNOR
+            .firewall_state_map_capacity()
+            .max(1)
+    }
+
+    /// Free room in a capacity-bound scoped-state map. Expired rows are swept
+    /// first; if the map is still full the earliest-expiring live rows are
+    /// removed in a batch. Returns the keys actually evicted so callers can
+    /// reconcile derived state (kernel filter, network/range snapshots).
+    fn evict_scoped_state_room<K>(
+        map: &DashMap<K, i64>,
+        capacity: usize,
+        now: i64,
+    ) -> Vec<K>
+    where
+        K: Copy + Eq + std::hash::Hash,
+    {
+        map.retain(|_, expiry| *expiry > now);
+        let len = map.len();
+        if len < capacity {
+            return Vec::new();
+        }
+        // We need `over` free slots to fit the pending insert below capacity.
+        let over = len - capacity + 1;
+        let batch = over
+            .max(capacity / 16)
+            .min(Self::WAF_STATE_EVICT_BATCH_MAX)
+            .min(map.len());
+        // Keep the earliest-expiring batch in a bounded max-heap (top element
+        // is the largest expiry among the kept rows, so pops drop it).
+        let mut heap: BinaryHeap<EarliestExpiry<K>> = BinaryHeap::with_capacity(batch + 1);
+        for entry in map.iter() {
+            heap.push(EarliestExpiry {
+                expiry: *entry.value(),
+                key: *entry.key(),
+            });
+            if heap.len() > batch {
+                heap.pop();
+            }
+        }
+        let mut evicted = Vec::with_capacity(heap.len());
+        for victim in heap {
+            // remove_if only drops the exact (key, expiry) pair seen during
+            // the scan — a concurrent refresh of the same key survives.
+            if map
+                .remove_if(&victim.key, |_, current| *current == victim.expiry)
+                .is_some()
+            {
+                evicted.push(victim.key);
+            }
+        }
+        evicted
+    }
+
+    /// Shared tail of the bounded scoped-state inserts: make room under
+    /// `capacity`, count evictions, and warn if a racing storm still leaves
+    /// the map full. Returns evicted keys (possibly empty).
+    fn evict_for_scoped_state<K>(
+        map: &DashMap<K, i64>,
+        map_name: &'static str,
+        capacity: usize,
+        now: i64,
+    ) -> Vec<K>
+    where
+        K: Copy + Eq + std::hash::Hash,
+    {
+        let mut evicted = Vec::new();
+        for _ in 0..3 {
+            if map.len() < capacity {
+                break;
+            }
+            let made_room = Self::evict_scoped_state_room(map, capacity, now);
+            if made_room.is_empty() {
+                break;
+            }
+            evicted.extend(made_room);
+        }
+        if !evicted.is_empty() {
+            crate::pipeline_metrics::add(
+                crate::pipeline_metrics::PipelineCounter::WafStateEvicted,
+                evicted.len() as u64,
+            );
+        }
+        if map.len() >= capacity {
+            warn_state_capacity_full(
+                &SCOPED_STATE_CAPACITY_WARN_AT,
+                map_name,
+                map.len(),
+                capacity,
+                "newest scoped entry refused; earliest-expiry eviction made no room",
+            );
+        }
+        evicted
+    }
+
+    /// Resolve the union expiry for one (kind, scope, ip) across that kind's
+    /// two source maps: the live view is "present if either source holds a
+    /// live entry", so the resolved value is the max expiry; `IP_DELTA_REMOVED`
+    /// when neither source has the key at all.
+    fn resolve_ip_union(&self, kind: u8, server_id: i64, ip: IpAddr) -> i64 {
+        let (a, b) = match kind {
+            KIND_BLOCK => (&self.blocks, &self.list_blocks),
+            KIND_WHITE => (&self.whitelists, &self.list_whitelists),
+            _ => (&self.graylists, &self.list_graylists),
+        };
+        let e1 = a.get(&(server_id, ip));
+        let e2 = b.get(&(server_id, ip));
+        match (e1, e2) {
+            (None, None) => IP_DELTA_REMOVED,
+            (Some(v), None) | (None, Some(v)) => v,
+            (Some(v1), Some(v2)) => v1.max(v2),
         }
     }
 
-    fn remove_scoped_ip(map: &DashMap<(i64, IpAddr), i64>, server_id: i64, ip: IpAddr) {
+    /// Publish a mutation of one scoped-IP source map into the read delta.
+    /// Must be called AFTER the source-map mutation; the SeqCst fence pairs
+    /// with the rebuilder's swap-then-scan so a mutation can never fall
+    /// between the two: either the snapshot scan observes the map write, or
+    /// this thread's delta insert lands in the post-swap delta.
+    fn publish_ip_delta(&self, kind: u8, server_id: i64, ip: IpAddr) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let mut delta = self.ip_delta.load();
+        let key = (kind, server_id, ip);
+        if !delta.contains_key(&key) && delta.len() >= IP_DELTA_CAP {
+            self.rebuild_ip_read_snapshot();
+            delta = self.ip_delta.load();
+        }
+        delta.insert(key, self.resolve_ip_union(kind, server_id, ip));
+    }
+
+    /// Single-flight rebuild: install a fresh delta first (post-swap
+    /// mutations land there), then fold the source maps into a new snapshot.
+    fn rebuild_ip_read_snapshot(&self) {
+        let _guard = match self.ip_rebuild.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let fresh: Arc<IpDelta> = Arc::new(DashMap::new());
+        self.ip_delta.store(fresh);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let now = crate::utils::time::now_timestamp();
+        self.ip_read.store(Arc::new(IpReadSnapshot {
+            blocked: Self::union_ip_maps(&self.blocks, &self.list_blocks, now),
+            whitelisted: Self::union_ip_maps(&self.whitelists, &self.list_whitelists, now),
+            graylisted: Self::union_ip_maps(&self.graylists, &self.list_graylists, now),
+        }));
+    }
+
+    /// Merge two scoped-IP tables into the union view, keeping only live
+    /// entries and resolving duplicates to the later expiry.
+    fn union_ip_maps(
+        a: &BoundedScopedMap<(i64, IpAddr)>,
+        b: &BoundedScopedMap<(i64, IpAddr)>,
+        now: i64,
+    ) -> HashMap<(i64, IpAddr), i64> {
+        let mut union = HashMap::with_capacity(a.len().max(b.len()));
+        for map in [a, b] {
+            map.for_each(|key, expiry| {
+                if expiry <= now {
+                    return true;
+                }
+                union
+                    .entry(key)
+                    .and_modify(|e: &mut i64| *e = (*e).max(expiry))
+                    .or_insert(expiry);
+                true
+            });
+        }
+        union
+    }
+
+    /// Hot-path scoped lookup: delta shadows the snapshot. Two probes max —
+    /// global scope first, then the server scope.
+    #[inline]
+    fn ip_kind_hit_at(
+        delta: &IpDelta,
+        map: &HashMap<(i64, IpAddr), i64>,
+        kind: u8,
+        scope: i64,
+        ip: IpAddr,
+        now: i64,
+    ) -> bool {
+        if let Some(entry) = delta.get(&(kind, scope, ip)) {
+            return *entry != IP_DELTA_REMOVED && now < *entry;
+        }
+        map.get(&(scope, ip)).is_some_and(|expiry| now < *expiry)
+    }
+
+    /// Scoped-IP union lookup for the read path: one delta load + one
+    /// snapshot load cover all three kinds.
+    #[inline]
+    fn contains_ip_kind(
+        &self,
+        delta: &IpDelta,
+        map: &HashMap<(i64, IpAddr), i64>,
+        kind: u8,
+        ip: IpAddr,
+        server_id: i64,
+        now: i64,
+    ) -> bool {
+        Self::ip_kind_hit_at(delta, map, kind, 0, ip, now)
+            || (server_id != 0 && Self::ip_kind_hit_at(delta, map, kind, server_id, ip, now))
+    }
+
+    /// Mutate a read-path scoped-IP map and publish the union delta for the
+    /// inserted key plus every evicted victim.
+    fn mutate_ip_kind(
+        &self,
+        kind: u8,
+        map: &BoundedScopedMap<(i64, IpAddr)>,
+        map_name: &'static str,
+        server_id: i64,
+        ip: IpAddr,
+        expiry: i64,
+    ) -> Vec<(i64, IpAddr)> {
+        let evicted = Self::apply_scoped_ip(map, map_name, server_id, ip, expiry);
+        self.publish_ip_delta(kind, server_id, ip);
+        for (evict_server_id, evict_ip) in &evicted {
+            self.publish_ip_delta(kind, *evict_server_id, *evict_ip);
+        }
+        evicted
+    }
+
+    /// Remove from a read-path scoped-IP map and publish the delta tombstone.
+    fn remove_ip_kind(
+        &self,
+        kind: u8,
+        map: &BoundedScopedMap<(i64, IpAddr)>,
+        server_id: i64,
+        ip: IpAddr,
+    ) {
+        Self::remove_scoped_ip(map, server_id, ip);
+        self.publish_ip_delta(kind, server_id, ip);
+    }
+
+    /// Insert-or-evict for scoped-IP maps. Returns evicted keys so callers can
+    /// reconcile kernel/list state; empty on update and expiry-remove paths.
+    fn apply_scoped_ip(
+        map: &BoundedScopedMap<(i64, IpAddr)>,
+        map_name: &'static str,
+        server_id: i64,
+        ip: IpAddr,
+        expiry: i64,
+    ) -> Vec<(i64, IpAddr)> {
+        Self::apply_scoped_ip_with_capacity(
+            map,
+            map_name,
+            server_id,
+            ip,
+            expiry,
+            Self::scoped_state_map_capacity(),
+        )
+    }
+
+    fn apply_scoped_ip_with_capacity(
+        map: &BoundedScopedMap<(i64, IpAddr)>,
+        _map_name: &'static str,
+        server_id: i64,
+        ip: IpAddr,
+        expiry: i64,
+        capacity: usize,
+    ) -> Vec<(i64, IpAddr)> {
+        let now = crate::utils::time::now_timestamp();
+        // The slot table enforces the cap inside the insert: at/above the
+        // soft cap it overwrites the lowest-expiry live slot in the probe
+        // window instead of growing. One victim max per insert.
+        let evicted: Vec<(i64, IpAddr)> = map
+            .insert((server_id, ip), expiry, now, capacity)
+            .into_iter()
+            .collect();
+        if !evicted.is_empty() {
+            crate::pipeline_metrics::add(
+                crate::pipeline_metrics::PipelineCounter::WafStateEvicted,
+                evicted.len() as u64,
+            );
+        }
+        evicted
+    }
+
+    fn remove_scoped_ip(
+        map: &BoundedScopedMap<(i64, IpAddr)>,
+        server_id: i64,
+        ip: IpAddr,
+    ) {
         map.remove(&(server_id, ip));
     }
 
+    /// Bounded variant of the scoped-network-map insert used by the kernel
+    /// block-network map (no snapshot attached). Returns evicted keys.
     fn apply_scoped_network_map(
         map: &DashMap<(i64, IpNet), i64>,
+        map_name: &'static str,
         server_id: i64,
         net: IpNet,
         expiry: i64,
-    ) {
-        if crate::utils::time::now_timestamp() >= expiry {
+    ) -> Vec<(i64, IpNet)> {
+        let now = crate::utils::time::now_timestamp();
+        if now >= expiry {
             map.remove(&(server_id, net));
-        } else {
-            map.insert((server_id, net), expiry);
+            return Vec::new();
         }
+        let key = (server_id, net);
+        if map.contains_key(&key) {
+            map.insert(key, expiry);
+            return Vec::new();
+        }
+        let evicted = Self::evict_for_scoped_state(
+            map,
+            map_name,
+            Self::scoped_state_map_capacity(),
+            now,
+        );
+        if map.len() < Self::scoped_state_map_capacity() {
+            map.insert(key, expiry);
+        }
+        evicted
     }
 
     fn remove_scoped_network_map(map: &DashMap<(i64, IpNet), i64>, server_id: i64, net: IpNet) {
         map.remove(&(server_id, net));
     }
 
-    fn contains_scoped_ip(
-        map: &DashMap<(i64, IpAddr), i64>,
-        ip: IpAddr,
-        server_id: i64,
-        now: i64,
-    ) -> bool {
-        Self::contains_scoped_ip_for(map, 0, ip, now)
-            || (server_id != 0 && Self::contains_scoped_ip_for(map, server_id, ip, now))
-    }
-
-    fn contains_scoped_ip_for(
-        map: &DashMap<(i64, IpAddr), i64>,
-        server_id: i64,
+    fn contains_any_scoped_ip(
+        map: &BoundedScopedMap<(i64, IpAddr)>,
         ip: IpAddr,
         now: i64,
     ) -> bool {
-        map.get(&(server_id, ip))
-            .is_some_and(|expiry| now < *expiry)
+        let mut found = false;
+        map.for_each(|(_, entry_ip), expiry| {
+            if entry_ip == ip && now < expiry {
+                found = true;
+                return false;
+            }
+            true
+        });
+        found
     }
 
-    fn contains_any_scoped_ip(map: &DashMap<(i64, IpAddr), i64>, ip: IpAddr, now: i64) -> bool {
-        map.iter()
-            .any(|entry| entry.key().1 == ip && now < *entry.value())
-    }
-
+    /// Bounded variant of the scoped-network insert for snapshot-backed maps.
+    /// Returns evicted keys; the snapshot is rebuilt whenever the map changed
+    /// (evictions included) so readers never see evicted ghosts.
     fn insert_scoped_network(
         map: &DashMap<(i64, IpNet), i64>,
         snapshots: &ArcSwap<NetworkSnapshot>,
+        map_name: &'static str,
         server_id: i64,
         net: IpNet,
         expiry: i64,
-    ) {
+    ) -> Vec<(i64, IpNet)> {
         let now = crate::utils::time::now_timestamp();
         if now >= expiry {
             Self::remove_scoped_network(map, snapshots, server_id, net);
-            return;
+            return Vec::new();
         }
 
-        map.insert((server_id, net), expiry);
+        let key = (server_id, net);
+        let mut evicted = Vec::new();
+        if !map.contains_key(&key) {
+            evicted = Self::evict_for_scoped_state(
+                map,
+                map_name,
+                Self::scoped_state_map_capacity(),
+                now,
+            );
+            if map.len() >= Self::scoped_state_map_capacity() {
+                if !evicted.is_empty() {
+                    // Evictions happened but the new entry was refused — the
+                    // snapshot must still drop the evicted ghosts.
+                    Self::rebuild_network_snapshot(map, snapshots, now);
+                }
+                return evicted;
+            }
+        }
+        map.insert(key, expiry);
         Self::rebuild_network_snapshot(map, snapshots, now);
+        evicted
     }
 
     fn remove_scoped_network(
@@ -1656,21 +2178,16 @@ impl WafStateManager {
         server_id: i64,
         now: i64,
     ) -> bool {
-        Self::contains_scoped_network_for(snapshots, 0, ip, now)
-            || (server_id != 0 && Self::contains_scoped_network_for(snapshots, server_id, ip, now))
-    }
-
-    fn contains_scoped_network_for(
-        snapshots: &ArcSwap<NetworkSnapshot>,
-        server_id: i64,
-        ip: IpAddr,
-        now: i64,
-    ) -> bool {
+        // One ArcSwap load serves both scopes; loading per scope doubles the
+        // hot-path atomic reads for no benefit.
         let snapshot = snapshots.load();
-        let Some(networks) = snapshot.get(&server_id) else {
-            return false;
-        };
-        networks.contains(ip, now)
+        snapshot
+            .get(&0)
+            .is_some_and(|networks| networks.contains(ip, now))
+            || (server_id != 0
+                && snapshot
+                    .get(&server_id)
+                    .is_some_and(|networks| networks.contains(ip, now)))
     }
 
     fn contains_any_scoped_network(
@@ -1711,18 +2228,15 @@ impl WafStateManager {
     pub fn gc_once(&self) {
         let now = crate::utils::time::now_timestamp();
 
-        let expired_ips = self
-            .blocks
-            .iter()
-            .filter_map(|entry| {
-                (now >= *entry.value()).then_some((entry.key().0, entry.key().1, *entry.value()))
-            })
-            .collect::<Vec<_>>();
+        let mut expired_ips: Vec<(i64, IpAddr, i64)> = Vec::new();
+        self.blocks.for_each(|(server_id, ip), expiry| {
+            if now >= expiry {
+                expired_ips.push((server_id, ip, expiry));
+            }
+            true
+        });
         for (server_id, ip, observed_expiry) in expired_ips {
-            let removed = self
-                .blocks
-                .remove_if(&(server_id, ip), |_, expiry| *expiry == observed_expiry)
-                .is_some();
+            let removed = self.blocks.remove_if(&(server_id, ip), observed_expiry);
             if removed {
                 crate::firewall::persistence::enqueue_delete(
                     scope_label(server_id),
@@ -1752,13 +2266,13 @@ impl WafStateManager {
             }
         }
 
-        self.blocks.retain(|_, expiry| now < *expiry);
-        self.kernel_blocks.retain(|_, expiry| now < *expiry);
-        self.list_blocks.retain(|_, expiry| now < *expiry);
-        self.whitelists.retain(|_, expiry| now < *expiry);
-        self.list_whitelists.retain(|_, expiry| now < *expiry);
-        self.graylists.retain(|_, expiry| now < *expiry);
-        self.list_graylists.retain(|_, expiry| now < *expiry);
+        self.blocks.retain(|expiry| now < expiry);
+        self.kernel_blocks.retain(|expiry| now < expiry);
+        self.list_blocks.retain(|expiry| now < expiry);
+        self.whitelists.retain(|expiry| now < expiry);
+        self.list_whitelists.retain(|expiry| now < expiry);
+        self.graylists.retain(|expiry| now < expiry);
+        self.list_graylists.retain(|expiry| now < expiry);
         self.block_networks.retain(|_, expiry| now < *expiry);
         self.kernel_block_networks.retain(|_, expiry| now < *expiry);
         self.list_block_networks.retain(|_, expiry| now < *expiry);
@@ -1817,6 +2331,7 @@ impl WafStateManager {
         Self::apply_scoped_range(
             &self.list_block_ranges,
             &self.list_block_range_snapshots,
+            "list_block_ranges",
             server_id,
             range,
             expiry,
@@ -1838,6 +2353,7 @@ impl WafStateManager {
         Self::apply_scoped_range(
             &self.list_white_ranges,
             &self.list_white_range_snapshots,
+            "list_white_ranges",
             server_id,
             range,
             expiry,
@@ -1859,6 +2375,7 @@ impl WafStateManager {
         Self::apply_scoped_range(
             &self.list_gray_ranges,
             &self.list_gray_range_snapshots,
+            "list_gray_ranges",
             server_id,
             range,
             expiry,
@@ -1877,6 +2394,7 @@ impl WafStateManager {
     fn apply_scoped_range(
         map: &DashMap<(i64, IpAddrRange), i64>,
         snapshots: &ArcSwap<RangeSnapshot>,
+        map_name: &'static str,
         server_id: i64,
         range: IpAddrRange,
         expiry: i64,
@@ -1884,10 +2402,27 @@ impl WafStateManager {
         let now = crate::utils::time::now_timestamp();
         if now >= expiry {
             Self::remove_scoped_range(map, snapshots, server_id, range);
-        } else {
-            map.insert((server_id, range), expiry);
-            Self::rebuild_range_snapshot(map, snapshots, now);
+            return;
         }
+        let key = (server_id, range);
+        if !map.contains_key(&key) {
+            let evicted = Self::evict_for_scoped_state(
+                map,
+                map_name,
+                Self::scoped_state_map_capacity(),
+                now,
+            );
+            if map.len() >= Self::scoped_state_map_capacity() {
+                if !evicted.is_empty() {
+                    // Refused insert but evictions happened — rebuild so the
+                    // snapshot drops the evicted ghosts.
+                    Self::rebuild_range_snapshot(map, snapshots, now);
+                }
+                return;
+            }
+        }
+        map.insert(key, expiry);
+        Self::rebuild_range_snapshot(map, snapshots, now);
     }
 
     fn remove_scoped_range(
@@ -2274,6 +2809,100 @@ mod tests {
     }
 
     #[test]
+    fn scoped_ip_map_evicts_earliest_expiry_at_capacity() {
+        let map: BoundedScopedMap<(i64, IpAddr)> = BoundedScopedMap::new(4096);
+        let now = crate::utils::time::now_timestamp();
+        let ip = |n: u8| IpAddr::from([10, 0, 0, n]);
+        let cap = 4;
+
+        // Fill to capacity with staggered expiries (ip(1) earliest).
+        for n in 1..=4u8 {
+            let evicted = WafStateManager::apply_scoped_ip_with_capacity(
+                &map,
+                "test",
+                7,
+                ip(n),
+                now + n as i64,
+                cap,
+            );
+            assert!(evicted.is_empty(), "below capacity must not evict");
+        }
+        assert_eq!(map.len(), 4);
+
+        // Updating an existing key never evicts, even at capacity.
+        let evicted = WafStateManager::apply_scoped_ip_with_capacity(
+            &map,
+            "test",
+            7,
+            ip(1),
+            now + 500,
+            cap,
+        );
+        assert!(evicted.is_empty());
+        assert_eq!(map.len(), 4);
+
+        // A brand-new key at capacity evicts exactly one live entry: the
+        // sampled-earliest-expiry victim (probe-window or corner scan).
+        let evicted = WafStateManager::apply_scoped_ip_with_capacity(
+            &map,
+            "test",
+            7,
+            ip(9),
+            now + 900,
+            cap,
+        );
+        assert_eq!(evicted.len(), 1, "at cap an insert must evict one entry");
+        let (victim_scope, victim_ip) = evicted[0];
+        assert_eq!(victim_scope, 7);
+        assert_ne!(victim_ip, ip(9));
+        assert!(!map.contains_key(&(7, victim_ip)));
+        assert!(map.contains_key(&(7, ip(9))));
+        assert_eq!(map.len(), 4);
+    }
+
+    #[test]
+    fn scoped_ip_map_sweeps_expired_before_evicting_live() {
+        let map: BoundedScopedMap<(i64, IpAddr)> = BoundedScopedMap::new(4096);
+        let now = crate::utils::time::now_timestamp();
+        let ip = |n: u8| IpAddr::from([10, 0, 0, n]);
+        let cap = 4;
+
+        for n in 1..=3u8 {
+            WafStateManager::apply_scoped_ip_with_capacity(
+                &map,
+                "test",
+                7,
+                ip(n),
+                now + 60,
+                cap,
+            );
+        }
+        // Plant an expired row directly — the bounded insert refuses
+        // already-expired writes, so seed it by hand.
+        map.seed_unchecked((7, ip(0)), now - 1);
+        assert_eq!(map.len(), 4);
+
+        let evicted = WafStateManager::apply_scoped_ip_with_capacity(
+            &map,
+            "test",
+            7,
+            ip(9),
+            now + 60,
+            cap,
+        );
+        // Invariants: the bound holds and the insert lands. Within a probe
+        // window expired rows always sort first (expiry <= now < live), so
+        // the expired row is reclaimed whenever it is sampled; a live
+        // victim outside the window is also legal under sampled eviction.
+        for (scope, _) in &evicted {
+            assert_eq!(*scope, 7);
+        }
+        assert!(evicted.len() <= 1);
+        assert!(map.contains_key(&(7, ip(9))));
+        assert!(map.len() <= cap);
+    }
+
+    #[test]
     fn candidate_stats_are_evicted_after_idle_window() {
         let state = WafStateManager::new();
         state.record_candidate_hit(42, 9, true, false);
@@ -2299,5 +2928,160 @@ mod tests {
         WafStateManager::release_slot(&counter);
         assert!(WafStateManager::reserve_slot(&counter, capacity));
         assert_eq!(counter.load(Ordering::Acquire), capacity as u64);
+    }
+
+    /// RCU read path: a brand-new block must be visible to is_blocked
+    /// immediately via the delta (empty snapshot, no rebuild needed).
+    #[test]
+    fn rcu_read_path_sees_writes_instantly_via_delta() {
+        let state = WafStateManager::new();
+        let now = crate::utils::time::now_timestamp();
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        state.apply_black_ip_until(7, ip, now + 3600);
+        assert!(state.is_blocked(ip, 7));
+        assert!(!state.is_blocked(ip, 999), "scope-7 entry must not match scope 999");
+        state.apply_white_ip_until(7, ip, now + 3600);
+        assert!(state.is_whitelisted(ip, 7));
+        assert!(!state.is_whitelisted(ip, 999));
+        state.apply_gray_ip_until(7, ip, now + 3600);
+        assert!(state.is_graylisted(ip, 7));
+    }
+
+    /// Global-scope (server_id=0) entries match every server scope.
+    #[test]
+    fn rcu_read_path_global_scope_matches_all() {
+        let state = WafStateManager::new();
+        let now = crate::utils::time::now_timestamp();
+        let ip: IpAddr = "203.0.113.8".parse().unwrap();
+        state.apply_black_ip_until(0, ip, now + 3600);
+        assert!(state.is_blocked(ip, 42));
+        assert!(state.is_blocked(ip, 0));
+    }
+
+    /// After a rebuild the delta is empty and reads flow through the
+    /// consolidated snapshot — results must be identical.
+    #[test]
+    fn rcu_snapshot_path_matches_after_rebuild() {
+        let state = WafStateManager::new();
+        let now = crate::utils::time::now_timestamp();
+        for n in 0..100u8 {
+            state.apply_black_ip_until(3, IpAddr::from([10, 9, 0, n]), now + 3600);
+            state.apply_white_ip_until(0, IpAddr::from([10, 9, 1, n]), now + 3600);
+        }
+        state.rebuild_ip_read_snapshot();
+        assert_eq!(state.ip_delta.load().len(), 0, "rebuild swaps in a fresh delta");
+        for n in 0..100u8 {
+            let blocked: IpAddr = IpAddr::from([10, 9, 0, n]);
+            let white: IpAddr = IpAddr::from([10, 9, 1, n]);
+            assert!(state.is_blocked(blocked, 3));
+            assert!(!state.is_blocked(blocked, 4), "scope-3 block must not leak to scope 4");
+            assert!(state.is_whitelisted(white, 5), "global whitelist matches any scope");
+        }
+    }
+
+    /// Union semantics: entry in either source map blocks; removing one
+    /// source while the other retains the key keeps the union live; removing
+    /// both unblocks.
+    #[test]
+    fn rcu_union_semantics_across_source_maps() {
+        let state = WafStateManager::new();
+        let now = crate::utils::time::now_timestamp();
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        state.apply_list_black_ip_until(2, ip, now + 3600);
+        assert!(state.is_blocked(ip, 2), "list_blocks alone must block");
+        state.apply_black_ip_until(2, ip, now + 1800);
+        state.remove_list_black_ip(2, ip);
+        assert!(
+            state.is_blocked(ip, 2),
+            "removing list_blocks must not unblock while blocks retains the key"
+        );
+        state.remove_black_ip(2, ip);
+        assert!(!state.is_blocked(ip, 2), "both sources removed → unblocked");
+    }
+
+    /// Eviction publishes a tombstone: an evicted victim must read unblocked
+    /// even though the stale snapshot may still contain it.
+    #[test]
+    fn rcu_eviction_tombstone_hides_stale_snapshot_entry() {
+        let state = WafStateManager::new();
+        let now = crate::utils::time::now_timestamp();
+        let ip_a: IpAddr = "203.0.113.10".parse().unwrap();
+        state.apply_black_ip_until(1, ip_a, now + 60);
+        state.rebuild_ip_read_snapshot();
+        assert!(state.is_blocked(ip_a, 1), "snapshot path blocks");
+        // Evict directly from the source map, then publish the delta —
+        // mirrors what mutate_ip_kind does for evicted victims.
+        state.blocks.remove(&(1, ip_a));
+        state.publish_ip_delta(KIND_BLOCK, 1, ip_a);
+        assert!(
+            !state.is_blocked(ip_a, 1),
+            "delta tombstone must shadow the stale snapshot entry"
+        );
+    }
+
+    /// Concurrent write/remove churn while readers poll: readers must never
+    /// panic and must observe a consistent state after quiesce.
+    #[test]
+    fn rcu_read_path_concurrent_write_read_consistency() {
+        use std::sync::Arc;
+        let state = Arc::new(WafStateManager::new());
+        let now = crate::utils::time::now_timestamp();
+        let ip: IpAddr = "203.0.113.11".parse().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let state = Arc::clone(&state);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut round = 0i64;
+                while !stop.load(Ordering::Relaxed) {
+                    round += 1;
+                    if round % 2 == 0 {
+                        state.apply_black_ip_until(5, ip, now + 3600);
+                    } else {
+                        state.remove_black_ip(5, ip);
+                    }
+                }
+                round
+            })
+        };
+        for _ in 0..2000 {
+            let _ = state.is_blocked(ip, 5);
+            let _ = state.is_whitelisted(ip, 5);
+            let _ = state.is_graylisted(ip, 5);
+        }
+        stop.store(true, Ordering::Relaxed);
+        let rounds = writer.join().unwrap();
+        assert!(rounds > 10, "writer must complete multiple churn rounds");
+        // Quiesce: final state must match the source maps exactly.
+        state.apply_black_ip_until(5, ip, now + 3600);
+        state.rebuild_ip_read_snapshot();
+        assert!(state.is_blocked(ip, 5));
+        state.remove_black_ip(5, ip);
+        assert!(!state.is_blocked(ip, 5));
+    }
+
+    /// Delta cap triggers a single-flight rebuild; reads stay correct across
+    /// the swap boundary.
+    #[test]
+    fn rcu_delta_cap_triggers_rebuild_without_losing_writes() {
+        let state = WafStateManager::new();
+        let now = crate::utils::time::now_timestamp();
+        // Fill the delta past capacity — each publish inserts one delta key.
+        for n in 0..(IP_DELTA_CAP + 64) {
+            let ip = IpAddr::from([10, (n >> 16) as u8, (n >> 8) as u8, n as u8]);
+            state.apply_black_ip_until(1, ip, now + 3600);
+        }
+        // After crossing the cap the delta must have been swapped: the
+        // rebuild consumed the first CAP keys, leaving only the tail.
+        assert!(
+            state.ip_delta.load().len() <= 128,
+            "delta must reset via rebuild, got {}",
+            state.ip_delta.load().len()
+        );
+        // Spot-check both early (snapshot-era) and late (delta-era) writes.
+        let early = IpAddr::from([10, 0, 0, 1]);
+        let late = IpAddr::from([10, (IP_DELTA_CAP >> 16) as u8, ((IP_DELTA_CAP + 63) >> 8) as u8, (IP_DELTA_CAP + 63) as u8]);
+        assert!(state.is_blocked(early, 1));
+        assert!(state.is_blocked(late, 1));
     }
 }
