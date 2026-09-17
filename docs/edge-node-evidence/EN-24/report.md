@@ -172,9 +172,9 @@ XDP drv/proxy, AF_XDP q0       TCP/UDP echo :18080/:18081 + HTTP
 
 ## 遗留 / 限制
 
-- **v6 PTB 未做在线注入**：v6 eBPF out-CT/ICMP 路径已过 verifier
-  （17/17）且 v6 数据面经矩阵+dial-v6 实测；ICMPv6 type2 PTB 的活体
-  收敛未单独注入（v4 已证明同一 `apply_pmtu` 机制）。
+- ~~v6 PTB 未做在线注入~~ **已补齐**（附录 B）：ICMPv6 type-2 PTB
+  活体注入 → eBPF out-CT claim（`outCtIcmp=2`）→ `apply_pmtu` →
+  wire 分段 1400→1220+180 即时收敛，会话全程无 ioError。
 - **zero-copy 未验证**：veth/virtio 环境无 AF_XDP ZC 能力；当前为
   copy 模式证据，ZC 声明需 i40e/ice/mlx5 类硬件另行复测。
 - **守卫孤儿模型**：`xdp stop`（新进程）不清理既有 guard 对象；
@@ -265,3 +265,31 @@ reload 存量会话静默冻结，已按合同显式上报。
 - 不兼容形状 reload（队列/接口/对象变更）按合同显式拒绝。
 - `xdp stop`（新进程）不拆既有 guard——孤儿再认领模型，fail-closed
   可接受，建议登记清理入口。
+
+## 附录 B — ICMPv6 PTB 在线注入验证（本轮新增）
+
+devin-build-90，kernel 6.1.0-41，drv attach，`cndial0`（init netns）
+↔ `cndial1`（cnpeer netns），v6 `fd00:210::1` ↔ `fd00:210::2`。
+
+方法：v6 dial-smoke 会话建立后（ready-file 报告 local port），在
+cnpeer netns 内用 raw socket（`IPPROTO_ICMPV6`，内核自动算校验和）
+注入 type-2/code-0 PTB mtu=1280，引用该会话的出向元组
+（`inject-ptb6.py`）。peer 侧 `cndial1` 全程抓包
+（`peer-v6-ptb.pcap`，时间线 `v6-ptb-timeline.txt`）。
+
+结果（`dial-v6-ptb.json`）：
+
+| 链路环节 | 证据 |
+|---|---|
+| eBPF 解析+claim | `outCtIcmp=2`（两次注入各 claim 一次）；`pass/control=0`——claim 的包不过内核栈 |
+| XSK redirect | `redirect` 随注入 +2，包入 XSK |
+| userspace PMTU | `apply_pmtu` → `set_path_mtu(1280)` |
+| wire 收敛 | 注入前全 1400B 分段（33 个）；注入后每个 1400B 写拆为 **1220+180**（243 对），与 MSS=1280−40−20=1220 精确一致；首个 1220 分段出现在注入后 ~100ms 内 |
+| 会话存活 | `sent=received=393400`，`ioError=null`，无 RST |
+
+软件级单测（`src/xdp/tests.rs`）另覆盖：非 PTB 的 ICMPv6 type-3
+错误不改变 PMTU cap、不杀会话；未知流 PTB 为显式 no-op。
+
+限制：注入器引用的是真实活跃元组——若引用不存在于 XDP_OUT_CT
+的流，eBPF 显式 miss → `control_pass`（已观测：引用过期端口时
+pass/control 各 +1，outCtIcmp 不变），不存在静默丢包路径。
