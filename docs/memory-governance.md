@@ -119,6 +119,11 @@ glibc-only `malloc_trim`:
   60s cache-janitor cycle (the janitor task migrates across Tokio workers, so
   repeated cycles eventually collect each worker's heap; `mi_collect` only
   affects the calling thread).
+- L1 entry weight now accounts for the entry's real heap cost — body bytes
+  plus the cache key, response header name/value bytes (names are stored
+  twice, raw + case-preserved), and a fixed ~512B struct/index/bookkeeping
+  overhead. Previously only `data.len()` was weighed, so header-heavy
+  entries could hold several times the nominal byte budget.
 - `High`/`Critical`: forced `mi_collect(true)` in the reclaim monitor.
 - After `ConfigStore::replace_all_servers` under High/Critical: forced collect
   on the same thread that dropped the previous generation, so its segments

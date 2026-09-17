@@ -2921,12 +2921,37 @@ impl TinyUfoL1 {
             .map(|v| (v, status))
     }
 
+    /// Real heap cost of a cache entry beyond its body: the key string, the
+    /// response headers (name bytes are stored twice — `headers` plus the
+    /// case-preserving `header_name_map`), the `TinyUfoL1Entry` struct, the
+    /// `Arc` allocations, TinyUFO internal bookkeeping, and the `keys` index
+    /// row. Counting only `data.len()` lets a cache full of small bodies with
+    /// large headers hold several times its nominal byte budget.
+    const L1_ENTRY_OVERHEAD_BYTES: usize = 512;
+
+    fn entry_weight_units(key: &str, entry: &TinyUfoL1Entry) -> usize {
+        let header_bytes: usize = entry
+            .response_header
+            .headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() * 2 + value.len())
+            .sum();
+        entry
+            .data
+            .len()
+            .saturating_add(key.len())
+            .saturating_add(header_bytes)
+            .saturating_add(Self::L1_ENTRY_OVERHEAD_BYTES)
+            .div_ceil(1024)
+            .clamp(1, u16::MAX as usize)
+    }
+
     fn put(&self, key: &str, entry: TinyUfoL1Entry, ttl: std::time::Duration) {
         let stale_window = entry
             .stale_while_revalidate_secs
             .max(entry.stale_if_error_secs);
         let retention = ttl.saturating_add(std::time::Duration::from_secs(stale_window));
-        let weight = (entry.data.len().div_ceil(1024)).clamp(1, u16::MAX as usize) as u16;
+        let weight = Self::entry_weight_units(key, &entry) as u16;
         let inner = self.read_inner();
         inner.put(key, Arc::new(entry), Some(retention), weight);
         if !retention.is_zero() {
@@ -3072,7 +3097,7 @@ impl TinyUfoL1 {
         let mut weight = 0usize;
         let mut kept: Vec<String> = Vec::new();
         for (key, entry) in live {
-            let entry_weight = (entry.data.len().div_ceil(1024)).clamp(1, u16::MAX as usize);
+            let entry_weight = Self::entry_weight_units(&key, &entry);
             if weight.saturating_add(entry_weight) > target_weight {
                 continue;
             }
@@ -7141,7 +7166,8 @@ mod tests {
             purge_generation: 0,
             metadata_required: false,
         };
-        // Each 600B entry weighs 1 unit; the 2KiB rebuild keeps weight<=2.
+        // Each entry weighs 2 units (600B body + key + 512B entry overhead
+        // rounds to 2KiB); a 5KiB rebuild keeps weight<=5 → two survive.
         for (suffix, created) in [
             ("oldest", now - 30),
             ("older", now - 20),
@@ -7153,7 +7179,7 @@ mod tests {
         }
         assert_eq!(l1.stats().0, 4);
 
-        l1.force_rebuild_with_limit(2048);
+        l1.force_rebuild_with_limit(5 * 1024);
 
         let (count, _) = l1.stats();
         assert_eq!(count, 2, "only what fits the smaller budget survives");
@@ -7161,7 +7187,44 @@ mod tests {
         assert!(l1.get("salvage-newer").is_some());
         assert!(l1.get("salvage-oldest").is_none());
         assert!(l1.get("salvage-older").is_none());
-        assert_eq!(l1.max_bytes.load(Ordering::Relaxed), 2048);
+        assert_eq!(l1.max_bytes.load(Ordering::Relaxed), 5 * 1024);
+    }
+
+    #[test]
+    fn l1_entry_weight_counts_headers_and_key_not_just_body() {
+        let now = crate::utils::time::now_timestamp();
+        let mut header = pingora_http::ResponseHeader::build(200, None).unwrap();
+        header
+            .insert_header("x-long-response-header", "v".repeat(700))
+            .unwrap();
+        let entry = TinyUfoL1Entry {
+            cache_key: "weighted".to_string(),
+            data: bytes::Bytes::from_static(b"x"),
+            response_header: Arc::new(header),
+            fresh_until: now + 60,
+            created_at: now,
+            stale_while_revalidate_secs: 0,
+            stale_if_error_secs: 0,
+            error_status_allowed: false,
+            metadata_updated_at: now,
+            cache_state_version: 0,
+            purge_generation: 0,
+            metadata_required: false,
+        };
+        let units = TinyUfoL1::entry_weight_units("weighted", &entry);
+        assert!(
+            units >= 2,
+            "a ~1.3KB-real-cost entry must weigh more than 1 KiB unit (got {units})"
+        );
+        let minimal = TinyUfoL1Entry {
+            cache_key: "w".to_string(),
+            data: bytes::Bytes::from_static(b"x"),
+            response_header: Arc::new(
+                pingora_http::ResponseHeader::build(200, None).unwrap(),
+            ),
+            ..entry
+        };
+        assert_eq!(TinyUfoL1::entry_weight_units("w", &minimal), 1);
     }
 
     #[test]
