@@ -1846,6 +1846,17 @@ impl AfXdpTcpReactor {
                         return;
                     }
                 } else {
+                    // A pre-proxy socket that reached a terminal state on
+                    // its own (peer RST during the handshake) has no
+                    // stream channels to drain — mark it closing so the
+                    // sweep reaps it on cadence instead of billing the
+                    // session table slot until the pre-proxy idle timeout.
+                    if matches!(
+                        socket.state(),
+                        SmoltcpTcp::State::Closed | SmoltcpTcp::State::TimeWait
+                    ) {
+                        session.closing = true;
+                    }
                     return;
                 }
             }
@@ -2006,14 +2017,25 @@ impl AfXdpTcpReactor {
                     }
                 }
             }
-            if session.egress_closed && session.pending_egress.is_empty() {
-                let socket = self
-                    .sockets
-                    .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
-                if socket.send_queue() == 0 {
-                    socket.close();
-                    session.closing = true;
-                }
+            if session.egress_closed
+                && session.pending_egress.is_empty()
+                && socket.send_queue() == 0
+            {
+                socket.close();
+                session.closing = true;
+            }
+            // A proxy-started socket that reached a terminal state on its
+            // own (peer RST → Closed, or TimeWait drain finished) is dead
+            // weight: it can neither receive nor send, so mark it closing
+            // and let the sweep reap it on cadence instead of waiting out
+            // the idle timeout. Reaping drops the stream channels, which
+            // wakes a writer parked in `poll_write` with BrokenPipe — the
+            // task, its upstream socket, and its permits release promptly.
+            if matches!(
+                socket.state(),
+                SmoltcpTcp::State::Closed | SmoltcpTcp::State::TimeWait
+            ) {
+                session.closing = true;
             }
         }
     }
@@ -2202,9 +2224,16 @@ pub(crate) fn af_xdp_tcp_session_reapable(closing: bool, state: SmoltcpTcp::Stat
 
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) fn af_xdp_tcp_stream_read_side_closed(state: SmoltcpTcp::State) -> bool {
+    // CloseWait is the peer's FIN: no further inbound data can arrive, so
+    // the stream's read side must observe EOF even though our send half is
+    // still open. Without it a graceful peer close parks `poll_read`
+    // forever — the relay task, its upstream socket, and every admission
+    // permit it holds leak until the idle reaper runs (observed: sessions
+    // stuck in CLOSE-WAIT wedged the node at the fd-derived limit).
     matches!(
         state,
-        SmoltcpTcp::State::Closing
+        SmoltcpTcp::State::CloseWait
+            | SmoltcpTcp::State::Closing
             | SmoltcpTcp::State::LastAck
             | SmoltcpTcp::State::TimeWait
             | SmoltcpTcp::State::Closed

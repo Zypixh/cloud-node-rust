@@ -3784,9 +3784,38 @@ fn runtime_limit(
         let fd_target = fd_budget(snapshot, fd_pct) as usize;
         if fd_target > 0 {
             target = target.min(fd_target);
+            // The fd gate can pull the class limit far below its nominal
+            // floor (nofile=1024 → TcpConnection=128) — intentional fd
+            // protection, but it turns any per-connection leak into a
+            // hard node-wide wedge. Make the squeeze observable once per
+            // class so a wedged deployment has a named cause.
+            if target < min_limit {
+                warn_fd_clamped_limit_once(class, target, min_limit, snapshot.fd_soft_limit);
+            }
         }
     }
     target.clamp(1, max_limit)
+}
+
+static FD_CLAMPED_LIMIT_WARNED: AtomicU64 = AtomicU64::new(0);
+
+fn warn_fd_clamped_limit_once(
+    class: AdmissionClass,
+    target: usize,
+    min_limit: usize,
+    fd_soft_limit: u64,
+) {
+    let bit = 1u64 << class_index(class) as u64;
+    if FD_CLAMPED_LIMIT_WARNED.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+        return;
+    }
+    tracing::warn!(
+        "memory governor: {:?} limit clamped to {} by fd budget (nofile soft={}) below nominal floor {}; raise RLIMIT_NOFILE for headroom",
+        class,
+        target,
+        fd_soft_limit,
+        min_limit
+    );
 }
 
 fn multiplexed_per_connection_limit(

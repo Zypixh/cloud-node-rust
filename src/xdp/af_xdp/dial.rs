@@ -66,12 +66,38 @@ pub(crate) struct AfXdpDialRegistry {
     owners: DashMap<AfXdpTcpFlowKey, AfXdpDialOwner>,
     queues: DashMap<(String, u32), mpsc::Sender<AfXdpReactorRequest>>,
     port_cursor: AtomicU32,
+    /// T4: resolved outbound routes (interface/source/MACs) keyed by
+    /// target IP. `resolve_outbound_route` shells out to `ip` three
+    /// times per call — tens of milliseconds — so each dial would pay
+    /// ~100ms of pure process-spawn latency on top of the ~4ms wire RTT.
+    /// Entries expire quickly and a dial timeout evicts the entry so a
+    /// stale neighbor MAC self-heals on the next connect.
+    route_cache: DashMap<IpAddr, AfXdpCachedRoute>,
     /// D-B1: reserved source-port span from `xdp.upstream.dialPortRange`
     /// (default 40000-49999), pinned in `ip_local_reserved_ports` by the
     /// dial guard before this registry is published.
     pub(crate) port_base: u16,
     pub(crate) port_span: u16,
 }
+
+/// T4: cached `resolve_outbound_route` result — the kernel answer is
+/// reused across dials until the TTL lapses.
+#[cfg(target_os = "linux")]
+struct AfXdpCachedRoute {
+    route: Arc<linux::XdpOutboundRoute>,
+    expires_at: std::time::Instant,
+}
+
+/// T4: route-resolution freshness window — short enough that a neighbor
+/// change surfaces quickly, long enough to collapse a connect burst to
+/// one `ip`-tool resolution per target.
+#[cfg(target_os = "linux")]
+const AF_XDP_DIAL_ROUTE_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// T4: hard bound on cached targets — a dial sweep across many backends
+/// can never grow the map without limit.
+#[cfg(target_os = "linux")]
+const AF_XDP_DIAL_ROUTE_CACHE_MAX: usize = 4_096;
 
 #[cfg(target_os = "linux")]
 impl AfXdpDialRegistry {
@@ -88,6 +114,7 @@ impl AfXdpDialRegistry {
             port_span: port_end.saturating_sub(port_base).saturating_add(1),
             owners: DashMap::new(),
             queues: DashMap::new(),
+            route_cache: DashMap::new(),
             // Randomized start spreads the probe cursor so back-to-back
             // dials do not serialize on the same port order.
             port_cursor: AtomicU32::new(
@@ -280,16 +307,23 @@ impl AfXdpDialRegistry {
         None
     }
 
-    /// Node-originated TCP connect through the AF_XDP dataplane. Fails
-    /// explicitly on route/neighbor failure, missing reactor, port-span
-    /// exhaustion, map insert failure, or a full request queue — there is
-    /// no silent kernel-path fallback.
-    pub(crate) async fn dial_tcp(
+    /// T4: route+neighbor resolution shared by TCP/UDP dials. Each
+    /// uncached lookup spawns three `ip`-tool processes (route/neigh/link)
+    /// — tens of milliseconds — which dominated the measured ~99ms dial
+    /// latency over a ~4ms RTT. Fresh entries are served for
+    /// AF_XDP_DIAL_ROUTE_CACHE_TTL; a dial timeout evicts the entry so a
+    /// stale next-hop MAC re-resolves on the next connect.
+    async fn resolve_route_cached(
         &self,
+        target: IpAddr,
         remote: SocketAddr,
-        syn_extra_options: Vec<u8>,
-    ) -> io::Result<AfXdpTcpStream> {
-        let target = remote.ip();
+    ) -> io::Result<Arc<linux::XdpOutboundRoute>> {
+        let now = std::time::Instant::now();
+        if let Some(entry) = self.route_cache.get(&target)
+            && entry.expires_at > now
+        {
+            return Ok(entry.route.clone());
+        }
         let route = tokio::task::spawn_blocking(move || linux::resolve_outbound_route(target))
             .await
             .map_err(|err| {
@@ -301,6 +335,41 @@ impl AfXdpDialRegistry {
                     format!("AF_XDP dial to {remote}: route resolution failed: {err}"),
                 )
             })?;
+        let route = Arc::new(route);
+        if self.route_cache.len() >= AF_XDP_DIAL_ROUTE_CACHE_MAX {
+            self.route_cache
+                .retain(|_, entry| entry.expires_at > now);
+            if self.route_cache.len() >= AF_XDP_DIAL_ROUTE_CACHE_MAX
+                && let Some(oldest) = self
+                    .route_cache
+                    .iter()
+                    .min_by_key(|entry| entry.expires_at)
+                    .map(|entry| *entry.key())
+            {
+                self.route_cache.remove(&oldest);
+            }
+        }
+        self.route_cache.insert(
+            target,
+            AfXdpCachedRoute {
+                route: route.clone(),
+                expires_at: now + AF_XDP_DIAL_ROUTE_CACHE_TTL,
+            },
+        );
+        Ok(route)
+    }
+
+    /// Node-originated TCP connect through the AF_XDP dataplane. Fails
+    /// explicitly on route/neighbor failure, missing reactor, port-span
+    /// exhaustion, map insert failure, or a full request queue — there is
+    /// no silent kernel-path fallback.
+    pub(crate) async fn dial_tcp(
+        &self,
+        remote: SocketAddr,
+        syn_extra_options: Vec<u8>,
+    ) -> io::Result<AfXdpTcpStream> {
+        let target = remote.ip();
+        let route = self.resolve_route_cached(target, remote).await?;
         if route.source.is_ipv4() != remote.is_ipv4() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
@@ -403,6 +472,13 @@ impl AfXdpDialRegistry {
             // once the dial succeeds, reap-time `release` owns cleanup.
             Ok(Err(err)) => {
                 self.rollback(&flow);
+                // A connect timeout is the one failure consistent with a
+                // stale cached next-hop MAC (frames black-holed at L2) —
+                // drop the entry so the next dial re-resolves. Refusals
+                // prove the L2 path works (the RST arrived) and keep it.
+                if err.kind() == io::ErrorKind::TimedOut {
+                    self.route_cache.remove(&target);
+                }
                 Err(err)
             }
             Err(_) => {
@@ -430,17 +506,7 @@ impl AfXdpDialRegistry {
         preferred_port: Option<u16>,
     ) -> io::Result<AfXdpUdpSocket> {
         let target = remote.ip();
-        let route = tokio::task::spawn_blocking(move || linux::resolve_outbound_route(target))
-            .await
-            .map_err(|err| {
-                io::Error::other(format!("AF_XDP UDP route resolution task failed: {err}"))
-            })?
-            .map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("AF_XDP UDP dial to {remote}: route resolution failed: {err}"),
-                )
-            })?;
+        let route = self.resolve_route_cached(target, remote).await?;
         if route.source.is_ipv4() != remote.is_ipv4() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,

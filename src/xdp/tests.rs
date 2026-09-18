@@ -1915,7 +1915,11 @@ fn af_xdp_tcp_reactor_keeps_stream_read_side_open_during_half_close() {
     assert!(!af_xdp::af_xdp_tcp_stream_read_side_closed(
         smoltcp::socket::tcp::State::Established
     ));
-    assert!(!af_xdp::af_xdp_tcp_stream_read_side_closed(
+    // CloseWait is the peer's FIN: no further inbound data is possible, so
+    // the stream's read side must EOF (kernel recv() → 0 semantics). The
+    // send half stays open independently — missing this parked relay tasks
+    // in `poll_read` forever and leaked their upstream sockets + permits.
+    assert!(af_xdp::af_xdp_tcp_stream_read_side_closed(
         smoltcp::socket::tcp::State::CloseWait
     ));
     assert!(af_xdp::af_xdp_tcp_stream_read_side_closed(
