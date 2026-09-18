@@ -639,7 +639,7 @@ detect_runtime() {
     fi
     if command -v strings >/dev/null 2>&1 && strings "$probe_path" 2>/dev/null | grep -q 'Go buildinf:'; then
         printf 'go\n'
-    elif command -v strings >/dev/null 2>&1 && strings "$probe_path" 2>/dev/null | grep -q 'cloud-node-rust'; then
+    elif command -v strings >/dev/null 2>&1 && strings "$probe_path" 2>/dev/null | grep -qE 'cloud-node-rust|rustc version'; then
         printf 'rust\n'
     else
         printf 'unknown\n'
@@ -1100,6 +1100,8 @@ draw_progress() {
     local total="${2:-0}"
     local spin_idx="${3:-0}"
     local started="${4:-$(date +%s)}"
+    case "$have" in ''|*[!0-9]*) have=0 ;; esac
+    case "$total" in ''|*[!0-9]*) total=0 ;; esac
     local spin=""
     local bar=""
     local line=""
@@ -1165,8 +1167,12 @@ download_with_progress() {
     local have=0
 
     while kill -0 "$curl_pid" 2>/dev/null; do
-        have="$(wc -c < "$dest" 2>/dev/null | tr -d '[:space:]')"
-        have="${have:-0}"
+        # $dest does not exist until curl's first write — tolerate that
+        # window instead of letting the failed read trip `set -e`.
+        have=0
+        if [ -f "$dest" ]; then
+            have="$(wc -c < "$dest" | tr -d '[:space:]')"
+        fi
         draw_progress "$have" "$total" "$spin_idx" "$started"
         spin_idx=$((spin_idx + 1))
         sleep 0.12
@@ -1174,8 +1180,10 @@ download_with_progress() {
 
     local rc=0
     wait "$curl_pid" || rc=$?
-    have="$(wc -c < "$dest" 2>/dev/null | tr -d '[:space:]')"
-    have="${have:-0}"
+    have=0
+    if [ -f "$dest" ]; then
+        have="$(wc -c < "$dest" | tr -d '[:space:]')"
+    fi
     if [ "$rc" -eq 0 ]; then
         draw_progress "$have" "$total" "$spin_idx" "$started"
         printf '\r%80s\r' "" >&2
