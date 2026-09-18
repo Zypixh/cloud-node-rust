@@ -2271,6 +2271,7 @@ fn af_xdp_udp_ingress_failure_tracker_resets_after_delivery() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn af_xdp_tcp_stream_bridges_bounded_channels() {
     let _budget_guard = tcp_queue_budget_test_lock()
         .lock()
@@ -2309,6 +2310,7 @@ async fn af_xdp_tcp_stream_bridges_bounded_channels() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn af_xdp_tcp_stream_chunks_large_writes_with_backpressure() {
     let _budget_guard = tcp_queue_budget_test_lock()
         .lock()
@@ -2344,6 +2346,7 @@ async fn af_xdp_tcp_stream_chunks_large_writes_with_backpressure() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn af_xdp_ingress_delivery_preserves_backpressured_chunk() {
     use bytes::Bytes;
 
@@ -2384,6 +2387,7 @@ async fn af_xdp_ingress_delivery_preserves_backpressured_chunk() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn af_xdp_tcp_stream_reports_broken_pipe_when_reactor_side_closes() {
     let _budget_guard = tcp_queue_budget_test_lock()
         .lock()
@@ -2452,6 +2456,7 @@ fn af_xdp_tcp_reactor_hot_set_dedups_and_drains() {
 
 #[cfg(any(test, target_os = "linux"))]
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn af_xdp_tcp_stream_write_and_shutdown_signal_reactor_wake() {
     let _budget_guard = tcp_queue_budget_test_lock()
         .lock()
@@ -2746,6 +2751,7 @@ fn af_xdp_tcp_reactor_ingress_budget_leaves_backlog_bounded() {
 
 #[cfg(any(test, target_os = "linux"))]
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn af_xdp_tcp_wake_set_stays_bounded_under_write_storm() {
     let _budget_guard = tcp_queue_budget_test_lock()
         .lock()
@@ -2876,6 +2882,7 @@ fn af_xdp_tcp_ingress_frame_holds_queue_charge_until_consumed() {
 
 #[cfg(any(test, target_os = "linux"))]
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn af_xdp_tcp_write_budget_stall_wakes_on_release() {
     use futures_util::FutureExt;
     use tokio::io::AsyncWriteExt;

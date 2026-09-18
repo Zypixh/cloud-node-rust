@@ -879,6 +879,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn connect_upstream_kernel_mode_returns_kernel_stream() {
         let _guard = crate::runtime_mode::runtime_config_test_guard();
         crate::runtime_mode::RuntimeConfig::set_current(
@@ -906,6 +907,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn connect_upstream_afxdp_mode_without_registry_is_explicit_error() {
         let _guard = crate::runtime_mode::runtime_config_test_guard();
         let mut config = crate::runtime_mode::RuntimeConfig::default();

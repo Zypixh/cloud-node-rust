@@ -837,6 +837,10 @@ mod test {
             assert_eq!(data, server_body);
 
             req_body.send_data("".into(), true).unwrap(); // set EOS after read the resp body
+            // Give the connection driver a turn to flush the queued
+            // DATA+EOS frame before the SendRequest handle drops;
+            // otherwise h2 emits RST_STREAM(CANCEL) on the open stream.
+            tokio::task::yield_now().await;
         }));
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
@@ -909,6 +913,10 @@ mod test {
             assert_eq!(data, server_body);
 
             req_body.send_data("".into(), true).unwrap(); // set EOS after read the resp body
+            // Give the connection driver a turn to flush the queued
+            // DATA+EOS frame before the SendRequest handle drops;
+            // otherwise h2 emits RST_STREAM(CANCEL) on the open stream.
+            tokio::task::yield_now().await;
         }));
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();

@@ -819,22 +819,18 @@ impl AfXdpUdpSocket {
     /// when the owning demux entry is torn down (registry release,
     /// generation drain), which surfaces as `UnexpectedEof`.
     pub async fn recv(&mut self) -> io::Result<Bytes> {
-        loop {
-            match self
-                .ingress_rx
-                .get_mut()
-                .unwrap_or_else(|err| err.into_inner())
-                .recv()
-                .await
-            {
-                // ICMP errors surface once, kernel error-queue style;
-                // the loop continues so the next item is the payload.
-                Some(AfXdpUdpIngress::IcmpError { mtu }) => {
-                    return Err(self.icmp_error(mtu));
-                }
-                Some(AfXdpUdpIngress::Datagram(datagram)) => return Ok(datagram.payload),
-                None => return Err(self.ingress_closed_error()),
-            }
+        match self
+            .ingress_rx
+            .get_mut()
+            .unwrap_or_else(|err| err.into_inner())
+            .recv()
+            .await
+        {
+            // ICMP errors surface once, kernel error-queue style;
+            // the loop continues so the next item is the payload.
+            Some(AfXdpUdpIngress::IcmpError { mtu }) => Err(self.icmp_error(mtu)),
+            Some(AfXdpUdpIngress::Datagram(datagram)) => Ok(datagram.payload),
+            None => Err(self.ingress_closed_error()),
         }
     }
 
