@@ -3517,18 +3517,22 @@ fn test_internet_checksum(bytes: &[u8]) -> u16 {
 #[test]
 fn percpu_counter_aggregation_sums_all_cpu_slots() {
     use cloud_node_xdp_common::XdpCounters;
-    let mut a = XdpCounters::default();
-    a.packets = 7;
-    a.pass = 3;
-    a.tx = 2;
-    a.acl_blocked = 1;
-    let mut b = XdpCounters::default();
-    b.packets = 5;
-    b.drop = 4;
-    b.redirect = 9;
-    b.tx = 11;
-    b.acl_blocked = 13;
-    let slots = vec![a, b, XdpCounters::default()];
+    let a = XdpCounters {
+        packets: 7,
+        pass: 3,
+        tx: 2,
+        acl_blocked: 1,
+        ..Default::default()
+    };
+    let b = XdpCounters {
+        packets: 5,
+        drop: 4,
+        redirect: 9,
+        tx: 11,
+        acl_blocked: 13,
+        ..Default::default()
+    };
+    let slots = [a, b, XdpCounters::default()];
     let total = linux::sum_percpu_counters(slots.iter());
     assert_eq!(total.packets, 12);
     assert_eq!(total.pass, 3);
@@ -3544,13 +3548,17 @@ fn percpu_counter_aggregation_sums_all_cpu_slots() {
 #[test]
 fn percpu_counter_aggregation_saturates_instead_of_wrapping() {
     use cloud_node_xdp_common::XdpCounters;
-    let mut a = XdpCounters::default();
-    a.packets = u64::MAX;
-    a.tx = u64::MAX - 1;
-    let mut b = XdpCounters::default();
-    b.packets = 10;
-    b.tx = 10;
-    let slots = vec![a, b];
+    let a = XdpCounters {
+        packets: u64::MAX,
+        tx: u64::MAX - 1,
+        ..Default::default()
+    };
+    let b = XdpCounters {
+        packets: 10,
+        tx: 10,
+        ..Default::default()
+    };
+    let slots = [a, b];
     let total = linux::sum_percpu_counters(slots.iter());
     assert_eq!(total.packets, u64::MAX);
     assert_eq!(total.tx, u64::MAX);
@@ -3589,9 +3597,8 @@ fn ipv4_tcp_flags_frame(flags: u8, doff_words: u8) -> Vec<u8> {
     frame.push(doff_words << 4);
     frame.push(flags);
     frame.extend_from_slice(&[0xff, 0xff, 0, 0, 0, 0]);
-    for _ in 20..tcp_len {
-        frame.push(1); // option bytes (e.g. MSS/TFO cookie space)
-    }
+    // option bytes (e.g. MSS/TFO cookie space)
+    frame.extend(std::iter::repeat_n(1, tcp_len.saturating_sub(20)));
     write_ipv4_checksum(&mut frame, 14);
     frame
 }
@@ -3940,17 +3947,19 @@ fn projected_bpf_map_bytes_bounded() {
 fn projected_bpf_map_bytes_respects_state_table_overrides() {
     use crate::runtime_mode::{XdpConfig, XdpStateTables};
     let default = linux::projected_bpf_map_bytes(&XdpConfig::default());
-    let mut cfg = XdpConfig::default();
-    cfg.state_tables = Some(XdpStateTables {
-        ct_max_entries: Some(8_192),
-        pending_max_entries: Some(4_096),
-        snat_rev_max_entries: Some(4_096),
-        flow_acct_max_entries: Some(8_192),
-        rate_v6_max_entries: Some(8_192),
-        acl_blocked_max_entries: Some(16_384),
-        acl_allowed_max_entries: Some(4_096),
-        rate_v4_max_entries: Some(16_384),
-    });
+    let cfg = XdpConfig {
+        state_tables: Some(XdpStateTables {
+            ct_max_entries: Some(8_192),
+            pending_max_entries: Some(4_096),
+            snat_rev_max_entries: Some(4_096),
+            flow_acct_max_entries: Some(8_192),
+            rate_v6_max_entries: Some(8_192),
+            acl_blocked_max_entries: Some(16_384),
+            acl_allowed_max_entries: Some(4_096),
+            rate_v4_max_entries: Some(16_384),
+        }),
+        ..Default::default()
+    };
     let shrunk = linux::projected_bpf_map_bytes(&cfg);
     assert!(
         shrunk < default / 2,
@@ -4002,10 +4011,12 @@ fn xdp_proxy_bridge_worker_lease_covers_startup_without_redirect() {
 fn flow_event_ledger_orders_by_incarnation_epoch_seq() {
     use cloud_node_xdp_common::*;
 
-    let mut key = XdpFlowKey::default();
-    key.family = 4;
-    key.proto = XDP_PROTO_TCP;
-    key.client_port_be = 1234u16.to_be();
+    let key = XdpFlowKey {
+        family: 4,
+        proto: XDP_PROTO_TCP,
+        client_port_be: 1234u16.to_be(),
+        ..Default::default()
+    };
 
     let event = |incarnation: u64, epoch: u64, seq: u64, kind: u8| XdpFlowEvent {
         key,

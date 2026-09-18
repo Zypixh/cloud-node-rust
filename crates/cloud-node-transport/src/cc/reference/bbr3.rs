@@ -144,6 +144,9 @@ impl MaxFilter {
     }
 }
 
+/// Eifel checkpoint snapshot: (inflight_hi, inflight_lo, bw_lo, mode).
+type EifelCheckpoint = (Option<u64>, Option<u64>, Option<u64>, &'static str);
+
 #[derive(Debug)]
 pub struct Bbr3Ref {
     mss: u64,
@@ -186,7 +189,7 @@ pub struct Bbr3Ref {
     // --- recovery ---
     prr: Prr,
     /// Eifel checkpoint: (inflight_hi, inflight_lo, bw_lo, mode).
-    saved: Option<(Option<u64>, Option<u64>, Option<u64>, &'static str)>,
+    saved: Option<EifelCheckpoint>,
     recovery_point: u64,
 
     pacing_bps: u64,

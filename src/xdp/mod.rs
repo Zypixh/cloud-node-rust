@@ -761,18 +761,18 @@ impl XdpManager {
         }
 
         let object_override = ebpf_object_override(&self.config);
-        if let Some(path) = &object_override {
-            if !path.exists() {
-                self.set_fallback_reason(format!(
-                    "configured eBPF object {} is missing",
-                    path.display()
-                ));
-                if self.config.fallback.fail_start() {
-                    anyhow::bail!("xdp eBPF object is missing: {}", path.display());
-                }
-                self.persist_status();
-                return Ok(());
+        if let Some(path) = &object_override
+            && !path.exists()
+        {
+            self.set_fallback_reason(format!(
+                "configured eBPF object {} is missing",
+                path.display()
+            ));
+            if self.config.fallback.fail_start() {
+                anyhow::bail!("xdp eBPF object is missing: {}", path.display());
             }
+            self.persist_status();
+            return Ok(());
         }
 
         #[cfg(target_os = "linux")]
@@ -897,20 +897,20 @@ impl XdpManager {
             self.release_dial_guard().await;
             *self.af_xdp.lock() = None;
             *self.ebpf.lock() = None;
-            if !self.config.interfaces.is_empty() {
-                if let Err(err) = linux::detach(&self.config).await {
-                    let detail = format!("runtime xdp.enabled=false; detach failed: {err}");
-                    self.set_fallback_reason(detail.clone());
-                    tracing::warn!("{detail}");
-                    crate::logging::report_node_log(
-                        "warn".to_string(),
-                        "xdp".to_string(),
-                        detail,
-                        0,
-                    );
-                    self.persist_status_blocking();
-                    return;
-                }
+            if !self.config.interfaces.is_empty()
+                && let Err(err) = linux::detach(&self.config).await
+            {
+                let detail = format!("runtime xdp.enabled=false; detach failed: {err}");
+                self.set_fallback_reason(detail.clone());
+                tracing::warn!("{detail}");
+                crate::logging::report_node_log(
+                    "warn".to_string(),
+                    "xdp".to_string(),
+                    detail,
+                    0,
+                );
+                self.persist_status_blocking();
+                return;
             }
         }
         self.attached.write().clear();
@@ -2815,11 +2815,11 @@ pub(crate) fn af_xdp_dial_registry() -> Option<std::sync::Arc<af_xdp::AfXdpDialR
 pub(crate) fn afxdp_upstream_selected() -> bool {
     #[cfg(target_os = "linux")]
     {
-        return RuntimeConfig::current()
+        RuntimeConfig::current()
             .map(|runtime| {
                 runtime.xdp.upstream_mode() == crate::runtime_mode::XdpUpstreamMode::Afxdp
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
     #[cfg(not(target_os = "linux"))]
     {

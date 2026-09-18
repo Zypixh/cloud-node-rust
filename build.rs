@@ -49,12 +49,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
             let _ = child.kill();
             continue;
         }
-        if let Ok(output) = child.wait_with_output() {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                if let Some(hex) = text.split_whitespace().next() {
-                    return hex.to_ascii_lowercase();
-                }
+        if let Ok(output) = child.wait_with_output()
+            && output.status.success()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(hex) = text.split_whitespace().next() {
+                return hex.to_ascii_lowercase();
             }
         }
     }
@@ -132,12 +132,11 @@ fn toolchain_channel(toml: &str) -> Option<String> {
             in_toolchain = line.trim_start_matches('[').starts_with("toolchain");
             continue;
         }
-        if in_toolchain {
-            if let Some((key, value)) = line.split_once('=') {
-                if key.trim() == "channel" {
-                    return Some(value.trim().trim_matches('"').to_string());
-                }
-            }
+        if in_toolchain
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "channel"
+        {
+            return Some(value.trim().trim_matches('"').to_string());
         }
     }
     None

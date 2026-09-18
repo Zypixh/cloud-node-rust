@@ -603,18 +603,13 @@ impl<'a> Sim<'a> {
             link.queued.pop_front();
         }
         let mut ce = false;
-        match cfg.aqm {
-            Aqm::CodelEcn { target } => {
-                let sojourn_us = if cfg.rate_bps > 0 {
-                    link.queued_bytes * 1_000_000 / cfg.rate_bps
-                } else {
-                    0
-                };
-                if sojourn_us > target.as_micros() as u64 {
-                    ce = true;
-                }
+        if let Aqm::CodelEcn { target } = cfg.aqm {
+            let sojourn_us = (link.queued_bytes * 1_000_000)
+                .checked_div(cfg.rate_bps)
+                .unwrap_or(0);
+            if sojourn_us > target.as_micros() as u64 {
+                ce = true;
             }
-            _ => {}
         }
         if link.queued_bytes + len > cfg.buffer_bytes {
             return Admit {
@@ -696,9 +691,9 @@ impl<'a> Sim<'a> {
                     Work::Done
                 } else {
                     let len = cfg.mss.min(cfg.total_bytes - f.next_seq);
-                    if f.in_flight + len > f.cc.cwnd() {
-                        Work::Blocked
-                    } else if self.now_us + self.pace_quantum_us < f.next_send_due {
+                    if f.in_flight + len > f.cc.cwnd()
+                        || self.now_us + self.pace_quantum_us < f.next_send_due
+                    {
                         Work::Blocked
                     } else {
                         match f.app_rate_bps {

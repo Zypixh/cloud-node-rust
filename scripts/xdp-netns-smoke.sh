@@ -20,7 +20,7 @@ HOST_IP6="${HOST_ADDR6%/*}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 XDP_SMOKE_PROFILE="${XDP_SMOKE_PROFILE:-debug}"
 NODE_BIN="$TARGET_DIR/$XDP_SMOKE_PROFILE/cloud-node-rust"
-H3_PROBE_BIN="$TARGET_DIR/$XDP_SMOKE_PROFILE/h3_probe"
+H3_PROBE_BIN="$TARGET_DIR/$XDP_SMOKE_PROFILE/h3-probe"
 PIDS_TO_KILL=()
 
 log() {
@@ -456,9 +456,9 @@ if [[ "${XDP_SMOKE_SKIP_BUILD:-0}" != "1" ]]; then
 
     log "building smoke binaries"
     if [[ "$XDP_SMOKE_PROFILE" == "release" ]]; then
-        cargo build -q --release --bin cloud-node-rust --bin h3_probe
+        cargo build -q --release --bin cloud-node-rust --bin h3-probe
     else
-        cargo build -q --bin cloud-node-rust --bin h3_probe
+        cargo build -q --bin cloud-node-rust --bin h3-probe
     fi
 fi
 [[ -x "$NODE_BIN" ]] || die "missing node binary: $NODE_BIN"

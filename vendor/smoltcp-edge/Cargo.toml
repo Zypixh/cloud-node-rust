@@ -296,6 +296,7 @@ socket-tcp = ["socket"]
 socket-tcp-cubic = []
 socket-tcp-pause-synack = ["socket-tcp"]
 socket-tcp-reno = []
+socket-tcp-timestamp = []
 socket-udp = ["socket"]
 std = [
     "managed/std",

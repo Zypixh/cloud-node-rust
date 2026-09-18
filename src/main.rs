@@ -581,7 +581,7 @@ fn spawn_xdp_port_sync_task(rt: &tokio::runtime::Runtime, enabled: bool) {
                         consecutive_errors, err
                     );
                     warn!("{message}");
-                    if consecutive_errors == 1 || consecutive_errors % 10 == 0 {
+                    if consecutive_errors == 1 || consecutive_errors.is_multiple_of(10) {
                         logging::report_node_log(
                             "warn".to_string(),
                             "xdp_ports".to_string(),

@@ -163,9 +163,7 @@ impl Token {
         self.val = [0; 32];
 
         // Copy the value
-        for i in 0..actual_copy_len {
-            self.val[i] = value[i];
-        }
+        self.val[..actual_copy_len].copy_from_slice(&value[..actual_copy_len]);
 
         self.val[actual_copy_len] = CHAR_NULL;
         // Note: str_open, str_close, and count are NOT reset to preserve variable info like C st_assign()

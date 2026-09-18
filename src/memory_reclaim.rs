@@ -278,8 +278,10 @@ pub fn reclaim_for_level(level: MemoryPressureLevel) -> ReclaimStats {
         panic!("forced reclaim panic for unwind-safety test");
     }
 
-    let mut stats = ReclaimStats::default();
-    stats.process_rss_before_bytes = current_process_rss_bytes();
+    let mut stats = ReclaimStats {
+        process_rss_before_bytes: current_process_rss_bytes(),
+        ..Default::default()
+    };
     match level {
         MemoryPressureLevel::Normal => {}
         MemoryPressureLevel::Elevated => {
@@ -1013,8 +1015,10 @@ mod tests {
         );
         // Cooldown still applies: an immediate second Critical does not
         // stampede another reclaim while one is cooling down.
-        let mut coordinator = ReclaimCoordinator::default();
-        coordinator.next_allowed_ms = 10_000;
+        let mut coordinator = ReclaimCoordinator {
+            next_allowed_ms: 10_000,
+            ..Default::default()
+        };
         assert_eq!(
             coordinator.observe(MemoryPressureLevel::Critical, 1),
             ReclaimDecision::Hold,

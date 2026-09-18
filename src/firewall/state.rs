@@ -1331,7 +1331,7 @@ impl WafStateManager {
         #[cfg(target_os = "linux")]
         {
             let _ = std::process::Command::new("ipset")
-                .args(&[
+                .args([
                     "add",
                     "cloud_waf_block",
                     &target,
@@ -1406,7 +1406,7 @@ impl WafStateManager {
         #[cfg(target_os = "linux")]
         {
             let _ = std::process::Command::new("ipset")
-                .args(&["del", "cloud_waf_block", &target, "-exist"])
+                .args(["del", "cloud_waf_block", &target, "-exist"])
                 .spawn();
         }
         #[cfg(not(target_os = "linux"))]

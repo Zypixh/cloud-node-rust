@@ -68,9 +68,9 @@ impl UdpBatchReceiver {
                 addresses.push(unsafe { std::mem::zeroed() });
                 controls.push([0u64; 8]);
             }
-            for index in 0..UDP_RECEIVE_BATCH_SIZE {
+            for buffer in &mut buffers {
                 iovecs.push(libc::iovec {
-                    iov_base: buffers[index].as_mut_ptr().cast(),
+                    iov_base: buffer.as_mut_ptr().cast(),
                     iov_len: UDP_MAX_DATAGRAM_SIZE,
                 });
             }
@@ -89,14 +89,14 @@ impl UdpBatchReceiver {
                 });
             }
 
-            return Self {
+            Self {
                 socket,
                 buffers,
                 addresses,
                 iovecs,
                 messages,
                 controls,
-            };
+            }
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -163,13 +163,19 @@ impl UdpBatchReceiver {
             };
 
             let mut datagrams = Vec::with_capacity(received);
-            for index in 0..received {
+            for ((address, message), buffer) in self
+                .addresses
+                .iter()
+                .zip(messages.iter())
+                .zip(self.buffers.iter())
+                .take(received)
+            {
                 let mut storage = SockAddrStorage::zeroed();
                 unsafe {
-                    *storage.view_as::<libc::sockaddr_storage>() = self.addresses[index];
+                    *storage.view_as::<libc::sockaddr_storage>() = *address;
                 }
                 let peer_addr =
-                    unsafe { SockAddr::new(storage, messages[index].msg_hdr.msg_namelen) }
+                    unsafe { SockAddr::new(storage, message.msg_hdr.msg_namelen) }
                         .as_socket()
                         .ok_or_else(|| {
                             io::Error::new(
@@ -177,11 +183,11 @@ impl UdpBatchReceiver {
                                 "UDP recvmmsg returned a non-IP peer address",
                             )
                         })?;
-                let len = messages[index].msg_len as usize;
+                let len = message.msg_len as usize;
                 datagrams.push(ReceivedUdpDatagram {
                     peer_addr,
-                    payload: Bytes::copy_from_slice(&self.buffers[index][..len]),
-                    rxq_overflow: parse_rxq_overflow(&messages[index].msg_hdr),
+                    payload: Bytes::copy_from_slice(&buffer[..len]),
+                    rxq_overflow: parse_rxq_overflow(&message.msg_hdr),
                 });
             }
             return Ok(datagrams);

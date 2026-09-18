@@ -1,4 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+// Vendored upstream code: we do not restyle it. Correctness and
+// suspicious lints stay enabled; style/complexity warnings are noise.
+#![allow(clippy::style, clippy::complexity)]
 
 //!
 //! ## API Guide

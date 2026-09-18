@@ -2009,7 +2009,7 @@ impl MemoryGovernor {
                 }
             }
             let _reset = InProgressReset(in_progress);
-            let result = (|| {
+            (|| {
                 let mut owners = lock_recover(&self.resident.owners);
                 let key = (category, owner.to_string());
                 let old_bytes = owners.get(&key).copied().unwrap_or(0);
@@ -2032,8 +2032,7 @@ impl MemoryGovernor {
                     owners.insert(key, new_bytes);
                 }
                 true
-            })();
-            result
+            })()
         })
     }
 

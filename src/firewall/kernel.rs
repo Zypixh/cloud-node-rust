@@ -340,13 +340,12 @@ mod linux {
     static IPTABLES_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
     static IPTABLES_QUEUE_LAST_WARNING: AtomicI64 = AtomicI64::new(0);
     static IP6TABLES_AVAILABLE: AtomicBool = AtomicBool::new(false);
-    static KERNEL_SNAPSHOT_PROVIDER: OnceLock<
-        std::sync::Mutex<Option<std::sync::Arc<dyn Fn() -> KernelFilterSnapshot + Send + Sync>>>,
-    > = OnceLock::new();
+    type KernelSnapshotProvider =
+        std::sync::Arc<dyn Fn() -> KernelFilterSnapshot + Send + Sync>;
+    static KERNEL_SNAPSHOT_PROVIDER: OnceLock<std::sync::Mutex<Option<KernelSnapshotProvider>>> =
+        OnceLock::new();
 
-    pub fn set_kernel_snapshot_provider(
-        provider: Option<std::sync::Arc<dyn Fn() -> KernelFilterSnapshot + Send + Sync>>,
-    ) {
+    pub fn set_kernel_snapshot_provider(provider: Option<KernelSnapshotProvider>) {
         let slot = KERNEL_SNAPSHOT_PROVIDER.get_or_init(|| std::sync::Mutex::new(None));
         if let Ok(mut guard) = slot.lock() {
             *guard = provider;

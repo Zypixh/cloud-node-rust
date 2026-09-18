@@ -322,7 +322,7 @@ impl AccEcn {
     /// Feed the peer's ACE field (3 bits) from an incoming ACK — sender
     /// side. Returns the new CE *packet* delta (wrap-safe).
     pub fn on_ack_ace(&mut self, ace: u8) -> u64 {
-        let delta = ((ace as u64 + ACE_MOD - self.peer_ace as u64) % ACE_MOD) as u64;
+        let delta = (ace as u64 + ACE_MOD - self.peer_ace as u64) % ACE_MOD;
         self.peer_ace = ace;
         self.peer_cep_packets += delta;
         delta

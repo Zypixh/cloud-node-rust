@@ -424,6 +424,7 @@ pub async fn dial_smoke(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn dial_smoke_inner(
     manager: std::sync::Arc<XdpManager>,
     target: std::net::SocketAddr,
@@ -1327,8 +1328,10 @@ async fn xdp_proxy_smoke_config_store(
         }
     }
 
-    let mut global_http = crate::config_models::GlobalHTTPAllConfig::default();
-    global_http.allow_lan_ip = true;
+    let global_http = crate::config_models::GlobalHTTPAllConfig {
+        allow_lan_ip: true,
+        ..Default::default()
+    };
     let mut http3_policies = std::collections::HashMap::new();
     http3_policies.insert(
         1,

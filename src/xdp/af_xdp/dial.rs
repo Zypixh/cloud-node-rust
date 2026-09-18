@@ -705,7 +705,7 @@ impl AfXdpUdpSocket {
 
     fn egress_request(&self, payload: &[u8], ecn: Option<u8>) -> AfXdpReactorRequest {
         AfXdpReactorRequest::UdpEgress {
-            link: self.link.clone(),
+            link: self.link,
             local: self.flow.local_addr,
             remote: self.flow.peer_addr,
             payload: Bytes::copy_from_slice(payload),

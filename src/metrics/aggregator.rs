@@ -157,15 +157,15 @@ impl AggregatedValue {
         is_attack: bool,
         capacity: usize,
     ) {
-        if !self.request_samples.contains_key(&request_attrs) {
-            if self.request_samples.len() >= capacity {
-                crate::pipeline_metrics::note_cardinality_drop(
-                    "metric_request_samples",
-                    self.request_samples.len(),
-                    capacity,
-                );
-                return;
-            }
+        if !self.request_samples.contains_key(&request_attrs)
+            && self.request_samples.len() >= capacity
+        {
+            crate::pipeline_metrics::note_cardinality_drop(
+                "metric_request_samples",
+                self.request_samples.len(),
+                capacity,
+            );
+            return;
         }
         self.request_samples.entry(request_attrs).or_default().add(
             bytes_sent,
@@ -293,15 +293,15 @@ impl MetricAggregator {
             entry.bytes_received += value.bytes_received;
             entry.attack_bytes += value.attack_bytes;
             for (attrs, request_value) in value.request_samples {
-                if !entry.request_samples.contains_key(&attrs) {
-                    if entry.request_samples.len() >= capacity {
-                        crate::pipeline_metrics::note_cardinality_drop(
-                            "metric_request_samples",
-                            entry.request_samples.len(),
-                            capacity,
-                        );
-                        continue;
-                    }
+                if !entry.request_samples.contains_key(&attrs)
+                    && entry.request_samples.len() >= capacity
+                {
+                    crate::pipeline_metrics::note_cardinality_drop(
+                        "metric_request_samples",
+                        entry.request_samples.len(),
+                        capacity,
+                    );
+                    continue;
                 }
                 let target = entry.request_samples.entry(attrs).or_default();
                 target.count += request_value.count;

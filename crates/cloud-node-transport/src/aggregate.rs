@@ -265,17 +265,17 @@ impl Aggregate {
             };
             if merged {
                 let c = self.compute_centroid(Some(id));
-                if c.members > 0 {
-                    if Self::correlation(&c, &stats).unwrap_or(0.0) < SPLIT_CORR {
-                        if let Some(m) = self.members.get_mut(&id) {
-                            m.merged = false;
-                            m.merge_votes = 0;
-                        }
-                        self.merged_since.remove(&id);
-                        if self.probe_holder == Some(id) {
-                            self.probe_holder = None;
-                            self.probe_epoch += 1;
-                        }
+                if c.members > 0
+                    && Self::correlation(&c, &stats).unwrap_or(0.0) < SPLIT_CORR
+                {
+                    if let Some(m) = self.members.get_mut(&id) {
+                        m.merged = false;
+                        m.merge_votes = 0;
+                    }
+                    self.merged_since.remove(&id);
+                    if self.probe_holder == Some(id) {
+                        self.probe_holder = None;
+                        self.probe_epoch += 1;
                     }
                 }
                 continue;

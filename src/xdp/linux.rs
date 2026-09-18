@@ -1467,7 +1467,7 @@ pub fn detach_blocking(config: &XdpConfig) -> anyhow::Result<()> {
         for entry in dir.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
-            if name.starts_with("link-") && !link_pins.iter().any(|p| *p == path) {
+            if name.starts_with("link-") && !link_pins.contains(&path) {
                 link_pins.push(path);
             }
         }
@@ -1508,10 +1508,10 @@ pub fn detach_blocking(config: &XdpConfig) -> anyhow::Result<()> {
         let _ = std::fs::remove_dir(&prog_pin_dir);
     }
     let dispatch_pin = Path::new(xdp_bpf_pin_dir()).join("XDP_DISPATCH");
-    if dispatch_pin.exists() {
-        if let Err(err) = std::fs::remove_file(&dispatch_pin) {
-            tracing::warn!("failed to unpin XDP_DISPATCH map: {err}");
-        }
+    if dispatch_pin.exists()
+        && let Err(err) = std::fs::remove_file(&dispatch_pin)
+    {
+        tracing::warn!("failed to unpin XDP_DISPATCH map: {err}");
     }
     Ok(())
 }
@@ -1757,8 +1757,10 @@ pub fn sync_cookie_key(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
     if cur.cur != [0u8; 16] {
         return Ok(());
     }
-    let mut key = cloud_node_xdp_common::XdpCookieKey::default();
-    key.cur = rand::random::<[u8; 16]>();
+    let key = cloud_node_xdp_common::XdpCookieKey {
+        cur: rand::random::<[u8; 16]>(),
+        ..Default::default()
+    };
     array.set(0, key, 0)?;
     Ok(())
 }

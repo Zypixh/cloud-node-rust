@@ -283,6 +283,10 @@ impl TimingWheel {
     pub fn len(&self) -> usize {
         self.len
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 /// Cancellation/handle returned by `schedule`.
@@ -306,16 +310,20 @@ impl MinHeapSched {
         self.heap.push(std::cmp::Reverse((due.micros(), self.seq, flow)));
     }
     pub fn pop_due(&mut self, now: TransportInstant) -> Option<FlowId> {
-        if let Some(&std::cmp::Reverse((due, _, _))) = self.heap.peek() {
-            if due <= now.micros() {
-                let std::cmp::Reverse((_, _, f)) = self.heap.pop().unwrap();
-                return Some(f);
-            }
+        if let Some(&std::cmp::Reverse((due, _, _))) = self.heap.peek()
+            && due <= now.micros()
+        {
+            let std::cmp::Reverse((_, _, f)) = self.heap.pop().unwrap();
+            return Some(f);
         }
         None
     }
     pub fn len(&self) -> usize {
         self.heap.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.heap.is_empty()
     }
 }
 
@@ -514,17 +522,17 @@ impl Scheduler {
             }
         }
         // Tier DRR: pick the highest-tier flow with deficit coverage.
-        for t in 0..3 {
-            while let Some(&f) = self.eligible[t].front() {
+        for (eligible, &quantum) in self.eligible.iter_mut().zip(TIER_QUANTUM.iter()) {
+            while let Some(&f) = eligible.front() {
                 let flow = match self.flows.get_mut(&f) {
                     Some(fl) => fl,
                     None => {
-                        self.eligible[t].pop_front();
+                        eligible.pop_front();
                         self.in_eligible.remove(&f);
                         continue;
                     }
                 };
-                flow.deficit += TIER_QUANTUM[t];
+                flow.deficit += quantum;
                 // Flow stays front until it sends; the caller reports
                 // the sent bytes via `charge`. Return it.
                 return Some(f);
@@ -553,9 +561,9 @@ impl Scheduler {
     /// Dequeue completion: flow no longer eligible until next schedule.
     pub fn complete(&mut self, flow: FlowId) {
         self.in_eligible.remove(&flow);
-        for t in 0..3 {
-            if let Some(pos) = self.eligible[t].iter().position(|&x| x == flow) {
-                self.eligible[t].remove(pos);
+        for eligible in &mut self.eligible {
+            if let Some(pos) = eligible.iter().position(|&x| x == flow) {
+                eligible.remove(pos);
             }
         }
     }
@@ -600,6 +608,10 @@ impl Scheduler {
 
     pub fn len(&self) -> usize {
         self.flows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.flows.is_empty()
     }
 
     /// Remove a flow entirely (session teardown — every byte of its

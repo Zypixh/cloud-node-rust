@@ -413,7 +413,7 @@ fn ensure_ethtool(report: &mut XdpNetdevTuneReport, options: &XdpNetdevTuneOptio
             target: ("present").into(),
             final_value: Some("missing".to_string()),
             status: XdpTuneStatus::DryRun,
-            reason: (format!("would install with {}", manager.program())).into(),
+            reason: format!("would install with {}", manager.program()),
             command: Some(shell.to_string()),
         });
         return;
@@ -426,7 +426,7 @@ fn ensure_ethtool(report: &mut XdpNetdevTuneReport, options: &XdpNetdevTuneOptio
         target: ("present").into(),
         final_value: Some("installing".to_string()),
         status: XdpTuneStatus::Installing,
-        reason: (format!("installing with {}", manager.program())).into(),
+        reason: format!("installing with {}", manager.program()),
         command: Some(shell.to_string()),
     });
     let status = Command::new("sh").arg("-c").arg(shell).status();
@@ -446,12 +446,11 @@ fn ensure_ethtool(report: &mut XdpNetdevTuneReport, options: &XdpNetdevTuneOptio
         } else {
             XdpTuneStatus::Failed
         },
-        reason: (match status {
+        reason: match status {
             Ok(status) if status.success() => "package manager installed ethtool".to_string(),
             Ok(status) => format!("package manager exited with {status}"),
             Err(err) => err.to_string(),
-        })
-        .into(),
+        },
         command: Some(shell.to_string()),
     });
 }
@@ -514,7 +513,7 @@ fn tune_features(
                 target: ("readable").into(),
                 final_value: None,
                 status: XdpTuneStatus::Failed,
-                reason: (err.to_string()).into(),
+                reason: err.to_string(),
                 command: Some(format!("ethtool -k {interface}")),
             });
             return;
@@ -526,7 +525,7 @@ fn tune_features(
         let Some(state) = features_before.get(tune.key) else {
             report.actions.push(XdpTuneAction {
                 interface: Some(interface.to_string()),
-                key: (key).into(),
+                key,
                 old: None,
                 target: (tune.target).into(),
                 final_value: None,
@@ -539,7 +538,7 @@ fn tune_features(
         if state.fixed {
             report.actions.push(XdpTuneAction {
                 interface: Some(interface.to_string()),
-                key: (key).into(),
+                key,
                 old: Some(state.value.clone()),
                 target: (tune.target).into(),
                 final_value: Some(state.value.clone()),
@@ -555,7 +554,7 @@ fn tune_features(
         if state.value == tune.target {
             report.actions.push(XdpTuneAction {
                 interface: Some(interface.to_string()),
-                key: (key).into(),
+                key,
                 old: Some(state.value.clone()),
                 target: (tune.target).into(),
                 final_value: Some(state.value.clone()),
@@ -571,7 +570,7 @@ fn tune_features(
         if options.dry_run {
             report.actions.push(XdpTuneAction {
                 interface: Some(interface.to_string()),
-                key: (key).into(),
+                key,
                 old: Some(state.value.clone()),
                 target: (tune.target).into(),
                 final_value: Some(state.value.clone()),
@@ -605,21 +604,20 @@ fn tune_features(
             && final_value.as_deref() == Some(tune.target);
         report.actions.push(XdpTuneAction {
             interface: Some(interface.to_string()),
-            key: (key).into(),
+            key,
             old: Some(state.value.clone()),
             target: (tune.target).into(),
-            final_value: final_value,
+            final_value,
             status: if success {
                 XdpTuneStatus::Applied
             } else {
                 XdpTuneStatus::Failed
             },
-            reason: (match status {
+            reason: match status {
                 Ok(status) if status.success() => "feature updated".to_string(),
                 Ok(status) => format!("ethtool exited with {status}"),
                 Err(err) => err.to_string(),
-            })
-            .into(),
+            },
             command: Some(command),
         });
     }
@@ -641,7 +639,7 @@ fn tune_channels(
                 target: ("max").into(),
                 final_value: None,
                 status: XdpTuneStatus::SkippedMissing,
-                reason: (err.to_string()).into(),
+                reason: err.to_string(),
                 command: Some(format!("ethtool -l {interface}")),
             });
             return;
@@ -695,7 +693,7 @@ fn tune_rings(interface: &str, options: &XdpNetdevTuneOptions, report: &mut XdpN
                 target: ("max").into(),
                 final_value: None,
                 status: XdpTuneStatus::SkippedMissing,
-                reason: (err.to_string()).into(),
+                reason: err.to_string(),
                 command: Some(format!("ethtool -g {interface}")),
             });
             return;
@@ -742,7 +740,7 @@ fn tune_coalesce(
                 target: ("low-latency").into(),
                 final_value: None,
                 status: XdpTuneStatus::SkippedMissing,
-                reason: (err.to_string()).into(),
+                reason: err.to_string(),
                 command: Some(format!("ethtool -c {interface}")),
             });
             return;
@@ -815,12 +813,11 @@ fn tune_coalesce(
         } else {
             XdpTuneStatus::Failed
         },
-        reason: (match status {
+        reason: match status {
             Ok(status) if status.success() => "coalescing updated".to_string(),
             Ok(status) => format!("ethtool exited with {status}"),
             Err(err) => err.to_string(),
-        })
-        .into(),
+        },
         command: Some(command),
     });
 }
@@ -896,12 +893,12 @@ fn tune_queue_cpu_masks(
         let Ok(entries) = fs::read_dir(&queue_root) else {
             report.actions.push(XdpTuneAction {
                 interface: Some(interface.to_string()),
-                key: (format!("queues.{queue_kind}.cpu_mask")).into(),
+                key: format!("queues.{queue_kind}.cpu_mask"),
                 old: None,
-                target: (mask.clone()).into(),
+                target: mask.clone(),
                 final_value: None,
                 status: XdpTuneStatus::SkippedMissing,
-                reason: (format!("{} is missing", queue_root.display())).into(),
+                reason: format!("{} is missing", queue_root.display()),
                 command: None,
             });
             return;
@@ -1008,7 +1005,7 @@ fn apply_simple_ethtool_numeric(
             interface: Some(interface.to_string()),
             key: (key).into(),
             old: Some(current.to_string()),
-            target: (target.to_string()).into(),
+            target: target.to_string(),
             final_value: Some(current.to_string()),
             status: XdpTuneStatus::AlreadySet,
             reason: ("already matches target").into(),
@@ -1021,7 +1018,7 @@ fn apply_simple_ethtool_numeric(
             interface: Some(interface.to_string()),
             key: (key).into(),
             old: Some(current.to_string()),
-            target: (target.to_string()).into(),
+            target: target.to_string(),
             final_value: Some(current.to_string()),
             status: XdpTuneStatus::DryRun,
             reason: ("would update ethtool numeric setting").into(),
@@ -1034,7 +1031,7 @@ fn apply_simple_ethtool_numeric(
         interface: Some(interface.to_string()),
         key: (key).into(),
         old: Some(current.to_string()),
-        target: (target.to_string()).into(),
+        target: target.to_string(),
         final_value: if status.as_ref().is_ok_and(|status| status.success()) {
             Some(target.to_string())
         } else {
@@ -1045,17 +1042,17 @@ fn apply_simple_ethtool_numeric(
         } else {
             XdpTuneStatus::Failed
         },
-        reason: (match status {
+        reason: match status {
             Ok(status) if status.success() => "setting updated".to_string(),
             Ok(status) => format!("ethtool exited with {status}"),
             Err(err) => err.to_string(),
-        })
-        .into(),
+        },
         command: Some(command),
     });
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn apply_ip_link_action(
     interface: &str,
     key: &str,
@@ -1097,7 +1094,7 @@ fn apply_ip_link_action(
     report.actions.push(XdpTuneAction {
         interface: Some(interface.to_string()),
         key: (key).into(),
-        old: old,
+        old,
         target: (target).into(),
         final_value: if status.as_ref().is_ok_and(|status| status.success()) {
             Some(target.to_string())
@@ -1109,12 +1106,11 @@ fn apply_ip_link_action(
         } else {
             XdpTuneStatus::Failed
         },
-        reason: (match status {
+        reason: match status {
             Ok(status) if status.success() => "link setting updated".to_string(),
             Ok(status) => format!("ip exited with {status}"),
             Err(err) => err.to_string(),
-        })
-        .into(),
+        },
         command: Some(command),
     });
 }
@@ -1137,7 +1133,7 @@ fn apply_sysfs_write(
         .is_some_and(|value| setting_value_matches(value, target))
     {
         report.actions.push(XdpTuneAction {
-            interface: interface,
+            interface,
             key: (key).into(),
             old: old.clone(),
             target: (target).into(),
@@ -1150,9 +1146,9 @@ fn apply_sysfs_write(
     }
     if !path.exists() {
         report.actions.push(XdpTuneAction {
-            interface: interface,
+            interface,
             key: (key).into(),
-            old: old,
+            old,
             target: (target).into(),
             final_value: None,
             status: XdpTuneStatus::SkippedMissing,
@@ -1163,7 +1159,7 @@ fn apply_sysfs_write(
     }
     if options.dry_run {
         report.actions.push(XdpTuneAction {
-            interface: interface,
+            interface,
             key: (key).into(),
             old: old.clone(),
             target: (target).into(),
@@ -1183,21 +1179,20 @@ fn apply_sysfs_write(
             .as_deref()
             .is_some_and(|value| setting_value_matches(value, target));
     report.actions.push(XdpTuneAction {
-        interface: interface,
+        interface,
         key: (key).into(),
-        old: old,
+        old,
         target: (target).into(),
-        final_value: final_value,
+        final_value,
         status: if success {
             XdpTuneStatus::Applied
         } else {
             XdpTuneStatus::Failed
         },
-        reason: (match write {
+        reason: match write {
             Ok(()) => "setting updated".to_string(),
             Err(err) => err.to_string(),
-        })
-        .into(),
+        },
         command: Some(format!("write {} {}", path.display(), target)),
     });
 }

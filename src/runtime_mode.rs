@@ -1023,15 +1023,15 @@ impl RuntimeConfig {
                 );
             }
         }
-        if let Some(upstream) = &self.xdp.upstream {
-            if !upstream.dial_port_range_valid() {
-                let (start, end) = upstream.dial_port_range();
-                anyhow::bail!("xdp.upstream dialPortRange is empty: {start}-{end}");
-            }
-            // The span must additionally lie inside the live
-            // ip_local_port_range — that check runs at guard-install
-            // time against the kernel value.
+        if let Some(upstream) = &self.xdp.upstream
+            && !upstream.dial_port_range_valid()
+        {
+            let (start, end) = upstream.dial_port_range();
+            anyhow::bail!("xdp.upstream dialPortRange is empty: {start}-{end}");
         }
+        // The span must additionally lie inside the live
+        // ip_local_port_range — that check runs at guard-install
+        // time against the kernel value.
         Ok(())
     }
 
@@ -1373,8 +1373,8 @@ xdp:
         ("CLOUD_NODE_XDP", Some(value))
     }
 
-    const NO_XDP_ENV: (&'static str, Option<&'static str>) = ("CLOUD_NODE_XDP", None);
-    const NO_MODE_ENV: (&'static str, Option<&'static str>) = ("CLOUD_NODE_MODE", None);
+    const NO_XDP_ENV: (&str, Option<&str>) = ("CLOUD_NODE_XDP", None);
+    const NO_MODE_ENV: (&str, Option<&str>) = ("CLOUD_NODE_MODE", None);
 
     #[test]
     fn xdp_enabled_precedence_default_env_file() {

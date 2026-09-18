@@ -266,12 +266,13 @@ impl Inference {
 
         // inflight rising while delivery plateaus — compare the same
         // per-sample rate the model filtered.
-        if in_flight_delta > 0 && rs.delivered > 0 {
-            if let Some(est) = model.bw_est() {
-                let rate = model.bw_last_sample();
-                if rate <= est + est / 20 {
-                    w += weights::PLATEAU_INFLIGHT_UP;
-                }
+        if in_flight_delta > 0
+            && rs.delivered > 0
+            && let Some(est) = model.bw_est()
+        {
+            let rate = model.bw_last_sample();
+            if rate <= est + est / 20 {
+                w += weights::PLATEAU_INFLIGHT_UP;
             }
         }
 

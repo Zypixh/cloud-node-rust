@@ -150,7 +150,6 @@ pub fn apply_runtime_tuning_and_report() {
         let store = ProcSysctlStore;
         let reports = apply_runtime_tuning_with_store(&store);
         report_all(&reports);
-        return;
     }
 
     #[cfg(not(target_os = "linux"))]

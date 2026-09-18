@@ -4481,7 +4481,6 @@ fn try_tcp_nat_v6_fwd(
 /// via four u32 accesses each: a `[u8; 16]` field copy lowers to a 16-round
 /// variable-offset byte loop whose state multiplies at every call site and
 /// pushes the verifier past its explored-state budget.
-#[inline(always)]
 /// Copy a 16-byte address between map values / packet memory. Volatile word
 /// copies keep this straight-line: a plain `[u8; 16]` assignment lowers to
 /// an inlined memmove whose pointer-difference overlap check multiplies
@@ -5077,7 +5076,7 @@ fn pending_touch(
         // Test hook: FAIL_CT_INSERT forces the full-table path so rollback
         // semantics are exercised without filling 262k entries.
         let ct_insert_ok = unsafe { (*scratch).debug_flags } & XDP_PENDING_CAP_FAIL_CT_INSERT == 0
-            && XDP_TCP_CT.insert(key, unsafe { &*p }, 0).is_ok();
+            && XDP_TCP_CT.insert(key, &mut *p, 0).is_ok();
         if ct_insert_ok {
             if let Some(ct) = XDP_TCP_CT.get_ptr_mut(key) {
                 let ct = unsafe { &mut *ct };
@@ -5748,7 +5747,6 @@ fn tcp_challenge_v4(
         let eth = ptr_at::<EthHdr>(ctx, 0)?;
         let client_mac = unsafe { (*eth).src_addr };
         let incarnation = unsafe { (*scratch).forge_incarnation };
-        let mut snat_port = 0u16;
         unsafe {
             let v = &mut (*scratch).ct_value;
             v.listen_addr = v4_embed(dst_be);
@@ -5774,13 +5772,10 @@ fn tcp_challenge_v4(
             k._pad = [0; 4];
         }
         snat_prefill(scratch, client_mac, unsafe { (*scratch).forge_server_id });
-        match snat_alloc(scratch, &XDP_TCP_FWD) {
-            Some(port) => {
-                snat_port = port;
-                unsafe { (*scratch).ct_value.snat_port_be = port };
-            }
-            None => return Ok(None),
-        }
+        let Some(snat_port) = snat_alloc(scratch, &XDP_TCP_FWD) else {
+            return Ok(None);
+        };
+        unsafe { (*scratch).ct_value.snat_port_be = snat_port };
         let pending_insert_ok =
             unsafe { (*scratch).debug_flags } & XDP_PENDING_CAP_FAIL_PENDING_INSERT == 0
                 && XDP_PENDING

@@ -2701,7 +2701,7 @@ fn remove_surrogate_tag_set(tag: &str) {
     if let Some((_, set)) = SURROGATE_KEY_INDEX.remove(tag) {
         let members = set.len() as u64;
         for hash in set.iter() {
-            let owner = format!("{tag}\0{}", &*hash);
+            let owner = format!("{tag}\0{}", hash.as_str());
             let _ = MEMORY_GOVERNOR.resident_memory_replace_owned(
                 crate::memory_governor::ResidentCategory::SurrogateIndex,
                 &owner,

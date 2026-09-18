@@ -71,11 +71,11 @@ fn bench_admission_throughput() {
                     let permit = if pooled {
                         bucket
                             .spend(class, cloud_node_rust::memory_governor::class_estimated_bytes(class))
-                            .map(|p| cloud_node_rust::memory_ticket::WorkspacePermit::Pooled(p))
+                            .map(cloud_node_rust::memory_ticket::WorkspacePermit::Pooled)
                     } else {
                         MEMORY_GOVERNOR
                             .try_admit(class)
-                            .map(|p| cloud_node_rust::memory_ticket::WorkspacePermit::Direct(p))
+                            .map(cloud_node_rust::memory_ticket::WorkspacePermit::Direct)
                     };
                     if let Some(permit) = permit {
                         granted.fetch_add(1, Ordering::Relaxed);

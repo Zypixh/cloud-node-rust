@@ -1373,10 +1373,10 @@ impl AfXdpTcpReactor {
             return;
         }
         if let Err(err) = socket.connect(self.iface.context(), req.remote, req.local) {
-            let _ = req.reply.send(Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("AF_XDP dial connect {} -> {} failed: {err}", req.local, req.remote),
-            )));
+            let _ = req.reply.send(Err(io::Error::other(format!(
+                "AF_XDP dial connect {} -> {} failed: {err}",
+                req.local, req.remote
+            ))));
             return;
         }
         let socket = self.sockets.add(socket);

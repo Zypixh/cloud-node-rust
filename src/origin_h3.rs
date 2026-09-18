@@ -173,24 +173,22 @@ mod af_xdp_quinn {
     /// is awaited via `reserve_owned`; the returned permit is dropped
     /// immediately — it only proves a slot existed, and quinn retries
     /// `try_send` which re-registers here if the slot was reclaimed.
+    type PendingPermit = Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        tokio::sync::mpsc::OwnedPermit<AfXdpReactorRequest>,
+                        tokio::sync::mpsc::error::SendError<()>,
+                    >,
+                > + Send,
+        >,
+    >;
+
     struct AfXdpUdpPoller {
         tx: tokio::sync::mpsc::Sender<AfXdpReactorRequest>,
         // `Mutex` keeps the poller `Sync` (`UdpPoller` requires it);
         // `poll_writable` only ever holds the guard while polling.
-        pending: std::sync::Mutex<
-            Option<
-                Pin<
-                    Box<
-                        dyn Future<
-                                Output = Result<
-                                    tokio::sync::mpsc::OwnedPermit<AfXdpReactorRequest>,
-                                    tokio::sync::mpsc::error::SendError<()>,
-                                >,
-                            > + Send,
-                    >,
-                >,
-            >,
-        >,
+        pending: std::sync::Mutex<Option<PendingPermit>>,
     }
 
     impl std::fmt::Debug for AfXdpUdpPoller {
@@ -414,6 +412,7 @@ fn client_config(verify_cert: bool) -> PingoraResult<ClientConfig> {
             format!("building H3 TLS config: {err}"),
         )
     })?;
+    #[allow(unused_mut)]
     let mut config = ClientConfig::new(Arc::new(quic));
     // T5: when this client will run over the AF_XDP upstream path,
     // apply the policy-selected transport controller. The stock

@@ -591,7 +591,7 @@ pub(crate) async fn run_proxy_bridge(
     // lease owner instead of stopping the polling loops.
     let lease = {
         let mut runtime = manager.af_xdp.lock();
-        let lease = match runtime.as_mut() {
+        match runtime.as_mut() {
             Some(runtime) => match &runtime.lease {
                 Some(lease) => lease.clone(),
                 None => {
@@ -601,8 +601,7 @@ pub(crate) async fn run_proxy_bridge(
                 }
             },
             None => Arc::new(crate::xdp::AfXdpDataplaneLease::new(manager.clone())),
-        };
-        lease
+        }
     };
     // EN-12 worker lease: prove every reactor is running *before* opening
     // redirect — a registered XSK is a socket, not a worker. Redirecting
@@ -722,7 +721,7 @@ pub(crate) async fn spawn_queue_reactors(
         Vec::with_capacity(queue_handles.len());
     for (ordinal, (queue_handle, ctx)) in queue_handles
         .into_iter()
-        .zip(contexts.into_iter())
+        .zip(contexts)
         .enumerate()
     {
         let cpu = af_xdp_queue_cpu(
@@ -2127,7 +2126,7 @@ mod sched_aqm_tests {
         s.push(5 << 4); // data offset
         s.push(flags);
         s.extend_from_slice(&[0; 6]); // window/checksum/urg
-        s.extend(std::iter::repeat(0x42).take(payload_len));
+        s.extend(std::iter::repeat_n(0x42, payload_len));
         s
     }
 

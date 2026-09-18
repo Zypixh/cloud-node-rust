@@ -835,6 +835,7 @@ impl TcpProxyManager {
     /// Keeps the live accept-worker count tracking
     /// `l4_defense::pressure_accept_worker_target`; extra workers retire
     /// themselves via their scale watch once pressure subsides.
+    #[allow(clippy::too_many_arguments)]
     async fn run_tcp_accept_scaler(
         self: Arc<Self>,
         bind_addr: SocketAddr,
@@ -904,6 +905,7 @@ impl TcpProxyManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_tcp_listener_worker(
         self: Arc<Self>,
         bind_addr: SocketAddr,
@@ -1865,7 +1867,7 @@ pub fn configure_relay_tcp_socket(stream: &TcpStream) {
                 fd,
                 libc::IPPROTO_TCP,
                 libc::TCP_CONGESTION,
-                "bbr\0".as_ptr() as *const libc::c_void,
+                c"bbr".as_ptr() as *const libc::c_void,
                 4,
             );
         }
@@ -2758,7 +2760,7 @@ mod zero_copy {
             Err(DirectionTaskError::new(
                 direction,
                 RelayIoPhase::Read,
-                io::Error::new(io::ErrorKind::Other, err.to_string()),
+                io::Error::other(err.to_string()),
             ))
         })
     }

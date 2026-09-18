@@ -157,13 +157,13 @@ where
         // At the soft cap we must evict rather than occupy a dead slot —
         // the global count would otherwise exceed the budget.
         let must_evict = self.len() >= soft_cap.max(1);
-        if !must_evict {
-            if let Some(idx) = dead {
-                seg.slots[idx] = Some((key, expiry));
-                seg.len += 1;
-                self.total_len.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
+        if !must_evict
+            && let Some(idx) = dead
+        {
+            seg.slots[idx] = Some((key, expiry));
+            seg.len += 1;
+            self.total_len.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
         if let Some(idx) = victim {
             // Full window or soft-cap pressure: evict earliest-expiry.
