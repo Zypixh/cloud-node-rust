@@ -68,8 +68,8 @@ Options / 选项:
                          列出可用备份目录后退出。
   --repo OWNER/REPO      GitHub repo. Default: Zypixh/cloud-node-rust
                          GitHub 仓库；默认 Zypixh/cloud-node-rust。
-  --version VERSION      Release tag, for example v1.2.7. Default: latest
-                         Release 标签，例如 v1.2.7；默认 latest。
+  --version VERSION      Release tag, for example v1.3.0. Default: latest
+                         Release 标签，例如 v1.3.0；默认 latest。
   --service NAME         systemd service name. Default: cloud-node
                          systemd 服务名；默认 cloud-node。
   --install-dir DIR      Runtime working directory. Default: existing runtime
