@@ -74,6 +74,29 @@ jobs:
             . -> target
             pingora-main -> pingora-main/target
 
+      - name: Install eBPF Toolchain
+        shell: bash
+        env:
+          # Same pin as release.yml — bumping it requires re-running the
+          # XDP/AF_XDP smoke matrix.
+          BPF_LINKER_VERSION: "0.11.1"
+        run: |
+          set -euo pipefail
+          EBPF_NIGHTLY="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/cloud-node-xdp-ebpf/rust-toolchain.toml | head -1)"
+          test -n "$EBPF_NIGHTLY"
+          rustup toolchain install "$EBPF_NIGHTLY" --profile minimal -c rust-src
+          cargo +"$EBPF_NIGHTLY" install bpf-linker --version "$BPF_LINKER_VERSION" --locked
+
+      - name: Build XDP eBPF Object
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f data/cloud-node-xdp-ebpf.o
+          cargo xtask build-ebpf
+          test -s data/cloud-node-xdp-ebpf.o
+          echo "CLOUD_NODE_XDP_EBPF_SOURCE=data/cloud-node-xdp-ebpf.o" >> "$GITHUB_ENV"
+          echo "CLOUD_NODE_XDP_EBPF_SHA256=$(sha256sum data/cloud-node-xdp-ebpf.o | awk '{print $1}')" >> "$GITHUB_ENV"
+
       - name: cargo check (all targets)
         run: cargo check --all-targets
 
@@ -139,6 +162,29 @@ jobs:
           workspaces: |
             . -> target
             pingora-main -> pingora-main/target
+
+      - name: Install eBPF Toolchain
+        shell: bash
+        env:
+          # Same pin as release.yml — bumping it requires re-running the
+          # XDP/AF_XDP smoke matrix.
+          BPF_LINKER_VERSION: "0.11.1"
+        run: |
+          set -euo pipefail
+          EBPF_NIGHTLY="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/cloud-node-xdp-ebpf/rust-toolchain.toml | head -1)"
+          test -n "$EBPF_NIGHTLY"
+          rustup toolchain install "$EBPF_NIGHTLY" --profile minimal -c rust-src
+          cargo +"$EBPF_NIGHTLY" install bpf-linker --version "$BPF_LINKER_VERSION" --locked
+
+      - name: Build XDP eBPF Object
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f data/cloud-node-xdp-ebpf.o
+          cargo xtask build-ebpf
+          test -s data/cloud-node-xdp-ebpf.o
+          echo "CLOUD_NODE_XDP_EBPF_SOURCE=data/cloud-node-xdp-ebpf.o" >> "$GITHUB_ENV"
+          echo "CLOUD_NODE_XDP_EBPF_SHA256=$(sha256sum data/cloud-node-xdp-ebpf.o | awk '{print $1}')" >> "$GITHUB_ENV"
 
       - name: cargo test
         run: cargo test --lib --bins
