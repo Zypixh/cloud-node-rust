@@ -156,30 +156,28 @@ sudo cloud-node upgrade --dry-run
 sudo cloud-node upgrade --yes --no-restart
 ```
 
-## 从 Go 原版迁移安装 Rust 版
+## 安装与升级 Rust 版
 
-仓库提供迁移安装脚本：
+仓库提供统一安装脚本（所有输出中英双语同时显示）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash
 ```
 
-脚本会执行以下步骤：
+脚本为单一收敛流程，不再区分“新装 / 升级 / 迁移”入口：
 
-- 第一步询问界面语言，支持中文和英文；自动化场景优先使用 `CLOUD_NODE_LANG=zh` 或 `CLOUD_NODE_LANG=en`。为兼容旧命令也接受 `LANGUAGE=zh`/`LANGUAGE=en`，并能识别系统常见的 gettext locale 列表（例如 `LANGUAGE=en_HK:en`）。
-- 默认交互式选择操作：覆盖/升级旧 Go 原版为 Rust 版、全新安装 Rust 版、从备份恢复 Go 原版。自动化场景必须显式传 `--install` 或 `--fresh`。
+- 自动检测现有部署：发现旧 Go 原版或旧 Rust 版时按迁移/升级处理；找不到现有 `api_node.yaml` 时按全新安装处理，交互式询问 API 连接配置（也可用参数传入）。
 - 查找当前 `cloud-node` 命令、`cloud-node.service` 的 `ExecStart` 和常见安装路径。
 - 将找到的旧二进制、`/usr/bin/cloud-node` 和 systemd unit 备份到 `/var/backups/cloud-node-rust-migration/<timestamp>/`。
 - 从 Go 原版迁移时备份文件带有 `go-original` 标识；升级已有 Rust 版时备份文件带有 `rust-current` 标识。
-- 根据系统架构选择 GitHub 最新 Rust Release 包；`--upgrade` 默认解析并下载当前最新 Release。
-- 将 Rust 二进制和 `data/cloud-node-xdp-ebpf.o` 原子替换到现有运行目录；目录识别优先使用 service `WorkingDirectory`、`/usr/bin/cloud-node` wrapper 中的 `cd` 目录、旧二进制所在目录和常见旧目录，只有没有可识别旧目录时才默认安装到 `/opt/cloud-node-rust/cloud-node-rust`。
+- 根据系统架构（x86-64 v2/v3/v4、arm64 generic/neoverse-n1）选择 GitHub Release 包，默认最新版，`--version` 可指定。
+- 将 Rust 二进制和 `data/cloud-node-xdp-ebpf.o` 原子替换到运行目录；目录识别优先使用 service `WorkingDirectory`、`/usr/bin/cloud-node` wrapper 中的 `cd` 目录、旧二进制所在目录和常见旧目录，全新安装默认 `/root/cloud-node`。
+- 从旧运行目录迁移 `configs/api_node.yaml`、旧版根目录 `api_node.yaml` 和运行状态数据。
 - 执行 Rust 二进制内置的 `install` 命令，重新注册 `/usr/bin/cloud-node` wrapper 和 `cloud-node.service`，并设置 `CLOUD_NODE_HOME` 指向运行目录。
-- 交互询问是否从 `https://github.com/P3TERX/GeoLite.mmdb` 下载 `GeoLite2-City.mmdb`、`GeoLite2-ASN.mmdb` 和 `GeoLite2-Country.mmdb`。
-- 安装/升级完成后交互询问是否立即重启或启动服务；自动化 `--yes` 场景保持原有 preserve 行为，迁移前服务运行则自动重启。
+- 默认必装 GeoIP 数据库：`GeoLite2-City.mmdb`、`GeoLite2-ASN.mmdb`、`GeoLite2-Country.mmdb` 已从 `P3TERX/GeoLite.mmdb` 同步到本仓库 `geoip/` 目录作为唯一来源，后续更新由仓库维护者决定；安装时从 `github.com/<repo>/raw/main/geoip/` 下载，可用 `GEOIP_BASE_URL` 覆盖镜像地址。
+- 默认安装完成后自动启动/重启服务并校验运行状态；`--no-start` 可跳过。
 
-显式 `--install` / `--upgrade` 要求找到现有 `cloud-node`，避免在未备份原版的情况下误装；其中 `--upgrade` 等价于升级现有节点到最新 Rust Release。升级时会保留既有运行目录名称，例如 `/root/cloud-node` 不会被改成 `/opt/cloud-node-rust`，并会从旧运行目录迁移 `configs/api_node.yaml`、旧版根目录 `api_node.yaml` 和运行状态数据。全新安装使用 `--fresh`，会自动允许没有旧节点的环境。
-
-全新安装会默认创建 `/root/cloud-node`，并交互输入 API 连接配置，生成 `/root/cloud-node/configs/api_node.yaml`。
+全新安装会默认创建 `/root/cloud-node`，并在缺少 `api_node.yaml` 时交互输入 API 连接配置，生成 `/root/cloud-node/configs/api_node.yaml`；`--timezone` 可同时设置系统时区。
 
 上线前建议先 dry-run：
 
@@ -211,34 +209,22 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 
 本版本重新整理 systemd 生命周期管理：新安装的服务使用 `Type=simple` 直接托管前台进程；`stop` 会等待真实退出并在必要时强制结束；`restart` 不再固定等待 1 秒，而是确认旧进程退出后再启动。
 
-升级现有 Rust 节点到最新版：
+升级现有 Rust 节点到最新版（与安装同一条命令，脚本自动按升级处理）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --upgrade --yes
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --yes
 ```
 
-全新安装：
+全新安装的一条非交互命令（未检测到现有 `api_node.yaml` 时自动按全新安装处理）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --fresh
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret
 ```
 
-全新安装的一条非交互命令：
+GeoIP 库默认必装，文件写入节点 `data/` 目录，因为运行时会优先从 `data/GeoLite2-City.mmdb` 和 `data/GeoLite2-ASN.mmdb` 读取。旧版工作目录 GeoIP 文件仍作为迁移 fallback。如需指定目录：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --fresh --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret --geoip
-```
-
-非交互下载 GeoIP 库：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo env CLOUD_NODE_LANG=zh bash -s -- --geoip --yes
-```
-
-GeoIP 文件默认写入节点 `data/` 目录，因为运行时会优先从 `data/GeoLite2-City.mmdb` 和 `data/GeoLite2-ASN.mmdb` 读取。旧版工作目录 GeoIP 文件仍作为迁移 fallback。 如需指定目录：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --geoip --geoip-dir /opt/cloud-node-rust/data --yes
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --geoip-dir /opt/cloud-node-rust/data --yes
 ```
 
 指定安装目录或禁止自动启动：

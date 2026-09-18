@@ -35,16 +35,16 @@ nodeId: "your-node-id"
 secret: "your-node-secret"
 ```
 
-从 Go 原版节点迁移到 GitHub 最新 Rust Release，或全新安装：
+安装或升级到 GitHub 最新 Rust Release（自动检测现有部署：有则迁移/升级，无则全新安装；输出中英双语）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | bash
 ```
 
-全新安装的一条非交互命令示例：
+全新安装的一条非交互命令示例（GeoLite2 库由本仓库 `geoip/` 提供，默认必装）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | bash -s -- --fresh --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret --geoip
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | bash -s -- --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret
 ```
 
 ## 文档

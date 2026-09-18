@@ -1,18 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# CloudNode Rust installer / CloudNode Rust 安装脚本
+#
+# Single unified flow / 统一流程:
+#   detect existing deployment -> backup -> download release -> stop legacy
+#   -> install binary + eBPF object -> install GeoIP (always) -> register
+#   service -> start/restart -> verify.
+#   检测现有部署 -> 备份 -> 下载 Release -> 停止旧进程 -> 安装二进制和
+#   eBPF 对象 -> 安装 GeoIP（默认必装）-> 注册服务 -> 启动/重启 -> 校验。
+#
+# When no existing cloud-node is found the script performs a fresh install
+# and asks for the API connection config (or takes it from flags).
+# 未检测到现有 cloud-node 时按全新安装处理，交互式询问 API 连接配置
+# （或通过参数传入）。
+
 REPO="${REPO:-Zypixh/cloud-node-rust}"
 VERSION="${VERSION:-latest}"
 SERVICE_NAME="${SERVICE_NAME:-cloud-node}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/cloud-node-rust-migration}"
 INSTALL_DIR="${INSTALL_DIR:-}"
 INSTALL_BINARY="${INSTALL_BINARY:-}"
-START_MODE="${START_MODE:-preserve}"
-LANGUAGE="${LANGUAGE:-}"
-CLOUD_NODE_LANG="${CLOUD_NODE_LANG:-}"
-DOWNLOAD_GEOIP="${DOWNLOAD_GEOIP:-ask}"
+AUTO_START="${AUTO_START:-yes}"
 GEOIP_DIR="${GEOIP_DIR:-}"
-MODE="${MODE:-ask}"
+GEOIP_BASE_URL="${GEOIP_BASE_URL:-}"
+ACTION="install"
 RESTORE_BACKUP="${RESTORE_BACKUP:-}"
 API_ENDPOINTS="${API_ENDPOINTS:-}"
 NODE_ID="${NODE_ID:-}"
@@ -20,123 +32,77 @@ NODE_SECRET="${NODE_SECRET:-}"
 TIMEZONE="${TIMEZONE:-}"
 ASSUME_YES=0
 DRY_RUN=0
-ALLOW_FRESH=0
-SKIP_TIMEZONE=0
+
+# Backwards-compatible environment mappings from the previous installer.
+case "${START_MODE:-}" in
+    always|preserve) AUTO_START="yes" ;;
+    never) AUTO_START="no" ;;
+esac
+case "${MODE:-}" in
+    restore) ACTION="restore" ;;
+    list-backups) ACTION="list-backups" ;;
+esac
 
 usage() {
     cat <<'USAGE'
-Install or upgrade the Rust CloudNode release over an existing cloud-node deployment,
-or perform a fresh install on a new server.
+CloudNode Rust installer / CloudNode Rust 安装脚本
 
-The script:
-  1. Asks for the interface language when running interactively.
-  2. Finds the current cloud-node systemd ExecStart binary or command.
-  3. Backs it up under a timestamped directory.
-  4. Downloads the requested Rust release from GitHub; latest is the default.
-  5. Stops any running legacy cloud-node process and unregisters old systemd units.
-  6. Optionally downloads GeoLite2 mmdb files from P3TERX/GeoLite.mmdb.
-  7. Overwrites the binary, re-registers the cloud-node command/service, and verifies startup.
+Installs or upgrades cloud-node to a Rust release, or performs a fresh
+install when no existing deployment is found.
+安装或升级 cloud-node 到 Rust 版本；未检测到现有部署时执行全新安装。
 
-Usage:
+Usage / 用法:
   sudo scripts/install-rust-cloud-node.sh
-  sudo scripts/install-rust-cloud-node.sh --fresh
   sudo scripts/install-rust-cloud-node.sh --restore
 
-Run directly from GitHub:
+Run directly from GitHub / 直接从 GitHub 运行:
   curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash
-  curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --fresh --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret --geoip
+  curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret
 
-Options:
-  --install              Install, migrate, or upgrade to the Rust release.
-                         Explicit mode; fails if no existing cloud-node is found.
-  --upgrade              Alias for --install --version latest; upgrade an existing Rust node to latest.
-  --fresh                Fresh install under /root/cloud-node and create configs/api_node.yaml.
+Options / 选项:
   --restore              Restore the Go original from a previous backup.
+                         从备份恢复 Go 原版。
   --restore-backup DIR   Restore from this backup dir. Default: latest backup.
+                         从指定备份目录恢复；默认最近备份。
   --list-backups         List available backup dirs and exit.
-  --repo OWNER/REPO       GitHub repo. Default: Zypixh/cloud-node-rust
-  --version VERSION      Release tag, for example v1.0.7. Default: latest
+                         列出可用备份目录后退出。
+  --repo OWNER/REPO      GitHub repo. Default: Zypixh/cloud-node-rust
+                         GitHub 仓库；默认 Zypixh/cloud-node-rust。
+  --version VERSION      Release tag, for example v1.2.7. Default: latest
+                         Release 标签，例如 v1.2.7；默认 latest。
   --service NAME         systemd service name. Default: cloud-node
-  --install-dir DIR      Runtime working directory. Default: existing runtime dir, or /opt/cloud-node-rust
-  --install-binary PATH  Installed Rust binary path. Default: INSTALL_DIR/cloud-node-rust
+                         systemd 服务名；默认 cloud-node。
+  --install-dir DIR      Runtime working directory. Default: existing runtime
+                         dir, /root/cloud-node on fresh installs.
+                         运行目录；默认沿用现有目录，全新安装为 /root/cloud-node。
+  --install-binary PATH  Installed binary path. Default: INSTALL_DIR/cloud-node-rust
+                         二进制安装路径；默认 INSTALL_DIR/cloud-node-rust。
   --backup-root DIR      Backup root. Default: /var/backups/cloud-node-rust-migration
-  --geoip                Download GeoLite2 mmdb files from P3TERX/GeoLite.mmdb.
-  --no-geoip             Do not download GeoLite2 mmdb files.
-  --geoip-dir DIR        GeoIP target dir. Default: INSTALL_DIR/data.
+                         备份根目录；默认 /var/backups/cloud-node-rust-migration。
+  --geoip-dir DIR        GeoIP target dir. Default: INSTALL_DIR/data
+                         GeoIP 目标目录；默认 INSTALL_DIR/data。
   --api-endpoint URL     API RPC endpoint for fresh install. Can be repeated.
+                         全新安装的 API RPC 地址；可重复。
   --api-endpoints LIST   Comma-separated API RPC endpoints for fresh install.
-  --node-id ID           nodeId for fresh install.
-  --secret SECRET        secret for fresh install.
-  --timezone TZ          Set system timezone during fresh install, e.g. Asia/Shanghai.
-  --no-timezone          Do not prompt for or change system timezone during fresh install.
-  --start                Restart/start service after install without prompting.
-  --no-start             Do not restart/start service after install.
-  --allow-fresh          Allow install when no existing cloud-node is found.
+                         全新安装的 API RPC 地址列表（逗号分隔）。
+  --node-id ID           nodeId for fresh install. / 全新安装的 nodeId。
+  --secret SECRET        secret for fresh install. / 全新安装的 secret。
+  --timezone TZ          Set system timezone on fresh install, e.g. Asia/Shanghai.
+                         全新安装时设置系统时区，例如 Asia/Shanghai。
+  --no-start             Do not start/restart the service after install.
+                         安装后不启动/重启服务。
   --dry-run              Print actions without changing files.
+                         只打印动作，不改动文件。
   --yes                  Do not prompt for confirmation.
-  --non-interactive      Alias for --yes.
-  -h, --help             Show this help.
+                         不进行交互确认。
+  --non-interactive      Alias for --yes. / 等同 --yes。
+  -h, --help             Show this help. / 显示本帮助。
 
 Environment variables with the same names are also supported:
   REPO, VERSION, SERVICE_NAME, INSTALL_DIR, INSTALL_BINARY, BACKUP_ROOT,
-  START_MODE, LANGUAGE, CLOUD_NODE_LANG, DOWNLOAD_GEOIP, GEOIP_DIR, MODE, RESTORE_BACKUP,
-  API_ENDPOINTS, NODE_ID, NODE_SECRET, TIMEZONE.
+  AUTO_START, GEOIP_DIR, GEOIP_BASE_URL, RESTORE_BACKUP, API_ENDPOINTS,
+  NODE_ID, NODE_SECRET, TIMEZONE.
 USAGE
-}
-
-is_zh() {
-    [ "$LANGUAGE" = "zh" ] || [ "$LANGUAGE" = "zh_CN" ] || [ "$LANGUAGE" = "cn" ]
-}
-
-# LANGUAGE is also a gettext environment variable. On many systems it is set
-# to a locale preference list such as "en_HK:en", so it cannot be treated as a
-# single installer language token. Keep installer output limited to the two
-# supported languages while accepting locale names, encodings, modifiers, and
-# colon-separated fallback lists.
-normalize_language() {
-    local raw="${1:-}"
-    local normalized=""
-
-    normalized="${raw%%.*}"
-    normalized="${normalized%%@*}"
-    normalized="${normalized//_/-}"
-    normalized="$(printf '%s' "$normalized" | tr '[:upper:]' '[:lower:]')"
-
-    case "$normalized" in
-        zh|zh-*|cn|chinese|中文|汉语)
-            printf 'zh\n'
-            return 0
-            ;;
-        en|en-*|eng|english|c|posix)
-            printf 'en\n'
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-language_from_list() {
-    local remaining="$1"
-    local candidate=""
-    local parsed=""
-
-    while [ -n "$remaining" ]; do
-        if [[ "$remaining" == *:* ]]; then
-            candidate="${remaining%%:*}"
-            remaining="${remaining#*:}"
-        else
-            candidate="$remaining"
-            remaining=""
-        fi
-        [ -n "$candidate" ] || continue
-        if parsed="$(normalize_language "$candidate")"; then
-            printf '%s\n' "$parsed"
-            return 0
-        fi
-    done
-    return 1
 }
 
 setup_colors() {
@@ -213,16 +179,15 @@ read_prompt_secret() {
     printf -v "$__var" '%s' "$__input"
 }
 
-die_need_mode() {
-    if is_zh; then
-        die "默认模式需要交互式选择；请传 --fresh 全新安装，或传 --install/--upgrade 升级现有节点"
-    else
-        die "default mode needs an interactive choice; pass --fresh for a new install or --install/--upgrade to upgrade an existing node"
-    fi
+# Bilingual output helpers / 双语输出辅助
+# Every user-facing message prints Chinese and English together.
+# 所有面向用户的消息同时输出中文和英文。
+bi() {
+    printf '%s | %s\n' "$1" "$2"
 }
 
 title() {
-    printf '\n%s%s%s\n' "$BOLD" "CloudNode Rust Installer" "$RESET"
+    printf '\n%s%s%s\n' "$BOLD" "CloudNode Rust Installer / 安装脚本" "$RESET"
     printf '%s\n\n' "============================================================"
 }
 
@@ -235,24 +200,40 @@ kv() {
 }
 
 log() {
-    printf '%s[cloud-node]%s %s\n' "$BLUE" "$RESET" "$*"
+    if [ "$#" -ge 2 ]; then
+        printf '%s[cloud-node]%s %s | %s\n' "$BLUE" "$RESET" "$1" "$2"
+    else
+        printf '%s[cloud-node]%s %s\n' "$BLUE" "$RESET" "$1"
+    fi
 }
 
 ok() {
-    printf '%s[ok]%s %s\n' "$GREEN" "$RESET" "$*"
+    if [ "$#" -ge 2 ]; then
+        printf '%s[ok]%s %s | %s\n' "$GREEN" "$RESET" "$1" "$2"
+    else
+        printf '%s[ok]%s %s\n' "$GREEN" "$RESET" "$1"
+    fi
 }
 
 warn() {
-    printf '%s[warn]%s %s\n' "$YELLOW" "$RESET" "$*"
+    if [ "$#" -ge 2 ]; then
+        printf '%s[warn]%s %s | %s\n' "$YELLOW" "$RESET" "$1" "$2"
+    else
+        printf '%s[warn]%s %s\n' "$YELLOW" "$RESET" "$1"
+    fi
 }
 
 die() {
-    printf '%s[error]%s %s\n' "$RED" "$RESET" "$*" >&2
+    if [ "$#" -ge 2 ]; then
+        printf '%s[error]%s %s | %s\n' "$RED" "$RESET" "$1" "$2" >&2
+    else
+        printf '%s[error]%s %s\n' "$RED" "$RESET" "$1" >&2
+    fi
     exit 1
 }
 
 need_cmd() {
-    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1" "缺少必需命令: $1"
 }
 
 run() {
@@ -265,107 +246,6 @@ run() {
 systemctl_available() {
     command -v systemctl >/dev/null 2>&1 || return 1
     systemctl show-environment >/dev/null 2>&1
-}
-
-prompt_language() {
-    # CLOUD_NODE_LANG is the unambiguous installer setting. LANGUAGE remains
-    # supported for compatibility, but is parsed as a gettext locale list.
-    if [ -n "$CLOUD_NODE_LANG" ]; then
-        if LANGUAGE="$(language_from_list "$CLOUD_NODE_LANG")"; then
-            return
-        fi
-        die "unsupported language: $CLOUD_NODE_LANG"
-    fi
-
-    if [ -n "$LANGUAGE" ]; then
-        if LANGUAGE="$(language_from_list "$LANGUAGE")"; then
-            return
-        fi
-
-        # Ignore an ambient, unsupported gettext value (for example
-        # LANGUAGE=fr_FR:de) and continue with normal selection instead of
-        # making the installer unusable.
-        case "$LANGUAGE" in
-            *[_:.-]*|*'@'*)
-                LANGUAGE=""
-                ;;
-            *)
-                die "unsupported language: $LANGUAGE"
-                ;;
-        esac
-    fi
-
-    if [ "$ASSUME_YES" -eq 1 ]; then
-        LANGUAGE="zh"
-        return
-    fi
-
-    if prompt_available; then
-        title
-        printf '%s\n' "请选择语言 / Select language"
-        printf '  %s1)%s 中文\n' "$BOLD" "$RESET"
-        printf '  %s2)%s English\n' "$BOLD" "$RESET"
-        printf '\n输入序号 / Enter choice %s[1]%s: ' "$DIM" "$RESET"
-        read_prompt lang_choice || lang_choice=""
-        case "${lang_choice:-1}" in
-            1|zh|ZH|中文)
-                LANGUAGE="zh"
-                ;;
-            2|en|EN|English|english)
-                LANGUAGE="en"
-                ;;
-            *)
-                LANGUAGE="zh"
-                ;;
-        esac
-    else
-        LANGUAGE="zh"
-    fi
-}
-
-prompt_mode() {
-    case "$MODE" in
-        install|fresh|restore|list-backups)
-            return
-            ;;
-        ask)
-            ;;
-        *)
-            die "invalid MODE: $MODE"
-            ;;
-    esac
-
-    if [ "$ASSUME_YES" -eq 1 ] || ! prompt_available; then
-        die_need_mode
-    fi
-
-    section "$(is_zh && printf '选择操作' || printf 'Choose Action')"
-    if is_zh; then
-        printf '  %s1)%s 安装/升级现有 cloud-node 到最新 Rust 版\n' "$BOLD" "$RESET"
-        printf '  %s2)%s 全新安装 Rust 版到 /root/cloud-node\n' "$BOLD" "$RESET"
-        printf '  %s3)%s 从备份恢复 Go 原版\n' "$BOLD" "$RESET"
-        printf '\n输入序号 %s[1]%s: ' "$DIM" "$RESET"
-    else
-        printf '  %s1)%s Install/upgrade existing cloud-node to latest Rust\n' "$BOLD" "$RESET"
-        printf '  %s2)%s Fresh install to /root/cloud-node\n' "$BOLD" "$RESET"
-        printf '  %s3)%s Restore Go original from backup\n' "$BOLD" "$RESET"
-        printf '\nEnter choice %s[1]%s: ' "$DIM" "$RESET"
-    fi
-    read_prompt mode_choice || die_need_mode
-    case "${mode_choice:-1}" in
-        1|install|INSTALL)
-            MODE="install"
-            ;;
-        2|fresh|FRESH|new|NEW)
-            MODE="fresh"
-            ;;
-        3|restore|RESTORE)
-            MODE="restore"
-            ;;
-        *)
-            MODE="install"
-            ;;
-    esac
 }
 
 ask_yes_no() {
@@ -381,11 +261,7 @@ ask_yes_no() {
         prompt_suffix="[y/N]"
     fi
 
-    if is_zh; then
-        printf '%s %s ' "$prompt_zh" "$prompt_suffix"
-    else
-        printf '%s %s ' "$prompt_en" "$prompt_suffix"
-    fi
+    printf '%s | %s %s ' "$prompt_zh" "$prompt_en" "$prompt_suffix"
     read_prompt answer || answer=""
     answer="${answer:-$default_answer}"
     case "$answer" in
@@ -405,11 +281,7 @@ prompt_text() {
     local secret="${4:-no}"
     local answer=""
 
-    if is_zh; then
-        printf '%s' "$prompt_zh" >&2
-    else
-        printf '%s' "$prompt_en" >&2
-    fi
+    printf '%s | %s' "$prompt_zh" "$prompt_en" >&2
     if [ -n "$default_value" ]; then
         printf ' %s[%s]%s' "$DIM" "$default_value" "$RESET" >&2
     fi
@@ -474,45 +346,12 @@ validate_timezone_name() {
     [ -f "/usr/share/zoneinfo/$timezone" ]
 }
 
-collect_fresh_timezone_config() {
-    local current_timezone=""
-    if [ "$MODE" != "fresh" ] || [ "$SKIP_TIMEZONE" -eq 1 ]; then
-        return
-    fi
-
-    current_timezone="$(detect_system_timezone || true)"
-    if [ -z "$current_timezone" ]; then
-        current_timezone="UTC"
-    fi
-
-    if [ -z "$TIMEZONE" ] && prompt_available && [ "$ASSUME_YES" -eq 0 ]; then
-        section "$(is_zh && printf '系统时区' || printf 'System Timezone')"
-        if is_zh; then
-            printf '当前检测到的时区：%s\n' "$current_timezone"
-            printf '可填写例如 Asia/Shanghai、Asia/Hong_Kong、UTC；留空保持当前设置。\n'
-        else
-            printf 'Detected timezone: %s\n' "$current_timezone"
-            printf 'Examples: Asia/Shanghai, Asia/Hong_Kong, UTC. Leave blank to keep current.\n'
-        fi
-        TIMEZONE="$(prompt_text \
-            "系统时区" \
-            "System timezone" \
-            "$current_timezone")"
-    fi
-
-    if [ -n "$TIMEZONE" ] && ! validate_timezone_name "$TIMEZONE"; then
-        die "invalid timezone or missing zoneinfo file: $TIMEZONE"
-    fi
-}
-
-apply_fresh_timezone() {
+apply_timezone() {
     local zoneinfo=""
-    if [ "$MODE" != "fresh" ] || [ "$SKIP_TIMEZONE" -eq 1 ] || [ -z "$TIMEZONE" ]; then
-        return
-    fi
+    [ -n "$TIMEZONE" ] || return 0
 
     zoneinfo="/usr/share/zoneinfo/$TIMEZONE"
-    validate_timezone_name "$TIMEZONE" || die "invalid timezone or missing zoneinfo file: $TIMEZONE"
+    validate_timezone_name "$TIMEZONE" || die "invalid timezone or missing zoneinfo file: $TIMEZONE" "时区无效或缺少 zoneinfo 文件: $TIMEZONE"
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "+ timedatectl set-timezone $TIMEZONE || ln -sfn $zoneinfo /etc/localtime"
@@ -521,42 +360,28 @@ apply_fresh_timezone() {
     fi
 
     if command -v timedatectl >/dev/null 2>&1 && timedatectl set-timezone "$TIMEZONE"; then
-        ok "system timezone set to $TIMEZONE"
+        ok "system timezone set to $TIMEZONE" "系统时区已设置为 $TIMEZONE"
         return
     fi
 
     ln -sfn "$zoneinfo" /etc/localtime
     printf '%s\n' "$TIMEZONE" > /etc/timezone
-    ok "system timezone set to $TIMEZONE"
+    ok "system timezone set to $TIMEZONE" "系统时区已设置为 $TIMEZONE"
 }
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --install)
-            MODE="install"
-            shift
-            ;;
-        --upgrade)
-            MODE="install"
-            VERSION="latest"
-            shift
-            ;;
-        --fresh|--new)
-            MODE="fresh"
-            ALLOW_FRESH=1
-            shift
-            ;;
         --restore)
-            MODE="restore"
+            ACTION="restore"
             shift
             ;;
         --restore-backup)
             RESTORE_BACKUP="${2:?missing restore backup dir}"
-            MODE="restore"
+            ACTION="restore"
             shift 2
             ;;
         --list-backups)
-            MODE="list-backups"
+            ACTION="list-backups"
             shift
             ;;
         --repo)
@@ -582,20 +407,6 @@ while [ "$#" -gt 0 ]; do
         --backup-root)
             BACKUP_ROOT="${2:?missing backup root}"
             shift 2
-            ;;
-        # Hidden compatibility for older one-line install commands. New usage should
-        # set CLOUD_NODE_LANG=zh or CLOUD_NODE_LANG=en instead of passing a language flag.
-        --lang)
-            LANGUAGE="${2:?missing language}"
-            shift 2
-            ;;
-        --geoip)
-            DOWNLOAD_GEOIP="yes"
-            shift
-            ;;
-        --no-geoip)
-            DOWNLOAD_GEOIP="no"
-            shift
             ;;
         --geoip-dir)
             GEOIP_DIR="${2:?missing geoip dir}"
@@ -625,57 +436,53 @@ while [ "$#" -gt 0 ]; do
             TIMEZONE="${2:?missing timezone}"
             shift 2
             ;;
-        --no-timezone)
-            SKIP_TIMEZONE=1
+        --no-start)
+            AUTO_START="no"
             shift
             ;;
         --start)
-            START_MODE="always"
-            shift
-            ;;
-        --no-start)
-            START_MODE="never"
-            shift
-            ;;
-        --allow-fresh)
-            ALLOW_FRESH=1
+            AUTO_START="yes"
             shift
             ;;
         --dry-run)
             DRY_RUN=1
             shift
             ;;
-        --yes)
+        --yes|--non-interactive)
             ASSUME_YES=1
             shift
             ;;
-        --non-interactive)
-            ASSUME_YES=1
+        # Accepted for backwards compatibility with older one-line commands;
+        # GeoIP is now always installed and modes are unified.
+        --geoip|--fresh|--new|--install|--upgrade|--allow-fresh|--no-timezone)
             shift
+            ;;
+        --no-geoip)
+            warn "--no-geoip is ignored: GeoIP databases are always installed" "--no-geoip 已忽略：GeoIP 数据库为默认必装"
+            shift
+            ;;
+        --lang)
+            # Output is always bilingual; the flag is consumed silently.
+            if [ "$#" -ge 2 ]; then
+                shift 2
+            else
+                shift
+            fi
             ;;
         -h|--help)
             usage
             exit 0
             ;;
         *)
-            die "unknown argument: $1"
+            die "unknown argument: $1" "未知参数: $1"
             ;;
     esac
 done
 
-prompt_language
+title
 
-prompt_mode
-
-if [ "$MODE" = "fresh" ]; then
-    ALLOW_FRESH=1
-    if [ -z "$INSTALL_DIR" ]; then
-        INSTALL_DIR="/root/cloud-node"
-    fi
-fi
-
-if [ "$MODE" != "list-backups" ]; then
-    [ "$(uname -s)" = "Linux" ] || [ "$DRY_RUN" -eq 1 ] || die "this installer supports Linux only"
+if [ "$ACTION" != "list-backups" ]; then
+    [ "$(uname -s)" = "Linux" ] || [ "$DRY_RUN" -eq 1 ] || die "this installer supports Linux only" "本安装脚本仅支持 Linux"
 fi
 
 need_cmd mktemp
@@ -684,13 +491,13 @@ need_cmd cp
 need_cmd mkdir
 need_cmd install
 need_cmd uname
-if [ "$MODE" = "install" ] || [ "$MODE" = "fresh" ]; then
+if [ "$ACTION" = "install" ]; then
     need_cmd curl
     need_cmd tar
 fi
 
-if [ "$MODE" != "list-backups" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
-    die "root is required; run with sudo"
+if [ "$ACTION" != "list-backups" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+    die "root is required; run with sudo" "需要 root 权限；请使用 sudo 运行"
 fi
 
 service_cat() {
@@ -827,6 +634,15 @@ is_cloud_node_path() {
 
 unique_lines() {
     awk 'NF && !seen[$0]++'
+}
+
+read_lines_into() {
+    local __arr_name="$1"
+    local __line=""
+    eval "$__arr_name=()"
+    while IFS= read -r __line; do
+        eval "$__arr_name+=(\"\$__line\")"
+    done
 }
 
 discover_legacy_units() {
@@ -1007,8 +823,8 @@ stop_legacy_deployment() {
     local unit=""
     local binary_stop_ok=0
 
-    mapfile -t units < <(discover_legacy_units || true)
-    mapfile -t pids < <(discover_legacy_pids || true)
+    read_lines_into units < <(discover_legacy_units || true)
+    read_lines_into pids < <(discover_legacy_pids || true)
 
     if systemctl_available; then
         for unit in "${units[@]}"; do
@@ -1020,13 +836,13 @@ stop_legacy_deployment() {
     fi
 
     if [ "${#active_units[@]}" -eq 0 ] && [ "${#pids[@]}" -eq 0 ]; then
-        log "no running legacy cloud-node process detected"
+        log "no running legacy cloud-node process detected" "未检测到运行中的旧 cloud-node 进程"
         return 0
     fi
 
     LEGACY_WAS_RUNNING=1
 
-    section "$(is_zh && printf '停止旧节点' || printf 'Stop Legacy Node')"
+    section "停止旧节点 / Stop Legacy Node"
     if [ "${#active_units[@]}" -gt 0 ]; then
         kv "legacy units" "${active_units[*]}"
     fi
@@ -1040,15 +856,15 @@ stop_legacy_deployment() {
             if command -v timeout >/dev/null 2>&1; then
                 if timeout 15s "$EXISTING_BINARY" stop >/dev/null 2>&1; then
                     binary_stop_ok=1
-                    ok "legacy binary stop succeeded"
+                    ok "legacy binary stop succeeded" "旧二进制 stop 成功"
                 else
-                    warn "legacy binary stop failed or timed out; continuing with systemd/process stop"
+                    warn "legacy binary stop failed or timed out; continuing with systemd/process stop" "旧二进制 stop 失败或超时；继续用 systemd/进程方式停止"
                 fi
             elif "$EXISTING_BINARY" stop >/dev/null 2>&1; then
                 binary_stop_ok=1
-                ok "legacy binary stop succeeded"
+                ok "legacy binary stop succeeded" "旧二进制 stop 成功"
             else
-                warn "legacy binary stop failed; continuing with systemd/process stop"
+                warn "legacy binary stop failed; continuing with systemd/process stop" "旧二进制 stop 失败；继续用 systemd/进程方式停止"
             fi
         else
             log "+ $EXISTING_BINARY stop"
@@ -1058,18 +874,18 @@ stop_legacy_deployment() {
     if systemctl_available; then
         for unit in "${active_units[@]}"; do
             [ -n "$unit" ] || continue
-            run systemctl stop "$unit" || warn "failed to stop $unit"
+            run systemctl stop "$unit" || warn "failed to stop $unit" "停止 $unit 失败"
         done
     fi
 
-    mapfile -t pids < <(discover_legacy_pids || true)
+    read_lines_into pids < <(discover_legacy_pids || true)
     if [ "${#pids[@]}" -gt 0 ]; then
         signal_pids TERM "${pids[@]}"
         if [ "$DRY_RUN" -eq 0 ]; then
             wait_for_pids_exit 10 "${pids[@]}" || true
-            mapfile -t pids < <(discover_legacy_pids || true)
+            read_lines_into pids < <(discover_legacy_pids || true)
             if [ "${#pids[@]}" -gt 0 ]; then
-                warn "forcing kill of remaining legacy pids: ${pids[*]}"
+                warn "forcing kill of remaining legacy pids: ${pids[*]}" "强制结束剩余旧进程: ${pids[*]}"
                 signal_pids KILL "${pids[@]}"
                 wait_for_pids_exit 5 "${pids[@]}" || true
             fi
@@ -1078,9 +894,10 @@ stop_legacy_deployment() {
 
     if [ "$DRY_RUN" -eq 0 ]; then
         if ! wait_for_ports_release 15; then
-            die "legacy cloud-node still holds ports 80/443 after stop; aborting before overwrite. Restore with: $0 --restore --restore-backup $BACKUP_DIR"
+            die "legacy cloud-node still holds ports 80/443 after stop; aborting before overwrite. Restore with: $0 --restore --restore-backup $BACKUP_DIR" \
+                "旧 cloud-node 停止后仍占用 80/443 端口；覆盖前中止。可用以下命令恢复: $0 --restore --restore-backup $BACKUP_DIR"
         fi
-        ok "legacy cloud-node stopped"
+        ok "legacy cloud-node stopped" "旧 cloud-node 已停止"
     fi
 }
 
@@ -1092,15 +909,15 @@ unregister_legacy_services() {
     local backed_up=0
     local dest=""
 
-    mapfile -t units < <(discover_legacy_units || true)
+    read_lines_into units < <(discover_legacy_units || true)
     [ "${#units[@]}" -gt 0 ] || return 0
 
-    section "$(is_zh && printf '注销旧服务' || printf 'Unregister Legacy Services')"
+    section "注销旧服务 / Unregister Legacy Services"
     for unit in "${units[@]}"; do
         [ -n "$unit" ] || continue
         if systemctl_available; then
             if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
-                run systemctl disable "$unit" || warn "failed to disable $unit"
+                run systemctl disable "$unit" || warn "failed to disable $unit" "禁用 $unit 失败"
             fi
         fi
 
@@ -1137,7 +954,7 @@ unregister_legacy_services() {
         run systemctl reset-failed || true
     fi
     if [ "$backed_up" -eq 1 ]; then
-        ok "legacy service registration removed (backed up under $BACKUP_DIR/legacy-units)"
+        ok "legacy service registration removed (backed up under $BACKUP_DIR/legacy-units)" "旧服务注册已移除（已备份到 $BACKUP_DIR/legacy-units）"
     fi
 }
 
@@ -1147,33 +964,33 @@ validate_rust_service_registration() {
     local wrapper=""
 
     if [ ! -x "$INSTALL_BINARY" ]; then
-        die "installed binary is missing or not executable: $INSTALL_BINARY"
+        die "installed binary is missing or not executable: $INSTALL_BINARY" "已安装二进制缺失或不可执行: $INSTALL_BINARY"
     fi
 
     wrapper="/usr/bin/cloud-node"
     if [ ! -e "$wrapper" ]; then
-        die "global cloud-node command was not registered at $wrapper"
+        die "global cloud-node command was not registered at $wrapper" "全局 cloud-node 命令未注册到 $wrapper"
     fi
 
     if systemctl_available; then
         if ! systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1; then
-            die "systemd service ${SERVICE_NAME}.service was not registered"
+            die "systemd service ${SERVICE_NAME}.service was not registered" "systemd 服务 ${SERVICE_NAME}.service 未注册"
         fi
         exec_line="$(systemctl show -p ExecStart --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
         exec_path="$(first_exec_token "$exec_line")"
         if [ -z "$exec_path" ]; then
-            die "systemd service ${SERVICE_NAME}.service has empty ExecStart"
+            die "systemd service ${SERVICE_NAME}.service has empty ExecStart" "systemd 服务 ${SERVICE_NAME}.service 的 ExecStart 为空"
         fi
         if [ "$exec_path" != "$INSTALL_BINARY" ] && [ "$exec_path" != "$wrapper" ]; then
             # Accept either direct binary or wrapper that ultimately points at INSTALL_BINARY.
             local resolved=""
             resolved="$(resolve_wrapper_binary "$exec_path" || true)"
             if [ "$resolved" != "$INSTALL_BINARY" ] && [ "$exec_path" != "$INSTALL_BINARY" ]; then
-                warn "ExecStart=$exec_path does not match $INSTALL_BINARY; continuing because install completed"
+                warn "ExecStart=$exec_path does not match $INSTALL_BINARY; continuing because install completed" "ExecStart=$exec_path 与 $INSTALL_BINARY 不一致；安装已完成故继续"
             fi
         fi
     fi
-    ok "Rust service registration validated"
+    ok "service registration validated" "服务注册校验通过"
 }
 
 verify_service_started() {
@@ -1196,22 +1013,22 @@ verify_service_started() {
             remaining=$((remaining - 1))
         done
         if [ "$active" -ne 1 ]; then
-            warn "service ${SERVICE_NAME} did not become active within ${timeout_secs}s"
+            warn "service ${SERVICE_NAME} did not become active within ${timeout_secs}s" "服务 ${SERVICE_NAME} 在 ${timeout_secs}s 内未进入 active 状态"
             if command -v journalctl >/dev/null 2>&1; then
                 journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
             fi
-            die "start verification failed; restore with: $0 --restore --restore-backup $BACKUP_DIR"
+            die "start verification failed; restore with: $0 --restore --restore-backup $BACKUP_DIR" "启动校验失败；可用以下命令恢复: $0 --restore --restore-backup $BACKUP_DIR"
         fi
-        ok "service ${SERVICE_NAME} is active"
+        ok "service ${SERVICE_NAME} is active" "服务 ${SERVICE_NAME} 已运行"
         return 0
     fi
 
     if [ -x "$INSTALL_BINARY" ]; then
         if (cd "$INSTALL_DIR" && "$INSTALL_BINARY" status >/dev/null 2>&1); then
-            ok "cloud-node status reports running"
+            ok "cloud-node status reports running" "cloud-node status 显示运行中"
             return 0
         fi
-        die "cloud-node status check failed; restore with: $0 --restore --restore-backup $BACKUP_DIR"
+        die "cloud-node status check failed; restore with: $0 --restore --restore-backup $BACKUP_DIR" "cloud-node status 检查失败；可用以下命令恢复: $0 --restore --restore-backup $BACKUP_DIR"
     fi
 }
 
@@ -1289,6 +1106,17 @@ first_existing_runtime_dir() {
     done
 }
 
+find_existing_api_config() {
+    local dir=""
+    for dir in "$@"; do
+        [ -n "$dir" ] || continue
+        if [ -e "$dir/configs/api_node.yaml" ] || [ -e "$dir/api_node.yaml" ]; then
+            printf '%s\n' "$dir"
+            return
+        fi
+    done
+}
+
 glibc_is_older_than_228() {
     local version=""
     local major=""
@@ -1318,9 +1146,9 @@ detect_asset_name() {
     case "$arch" in
         x86_64|amd64)
             if glibc_is_older_than_228; then
-                die "x86_64 systems with glibc older than 2.28 are not supported by official release assets"
+                die "x86_64 systems with glibc older than 2.28 are not supported by official release assets" "glibc 低于 2.28 的 x86_64 系统不受官方 Release 包支持"
             elif ! cpu_has_flag sse4_2; then
-                die "x86_64 CPU without SSE4.2 is not supported by official release assets"
+                die "x86_64 CPU without SSE4.2 is not supported by official release assets" "不支持 SSE4.2 的 x86_64 CPU 不受官方 Release 包支持"
             elif cpu_has_flag avx512f; then
                 printf 'cloud-node-rust-linux-x64-v4-avx512.tar.gz\n'
             elif cpu_has_flag avx2; then
@@ -1337,7 +1165,7 @@ detect_asset_name() {
             fi
             ;;
         *)
-            die "unsupported architecture: $arch"
+            die "unsupported architecture: $arch" "不支持的架构: $arch"
             ;;
     esac
 }
@@ -1364,7 +1192,14 @@ download_url_for() {
 
 geoip_url_for() {
     local name="$1"
-    printf 'https://github.com/P3TERX/GeoLite.mmdb/raw/download/%s\n' "$name"
+    if [ -n "$GEOIP_BASE_URL" ]; then
+        printf '%s/%s\n' "${GEOIP_BASE_URL%/}" "$name"
+    else
+        # GeoIP databases are vendored in this repository under geoip/ and are
+        # the canonical source for installs. Updates are controlled by the
+        # repository owner.
+        printf 'https://github.com/%s/raw/main/geoip/%s\n' "$REPO" "$name"
+    fi
 }
 
 download_geoip_files() {
@@ -1373,8 +1208,22 @@ download_geoip_files() {
     local url=""
     local target=""
     local tmp_target=""
+    local sums_file=""
+    local expected=""
 
+    section "安装 GeoIP 数据库 / Install GeoIP Databases"
     run mkdir -p "$GEOIP_DIR"
+
+    # Fetch the checksum manifest from the same source for integrity
+    # verification. Missing manifest only warns; a checksum mismatch aborts.
+    if [ "$DRY_RUN" -eq 0 ]; then
+        if curl -fsSL --retry 2 --connect-timeout 15 -o "$TMP_DIR/geoip-SHA256SUMS.txt" "$(geoip_url_for SHA256SUMS.txt)" 2>/dev/null; then
+            sums_file="$TMP_DIR/geoip-SHA256SUMS.txt"
+        else
+            warn "GeoIP checksum manifest unavailable; skipping integrity verification" "GeoIP 校验清单不可用；跳过完整性校验"
+        fi
+    fi
+
     for name in $names; do
         url="$(geoip_url_for "$name")"
         target="$GEOIP_DIR/$name"
@@ -1385,21 +1234,31 @@ download_geoip_files() {
         if [ "$DRY_RUN" -eq 0 ]; then
             log "downloading GeoIP: $url"
             curl -fL --retry 3 --connect-timeout 20 -o "$tmp_target" "$url"
+            if [ -n "$sums_file" ]; then
+                expected="$(awk -v f="$name" '$2 == f {print $1}' "$sums_file" | head -n 1)"
+                if [ -z "$expected" ]; then
+                    warn "no checksum entry for $name; skipping verification" "$name 无校验条目；跳过校验"
+                elif [ "$(sha256_file "$tmp_target")" != "$expected" ]; then
+                    die "GeoIP checksum mismatch for $name; aborting before install" "$name 校验和不匹配；安装前中止"
+                fi
+            fi
             install -m 0644 "$tmp_target" "$target"
         else
             log "+ curl -fL --retry 3 --connect-timeout 20 -o $tmp_target $url"
             log "+ install -m 0644 $tmp_target $target"
         fi
     done
+    ok "GeoIP databases installed to $GEOIP_DIR" "GeoIP 数据库已安装到 $GEOIP_DIR"
 }
 
-collect_fresh_api_config() {
-    if [ "$MODE" != "fresh" ]; then
+collect_api_config() {
+    # Only needed when no existing api_node.yaml can be migrated (fresh install).
+    if [ -n "$EXISTING_API_CONFIG_DIR" ]; then
         return
     fi
 
     if prompt_available && [ "$ASSUME_YES" -eq 0 ]; then
-        section "$(is_zh && printf 'API 连接配置' || printf 'API Connection Config')"
+        section "API 连接配置 / API Connection Config"
         if [ -z "$API_ENDPOINTS" ]; then
             API_ENDPOINTS="$(prompt_text \
                 "API RPC 地址，多个用逗号分隔" \
@@ -1414,9 +1273,9 @@ collect_fresh_api_config() {
         fi
     fi
 
-    [ -n "$API_ENDPOINTS" ] || die "fresh install requires --api-endpoint or --api-endpoints"
-    [ -n "$NODE_ID" ] || die "fresh install requires --node-id"
-    [ -n "$NODE_SECRET" ] || die "fresh install requires --secret"
+    [ -n "$API_ENDPOINTS" ] || die "no existing api_node.yaml found; fresh install requires --api-endpoint or --api-endpoints" "未找到可迁移的 api_node.yaml；全新安装需要 --api-endpoint 或 --api-endpoints"
+    [ -n "$NODE_ID" ] || die "no existing api_node.yaml found; fresh install requires --node-id" "未找到可迁移的 api_node.yaml；全新安装需要 --node-id"
+    [ -n "$NODE_SECRET" ] || die "no existing api_node.yaml found; fresh install requires --secret" "未找到可迁移的 api_node.yaml；全新安装需要 --secret"
 }
 
 migrate_runtime_layout() {
@@ -1490,7 +1349,8 @@ write_api_node_config() {
     local first=1
     local list="[ "
 
-    if [ "$MODE" != "fresh" ]; then
+    # Only write a new config when nothing could be migrated.
+    if [ -n "$EXISTING_API_CONFIG_DIR" ] || [ -e "$config_path" ]; then
         return 0
     fi
 
@@ -1505,7 +1365,7 @@ write_api_node_config() {
         first=0
     done
     list="${list} ]"
-    [ "$first" -eq 0 ] || die "fresh install requires at least one non-empty API endpoint"
+    [ "$first" -eq 0 ] || die "fresh install requires at least one non-empty API endpoint" "全新安装至少需要一个非空 API 地址"
 
     run mkdir -p "$INSTALL_DIR/configs"
     if [ -e "$config_path" ]; then
@@ -1568,13 +1428,9 @@ list_backups() {
     local created=""
     local version=""
     local existing=""
-    section "$(is_zh && printf '可用备份' || printf 'Available Backups')"
+    section "可用备份 / Available Backups"
     if ! backup_dirs | grep -q .; then
-        if is_zh; then
-            printf '  未找到备份目录：%s\n' "$BACKUP_ROOT"
-        else
-            printf '  No backups found under: %s\n' "$BACKUP_ROOT"
-        fi
+        bi "  未找到备份目录：$BACKUP_ROOT" "  No backups found under: $BACKUP_ROOT"
         return
     fi
     while IFS= read -r backup; do
@@ -1600,25 +1456,23 @@ choose_restore_backup() {
         return
     fi
 
-    mapfile -t backups < <(restore_backup_dirs)
-    [ "${#backups[@]}" -gt 0 ] || die "no backups found under $BACKUP_ROOT"
+    read_lines_into backups < <(restore_backup_dirs)
+    [ "${#backups[@]}" -gt 0 ] || die "no backups found under $BACKUP_ROOT" "$BACKUP_ROOT 下未找到备份"
 
     if [ "$ASSUME_YES" -eq 1 ] || ! prompt_available; then
         printf '%s\n' "${backups[0]}"
         return
     fi
 
-    section "$(is_zh && printf '选择恢复备份' || printf 'Choose Restore Backup')"
+    # Display output goes to stderr; only the chosen path is printed to stdout
+    # so the caller's command substitution captures a clean value.
+    section "选择恢复备份 / Choose Restore Backup" >&2
     idx=1
     for backup in "${backups[@]}"; do
-        printf '  %s%d)%s %s\n' "$BOLD" "$idx" "$RESET" "$backup"
+        printf '  %s%d)%s %s\n' "$BOLD" "$idx" "$RESET" "$backup" >&2
         idx=$((idx + 1))
     done
-    if is_zh; then
-        printf '\n输入序号 %s[1]%s: ' "$DIM" "$RESET"
-    else
-        printf '\nEnter choice %s[1]%s: ' "$DIM" "$RESET"
-    fi
+    printf '\n输入序号 | Enter choice %s[1]%s: ' "$DIM" "$RESET" >&2
     read_prompt choice || choice=""
     choice="${choice:-1}"
     case "$choice" in
@@ -1640,7 +1494,7 @@ restore_file() {
     local current_name=""
 
     if [ ! -e "$source" ]; then
-        warn "missing backup for $label: $source"
+        warn "missing backup for $label: $source" "$label 的备份缺失: $source"
         return
     fi
 
@@ -1665,15 +1519,14 @@ restore_go_original() {
     local service_was_active=0
 
     backup_dir="$(choose_restore_backup)"
-    [ -d "$backup_dir" ] || die "restore backup dir does not exist: $backup_dir"
+    [ -d "$backup_dir" ] || die "restore backup dir does not exist: $backup_dir" "恢复备份目录不存在: $backup_dir"
 
-    section "$(is_zh && printf '恢复摘要' || printf 'Restore Summary')"
+    section "恢复摘要 / Restore Summary"
     kv "backup" "$backup_dir"
     kv "service" "$SERVICE_NAME"
-    kv "start mode" "$START_MODE"
 
     if [ "$ASSUME_YES" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-        ask_yes_no "确认从该备份恢复 Go 原版吗？" "Restore Go original from this backup?" "no" || die "aborted"
+        ask_yes_no "确认从该备份恢复 Go 原版吗？" "Restore Go original from this backup?" "no" || die "aborted" "已中止"
     fi
 
     RESTORE_CURRENT_DIR="$BACKUP_ROOT/restore-current-$(date +%Y%m%d-%H%M%S)"
@@ -1713,41 +1566,28 @@ restore_go_original() {
         run systemctl daemon-reload
     fi
 
-    case "$START_MODE" in
-        always)
-            if systemctl_available; then
-                run systemctl restart "$SERVICE_NAME"
-            fi
-            ;;
-        preserve)
-            if [ "$service_was_active" -eq 1 ] && systemctl_available; then
-                run systemctl start "$SERVICE_NAME"
-            fi
-            ;;
-        never)
-            ;;
-        *)
-            die "invalid START_MODE: $START_MODE"
-            ;;
-    esac
+    # Restore always preserves prior run state: restart only if it was running.
+    if [ "$service_was_active" -eq 1 ] && systemctl_available; then
+        run systemctl start "$SERVICE_NAME"
+    fi
 
-    ok "restore completed"
-    log "current Rust files backed up at: $RESTORE_CURRENT_DIR"
+    ok "restore completed" "恢复完成"
+    log "current Rust files backed up at: $RESTORE_CURRENT_DIR" "当前 Rust 文件已备份到: $RESTORE_CURRENT_DIR"
 }
 
 confirm_install() {
     if [ "$ASSUME_YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
         return
     fi
-    ask_yes_no "确认开始安装 Rust CloudNode 吗？" "Proceed with Rust CloudNode install?" "no" || die "aborted"
+    ask_yes_no "确认开始安装吗？" "Proceed with install?" "yes" || die "aborted" "已中止"
 }
 
-if [ "$MODE" = "list-backups" ]; then
+if [ "$ACTION" = "list-backups" ]; then
     list_backups
     exit 0
 fi
 
-if [ "$MODE" = "restore" ]; then
+if [ "$ACTION" = "restore" ]; then
     restore_go_original
     exit 0
 fi
@@ -1762,16 +1602,13 @@ EXISTING_RUNTIME_DIR="$(first_existing_runtime_dir \
     /opt/cloud-node \
     /opt/cloud-node-rust \
     || true)"
-if [ "$MODE" = "fresh" ]; then
-    ALLOW_FRESH=1
-fi
 if [ -z "$INSTALL_DIR" ]; then
-    if [ "$MODE" = "fresh" ]; then
-        INSTALL_DIR="/root/cloud-node"
-    elif [ -n "$EXISTING_RUNTIME_DIR" ]; then
+    if [ -n "$EXISTING_RUNTIME_DIR" ]; then
         INSTALL_DIR="$EXISTING_RUNTIME_DIR"
-    else
+    elif [ -n "$EXISTING_BINARY" ]; then
         INSTALL_DIR="/opt/cloud-node-rust"
+    else
+        INSTALL_DIR="/root/cloud-node"
     fi
 fi
 if [ -z "$INSTALL_BINARY" ]; then
@@ -1781,30 +1618,21 @@ if [ -z "$GEOIP_DIR" ]; then
     GEOIP_DIR="$INSTALL_DIR/data"
 fi
 
-case "$DOWNLOAD_GEOIP" in
-    ask|yes|no)
-        ;;
-    *)
-        die "invalid DOWNLOAD_GEOIP: $DOWNLOAD_GEOIP"
-        ;;
-esac
+EXISTING_API_CONFIG_DIR="$(find_existing_api_config \
+    "$INSTALL_DIR" \
+    "$EXISTING_RUNTIME_DIR" \
+    "$EXISTING_BINARY_WORKDIR" \
+    /root/cloud-node \
+    /opt/cloud-node \
+    /opt/cloud-node-rust \
+    || true)"
 
-if [ "$DOWNLOAD_GEOIP" = "ask" ]; then
-    if [ "$ASSUME_YES" -eq 1 ] || ! prompt_available; then
-        DOWNLOAD_GEOIP="no"
-    elif ask_yes_no \
-        "是否从 https://github.com/P3TERX/GeoLite.mmdb 下载 GeoIP 库？" \
-        "Download GeoIP databases from https://github.com/P3TERX/GeoLite.mmdb?" \
-        "no"
-    then
-        DOWNLOAD_GEOIP="yes"
-    else
-        DOWNLOAD_GEOIP="no"
-    fi
+IS_FRESH=0
+if [ -z "$EXISTING_API_CONFIG_DIR" ]; then
+    IS_FRESH=1
 fi
 
-collect_fresh_api_config
-collect_fresh_timezone_config
+collect_api_config
 
 BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
 ASSET_NAME="$(detect_asset_name)"
@@ -1826,9 +1654,6 @@ case "$EXISTING_RUNTIME" in
         CURRENT_BACKUP_SUFFIX="current"
         ;;
 esac
-if [ -z "$EXISTING_BINARY" ] && [ "$ALLOW_FRESH" -eq 0 ]; then
-    die "no existing cloud-node was found; pass --allow-fresh for a new install"
-fi
 
 SERVICE_WAS_ACTIVE=0
 LEGACY_WAS_RUNNING=0
@@ -1849,13 +1674,13 @@ if [ "$LEGACY_WAS_RUNNING" -eq 0 ] && systemctl_available; then
     done < <(discover_legacy_units || true)
 fi
 
-section "$(is_zh && printf '安装摘要' || printf 'Install Summary')"
-kv "mode" "$MODE"
+section "安装摘要 / Install Summary"
 kv "repository" "$REPO"
 kv "version" "$NORMALIZED_VERSION"
 kv "asset" "$ASSET_NAME"
 kv "existing cloud-node" "${EXISTING_BINARY:-not found}"
 kv "existing runtime" "$EXISTING_RUNTIME"
+kv "fresh install" "$IS_FRESH"
 kv "legacy running" "$LEGACY_WAS_RUNNING"
 kv "install dir" "$INSTALL_DIR"
 kv "install binary" "$INSTALL_BINARY"
@@ -1864,32 +1689,25 @@ kv "data dir" "$INSTALL_DIR/data"
 kv "logs dir" "$INSTALL_DIR/logs"
 kv "backup dir" "$BACKUP_DIR"
 kv "service" "$SERVICE_NAME"
-kv "start mode" "$START_MODE"
-kv "download GeoIP" "$DOWNLOAD_GEOIP"
-if [ "$DOWNLOAD_GEOIP" = "yes" ]; then
-    kv "GeoIP dir" "$GEOIP_DIR"
-fi
-if [ "$MODE" = "fresh" ]; then
+kv "auto start" "$AUTO_START"
+kv "GeoIP dir" "$GEOIP_DIR"
+if [ "$IS_FRESH" -eq 1 ]; then
     kv "api endpoints" "$API_ENDPOINTS"
     kv "nodeId" "$NODE_ID"
     kv "secret" "******"
-    if [ "$SKIP_TIMEZONE" -eq 1 ]; then
-        kv "timezone" "keep current"
-    else
-        kv "timezone" "${TIMEZONE:-keep current}"
-    fi
+    kv "timezone" "${TIMEZONE:-keep current}"
 fi
 
-if [ "$EXISTING_RUNTIME" = "rust" ] && [ "$NORMALIZED_VERSION" = "latest" ]; then
-    ok "existing Rust cloud-node will be upgraded to the latest release."
-elif [ "$EXISTING_RUNTIME" = "rust" ]; then
-    ok "existing Rust cloud-node will be upgraded to the selected release."
+if [ "$EXISTING_RUNTIME" = "rust" ]; then
+    ok "existing Rust cloud-node will be upgraded to the selected release" "现有 Rust 节点将升级到所选版本"
+elif [ "$EXISTING_RUNTIME" = "go" ]; then
+    ok "existing Go cloud-node will be migrated to the Rust release" "现有 Go 节点将迁移到 Rust 版本"
 elif [ "$EXISTING_RUNTIME" = "unknown" ]; then
-    warn "existing binary runtime is unknown; it will still be backed up before install."
+    warn "existing binary runtime is unknown; it will still be backed up before install" "现有二进制运行时未知；安装前仍会备份"
 fi
 
 confirm_install
-apply_fresh_timezone
+apply_timezone
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -1923,10 +1741,10 @@ fi
 if [ "$DRY_RUN" -eq 0 ]; then
     {
         printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        printf 'mode=%s\n' "$MODE"
         printf 'repo=%s\n' "$REPO"
         printf 'version=%s\n' "$NORMALIZED_VERSION"
         printf 'asset=%s\n' "$ASSET_NAME"
+        printf 'fresh_install=%s\n' "$IS_FRESH"
         printf 'existing_binary=%s\n' "${EXISTING_BINARY:-not found}"
         printf 'existing_runtime_guess=%s\n' "$EXISTING_RUNTIME"
         printf 'backup_suffix=%s\n' "$CURRENT_BACKUP_SUFFIX"
@@ -1938,9 +1756,8 @@ if [ "$DRY_RUN" -eq 0 ]; then
         printf 'config_dir=%s\n' "$INSTALL_DIR/configs"
         printf 'data_dir=%s\n' "$INSTALL_DIR/data"
         printf 'logs_dir=%s\n' "$INSTALL_DIR/logs"
-        printf 'download_geoip=%s\n' "$DOWNLOAD_GEOIP"
         printf 'geoip_dir=%s\n' "$GEOIP_DIR"
-        if [ "$MODE" = "fresh" ]; then
+        if [ "$IS_FRESH" -eq 1 ]; then
             printf 'api_config=%s\n' "$INSTALL_DIR/configs/api_node.yaml"
             printf 'api_endpoints=%s\n' "$API_ENDPOINTS"
             printf 'node_id=%s\n' "$NODE_ID"
@@ -1954,32 +1771,13 @@ else
     log "+ write $BACKUP_DIR/manifest.current.txt"
 fi
 
-SERVICE_WAS_ACTIVE=0
-LEGACY_WAS_RUNNING=0
-if systemctl_available && systemctl is-active --quiet "$SERVICE_NAME"; then
-    SERVICE_WAS_ACTIVE=1
-    LEGACY_WAS_RUNNING=1
-fi
-if [ "$LEGACY_WAS_RUNNING" -eq 0 ] && discover_legacy_pids | grep -q .; then
-    LEGACY_WAS_RUNNING=1
-fi
-if [ "$LEGACY_WAS_RUNNING" -eq 0 ] && systemctl_available; then
-    while IFS= read -r unit; do
-        [ -n "$unit" ] || continue
-        if systemctl is-active --quiet "$unit" 2>/dev/null; then
-            LEGACY_WAS_RUNNING=1
-            break
-        fi
-    done < <(discover_legacy_units || true)
-fi
-
 log "downloading: $DOWNLOAD_URL"
 if [ "$DRY_RUN" -eq 0 ]; then
     curl -fL --retry 3 --connect-timeout 20 -o "$TMP_DIR/$ASSET_NAME" "$DOWNLOAD_URL"
     tar -xzf "$TMP_DIR/$ASSET_NAME" -C "$TMP_DIR"
-    [ -f "$TMP_DIR/cloud-node" ] || die "release archive does not contain cloud-node"
+    [ -f "$TMP_DIR/cloud-node" ] || die "release archive does not contain cloud-node" "Release 包中不含 cloud-node"
     if [ ! -f "$TMP_DIR/data/cloud-node-xdp-ebpf.o" ]; then
-        warn "release archive does not contain data/cloud-node-xdp-ebpf.o; the binary will use its embedded eBPF object (the file is only needed for explicit xdp.ebpfObject overrides)"
+        warn "release archive does not contain data/cloud-node-xdp-ebpf.o; the binary will use its embedded eBPF object (the file is only needed for explicit xdp.ebpfObject overrides)" "Release 包中不含 data/cloud-node-xdp-ebpf.o；二进制将使用内嵌 eBPF 对象（该文件仅用于显式 xdp.ebpfObject 覆盖）"
     fi
 else
     log "+ curl -fL --retry 3 --connect-timeout 20 -o $TMP_DIR/$ASSET_NAME $DOWNLOAD_URL"
@@ -2017,47 +1815,16 @@ fi
 if [ "$DRY_RUN" -eq 0 ]; then
     validate_rust_service_registration
 else
-    log "+ validate Rust service registration"
+    log "+ validate service registration"
 fi
 
-if [ "$DOWNLOAD_GEOIP" = "yes" ]; then
-    download_geoip_files
-fi
+download_geoip_files
 
 if systemctl_available; then
     run systemctl daemon-reload
 fi
 
-RESTART_SERVICE=0
-case "$START_MODE" in
-    always)
-        RESTART_SERVICE=1
-        ;;
-    preserve)
-        if [ "$ASSUME_YES" -eq 0 ] && prompt_available; then
-            if [ "$LEGACY_WAS_RUNNING" -eq 1 ] || [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
-                if ask_yes_no "安装/升级已完成，是否现在重启 ${SERVICE_NAME} 进程？" "Install/upgrade completed. Restart ${SERVICE_NAME} now?" "yes"; then
-                    RESTART_SERVICE=1
-                fi
-            else
-                if ask_yes_no "安装/升级已完成，是否现在启动 ${SERVICE_NAME} 进程？" "Install/upgrade completed. Start ${SERVICE_NAME} now?" "no"; then
-                    RESTART_SERVICE=1
-                fi
-            fi
-        elif [ "$LEGACY_WAS_RUNNING" -eq 1 ] || [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
-            # Migration from a previously running node must bring the Rust node up,
-            # even when the old process was not managed by systemd.
-            RESTART_SERVICE=1
-        fi
-        ;;
-    never)
-        ;;
-    *)
-        die "invalid START_MODE: $START_MODE"
-        ;;
-esac
-
-if [ "$RESTART_SERVICE" -eq 1 ]; then
+if [ "$AUTO_START" = "yes" ]; then
     if [ "$DRY_RUN" -eq 0 ]; then
         if systemctl_available; then
             run systemctl restart "$SERVICE_NAME" || run systemctl start "$SERVICE_NAME"
@@ -2069,30 +1836,18 @@ if [ "$RESTART_SERVICE" -eq 1 ]; then
             (cd "$INSTALL_DIR" && "$INSTALL_BINARY" start)
         fi
         verify_service_started 20
-    elif systemctl_available; then
-        log "+ systemctl restart $SERVICE_NAME"
-        log "+ verify ${SERVICE_NAME} is active"
-    elif [ "$LEGACY_WAS_RUNNING" -eq 1 ] || [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
-        log "+ cd $INSTALL_DIR && $INSTALL_BINARY restart"
     else
-        log "+ cd $INSTALL_DIR && $INSTALL_BINARY start"
+        log "+ systemctl restart $SERVICE_NAME (or binary start)"
+        log "+ verify ${SERVICE_NAME} is active"
     fi
 fi
 
-log "done"
-log "previous binary backup: $BACKUP_DIR"
-log "Rust binary installed at: $INSTALL_BINARY"
-if [ "$RESTART_SERVICE" -eq 0 ]; then
-    if is_zh; then
-        log "服务未启动。需要时执行: systemctl start ${SERVICE_NAME} 或 cd ${INSTALL_DIR} && ${INSTALL_BINARY} start"
-    else
-        log "service was not started. To start later: systemctl start ${SERVICE_NAME} or cd ${INSTALL_DIR} && ${INSTALL_BINARY} start"
-    fi
+ok "done" "完成"
+log "previous binary backup: $BACKUP_DIR" "旧二进制备份: $BACKUP_DIR"
+log "Rust binary installed at: $INSTALL_BINARY" "Rust 二进制已安装到: $INSTALL_BINARY"
+if [ "$AUTO_START" != "yes" ]; then
+    log "service was not started. To start later: systemctl start ${SERVICE_NAME} or cd ${INSTALL_DIR} && ${INSTALL_BINARY} start" "服务未启动。需要时执行: systemctl start ${SERVICE_NAME} 或 cd ${INSTALL_DIR} && ${INSTALL_BINARY} start"
 fi
 if [ "$LEGACY_WAS_RUNNING" -eq 1 ] || [ -n "${EXISTING_BINARY:-}" ]; then
-    if is_zh; then
-        log "如需回滚到迁移前备份: $0 --restore --restore-backup $BACKUP_DIR"
-    else
-        log "to roll back to the pre-migration backup: $0 --restore --restore-backup $BACKUP_DIR"
-    fi
+    log "to roll back to the pre-migration backup: $0 --restore --restore-backup $BACKUP_DIR" "如需回滚到迁移前备份: $0 --restore --restore-backup $BACKUP_DIR"
 fi

@@ -9,6 +9,7 @@ configs/cache/disk/
 bench-cert.pem
 bench-key.pem
 GeoLite2-*.mmdb
+!geoip/GeoLite2-*.mmdb
 all_pb_rpcs.txt
 used_rust_rpcs.txt
 current_head.txt
