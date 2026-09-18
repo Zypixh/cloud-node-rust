@@ -104,7 +104,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          packages=(cmake build-essential golang-go protobuf-compiler pkg-config libelf-dev zlib1g-dev libpcap0.8-dev)
+          packages=(cmake build-essential golang-go protobuf-compiler pkg-config libelf-dev zlib1g-dev libpcap0.8-dev llvm llvm-dev)
 
           # GitHub ubuntu-22.04 runners pin apt to azure.archive.ubuntu.com via
           # Mirrorlist. When that host stalls, apt-get update hangs until the
@@ -189,6 +189,10 @@ jobs:
           echo "EBPF_NIGHTLY=$EBPF_NIGHTLY" >> "$GITHUB_ENV"
           rustup toolchain install "$EBPF_NIGHTLY" --profile minimal -c rust-src
           rustup run "$EBPF_NIGHTLY" rustc --version
+          # bpf-linker's build script resolves LLVM via LLVM_PREFIX or via
+          # llvm-config's location on PATH; /usr/bin/llvm-config resolves to
+          # basedir=/usr which lacks libLLVM, so pin the real prefix.
+          echo "LLVM_PREFIX=$(llvm-config --prefix)" >> "$GITHUB_ENV"
           cargo +"$EBPF_NIGHTLY" install bpf-linker --version "$BPF_LINKER_VERSION" --locked
           bpf-linker --version
 

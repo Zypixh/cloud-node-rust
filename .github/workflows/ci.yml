@@ -32,7 +32,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          packages=(cmake build-essential clang pkg-config perl protobuf-compiler libclang-dev libelf-dev zlib1g-dev libzstd-dev libpcap0.8-dev m4 llvm)
+          packages=(cmake build-essential clang pkg-config perl protobuf-compiler libclang-dev libelf-dev zlib1g-dev libzstd-dev libpcap0.8-dev m4 llvm llvm-dev)
 
           # GitHub ubuntu-22.04 runners pin apt to azure.archive.ubuntu.com via
           # Mirrorlist. When that host stalls, apt-get update hangs until the
@@ -85,6 +85,10 @@ jobs:
           EBPF_NIGHTLY="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/cloud-node-xdp-ebpf/rust-toolchain.toml | head -1)"
           test -n "$EBPF_NIGHTLY"
           rustup toolchain install "$EBPF_NIGHTLY" --profile minimal -c rust-src
+          # bpf-linker's build script resolves LLVM via LLVM_PREFIX or via
+          # llvm-config's location on PATH; /usr/bin/llvm-config resolves to
+          # basedir=/usr which lacks libLLVM, so pin the real prefix.
+          echo "LLVM_PREFIX=$(llvm-config --prefix)" >> "$GITHUB_ENV"
           cargo +"$EBPF_NIGHTLY" install bpf-linker --version "$BPF_LINKER_VERSION" --locked
 
       - name: Build XDP eBPF Object
@@ -124,7 +128,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          packages=(cmake build-essential clang pkg-config perl protobuf-compiler libclang-dev libelf-dev zlib1g-dev libzstd-dev libpcap0.8-dev m4 llvm)
+          packages=(cmake build-essential clang pkg-config perl protobuf-compiler libclang-dev libelf-dev zlib1g-dev libzstd-dev libpcap0.8-dev m4 llvm llvm-dev)
 
           sudo tee /etc/apt/apt.conf.d/99ci-timeouts >/dev/null <<'EOF'
           Acquire::Retries "3";
@@ -174,6 +178,10 @@ jobs:
           EBPF_NIGHTLY="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/cloud-node-xdp-ebpf/rust-toolchain.toml | head -1)"
           test -n "$EBPF_NIGHTLY"
           rustup toolchain install "$EBPF_NIGHTLY" --profile minimal -c rust-src
+          # bpf-linker's build script resolves LLVM via LLVM_PREFIX or via
+          # llvm-config's location on PATH; /usr/bin/llvm-config resolves to
+          # basedir=/usr which lacks libLLVM, so pin the real prefix.
+          echo "LLVM_PREFIX=$(llvm-config --prefix)" >> "$GITHUB_ENV"
           cargo +"$EBPF_NIGHTLY" install bpf-linker --version "$BPF_LINKER_VERSION" --locked
 
       - name: Build XDP eBPF Object
