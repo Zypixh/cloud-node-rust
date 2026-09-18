@@ -1043,6 +1043,125 @@ sha256_file() {
     fi
 }
 
+human_bytes() {
+    awk -v b="${1:-0}" 'BEGIN {
+        split("B KiB MiB GiB", u, " ");
+        i = 1;
+        while (b >= 1024 && i < 4) { b /= 1024; i++ }
+        printf "%.1f%s", b, u[i]
+    }'
+}
+
+tty_progress() {
+    [ "$DRY_RUN" -eq 0 ] && [ -t 2 ] && [ -z "${NO_PROGRESS:-}" ]
+}
+
+spinner_frame() {
+    local idx="$1"
+    local frames=""
+    case "${LANG:-}${LC_ALL:-}${LC_CTYPE:-}" in
+        *UTF-8*|*utf-8*|*utf8*|*UTF8*)
+            frames="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            ;;
+        *)
+            frames="|/-\\"
+            ;;
+    esac
+    # Braille frames are multibyte; index by character, not byte.
+    printf '%s' "$frames" | cut -c "$((idx % 10 + 1))"
+}
+
+draw_progress() {
+    local have="${1:-0}"
+    local total="${2:-0}"
+    local spin_idx="${3:-0}"
+    local started="${4:-$(date +%s)}"
+    local spin=""
+    local bar=""
+    local line=""
+    local elapsed=0
+    local rate=""
+
+    spin="$(spinner_frame "$spin_idx")"
+    elapsed=$(( $(date +%s) - started ))
+    if [ "$elapsed" -gt 0 ] && [ "$have" -gt 0 ]; then
+        rate="$(human_bytes "$((have / elapsed))")/s"
+    fi
+
+    if [ "$total" -gt 0 ] 2>/dev/null; then
+        local pct=$((have * 100 / total))
+        [ "$pct" -gt 100 ] && pct=100
+        local width=26
+        local filled=$((pct * width / 100))
+        local i=0
+        bar="["
+        while [ "$i" -lt "$width" ]; do
+            if [ "$i" -lt "$filled" ]; then
+                bar="${bar}="
+            elif [ "$i" -eq "$filled" ] && [ "$pct" -lt 100 ]; then
+                bar="${bar}>"
+            else
+                bar="${bar} "
+            fi
+            i=$((i + 1))
+        done
+        bar="${bar}]"
+        line=$(printf '%s %s %3d%% %s/%s %s' \
+            "$spin" "$bar" "$pct" \
+            "$(human_bytes "$have")" "$(human_bytes "$total")" "$rate")
+    else
+        line=$(printf '%s %s %s' "$spin" "$(human_bytes "$have")" "$rate")
+    fi
+    printf '\r%s%-78.78s%s' "$CYAN" "$line" "$RESET" >&2
+}
+
+download_with_progress() {
+    local url="$1"
+    local dest="$2"
+    local label="${3:-$(basename "$url")}"
+
+    if ! tty_progress; then
+        log "downloading: $url"
+        curl -fL --retry 3 --connect-timeout 20 -o "$dest" "$url"
+        return $?
+    fi
+
+    local total=""
+    total="$(curl -fsIL --connect-timeout 10 "$url" 2>/dev/null \
+        | sed -n 's/^[Cc]ontent-[Ll]ength:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        | tail -n 1 || true)"
+    total="${total:-0}"
+
+    printf '%s[cloud-node]%s %s\n' "$BLUE" "$RESET" "$label" >&2
+    curl -fL --retry 3 --connect-timeout 20 -o "$dest" "$url" &
+    local curl_pid=$!
+    local started
+    started="$(date +%s)"
+    local spin_idx=0
+    local have=0
+
+    while kill -0 "$curl_pid" 2>/dev/null; do
+        have="$(wc -c < "$dest" 2>/dev/null | tr -d '[:space:]')"
+        have="${have:-0}"
+        draw_progress "$have" "$total" "$spin_idx" "$started"
+        spin_idx=$((spin_idx + 1))
+        sleep 0.12
+    done
+
+    local rc=0
+    wait "$curl_pid" || rc=$?
+    have="$(wc -c < "$dest" 2>/dev/null | tr -d '[:space:]')"
+    have="${have:-0}"
+    if [ "$rc" -eq 0 ]; then
+        draw_progress "$have" "$total" "$spin_idx" "$started"
+        printf '\r%80s\r' "" >&2
+        ok "downloaded $label ($(human_bytes "$have"))" "已下载 $label ($(human_bytes "$have"))"
+    else
+        printf '\n' >&2
+    fi
+    return "$rc"
+}
+
 sanitize_path() {
     printf '%s' "$1" | sed 's#/#_#g; s#^_##'
 }
@@ -1202,6 +1321,149 @@ geoip_url_for() {
     fi
 }
 
+nic_driver() {
+    local iface="$1"
+    local driver=""
+    if command -v ethtool >/dev/null 2>&1; then
+        driver="$(ethtool -i "$iface" 2>/dev/null | sed -n 's/^driver:[[:space:]]*//p' | head -n 1)"
+    fi
+    if [ -z "$driver" ] && [ -e "/sys/class/net/$iface/device/driver" ]; then
+        driver="$(basename "$(readlink "/sys/class/net/$iface/device/driver" 2>/dev/null || true)" 2>/dev/null || true)"
+    fi
+    printf '%s' "${driver:-unknown}"
+}
+
+nic_xdp_verdict() {
+    # Driver allowlist for native (drv) XDP attach; everything else only gets
+    # generic/skb mode at best. Advisory only — the runtime still probes the
+    # real attach path.
+    case "$1" in
+        i40e|ice|ixgbe|ixgbevf|iavf|mlx4_en|mlx5_core|bnxt_en|qede|sfc|sfc_ef100|nfp|nfp_netvf|virtio_net|ena|gve|mvneta|mvpp2|stmmac|enetc|atlantic|axgbe|amd-xgbe|bcmgenet|cpsw|am65-cpsw|fec|dpaa2-eth|xilinx_axienet|netdevsim)
+            printf 'native'
+            ;;
+        veth|tun|tap)
+            printf 'conditional'
+            ;;
+        *)
+            printf 'generic'
+            ;;
+    esac
+}
+
+nic_afxdp_zc() {
+    # AF_XDP zero-copy capable drivers (subset of native-XDP drivers).
+    case "$1" in
+        i40e|ice|ixgbe|mlx5_core|bnxt_en|stmmac|sfc|sfc_ef100)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+nic_is_virtual_noise() {
+    case "$1" in
+        lo|docker*|br-*|virbr*|cni*|flannel*|cali*|kube*|podman*|veth*|tun*|tap*|wg*|zt*|tailscale*|vxlan*|macvlan*|ifb*|gre*|gretap*|erspan*|ip6tnl*|sit*|bonding_masters)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+nic_xdp_attached() {
+    # Best-effort detection of an already-attached XDP program and its mode.
+    local out=""
+    out="$(ip -d link show dev "$1" 2>/dev/null || true)"
+    case "$out" in
+        *xdpoffload*) printf 'offload' ;;
+        *xdpdrv*) printf 'native' ;;
+        *xdpgeneric*) printf 'generic' ;;
+        *prog/xdp*|*" xdp "*) printf 'native' ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+report_nic_xdp() {
+    local kernel=""
+    local kmajor=0
+    local kminor=0
+    local iface=""
+    local driver=""
+    local state=""
+    local verdict=""
+    local attached=""
+    local default_iface=""
+    local real_nics=0
+    local native_nics=0
+    local marker=""
+
+    section "网卡 XDP 能力检测 / NIC XDP Capability"
+
+    kernel="$(uname -r 2>/dev/null || true)"
+    kmajor="$(printf '%s' "$kernel" | cut -d. -f1)"
+    kminor="$(printf '%s' "$kernel" | cut -d. -f2)"
+    case "$kmajor$kminor" in ''|*[!0-9]*) kmajor=0; kminor=0 ;; esac
+    if [ "$kmajor" -gt 5 ] || { [ "$kmajor" -eq 5 ] && [ "$kminor" -ge 4 ]; }; then
+        ok "kernel $kernel" "内核 $kernel 满足 AF_XDP 要求"
+    elif [ "$kmajor" -gt 4 ] || { [ "$kmajor" -eq 4 ] && [ "$kminor" -ge 18 ]; }; then
+        warn "kernel $kernel supports AF_XDP but >= 5.4 is recommended" "内核 $kernel 支持 AF_XDP，建议 >= 5.4"
+    else
+        warn "kernel $kernel is too old for AF_XDP (need >= 4.18)" "内核 $kernel 过旧，AF_XDP 需要 >= 4.18"
+    fi
+
+    if [ ! -d /sys/class/net ]; then
+        warn "no /sys/class/net; NIC detection unavailable" "无 /sys/class/net；无法检测网卡"
+        return 0
+    fi
+
+    if command -v ip >/dev/null 2>&1; then
+        default_iface="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    fi
+
+    for path in /sys/class/net/*; do
+        iface="$(basename "$path")"
+        if nic_is_virtual_noise "$iface" && [ "$iface" != "$default_iface" ]; then
+            continue
+        fi
+        driver="$(nic_driver "$iface")"
+        state="$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || printf 'unknown')"
+        verdict="$(nic_xdp_verdict "$driver")"
+        attached="$(nic_xdp_attached "$iface" || true)"
+        marker=""
+        [ "$iface" = "$default_iface" ] && marker=" *"
+        real_nics=$((real_nics + 1))
+
+        case "$verdict" in
+            native)
+                native_nics=$((native_nics + 1))
+                if nic_afxdp_zc "$driver"; then
+                    ok "  $iface$marker  driver=$driver  state=$state  native XDP (drv) + AF_XDP zero-copy" "  $iface$marker  驱动=$driver  状态=$state  支持 native XDP (drv) + AF_XDP 零拷贝"
+                else
+                    ok "  $iface$marker  driver=$driver  state=$state  native XDP (drv); AF_XDP copy-mode" "  $iface$marker  驱动=$driver  状态=$state  支持 native XDP (drv)；AF_XDP 为拷贝模式"
+                fi
+                ;;
+            conditional)
+                warn "  $iface$marker  driver=$driver  state=$state  native XDP depends on kernel (veth/tun need >= 5.11)" "  $iface$marker  驱动=$driver  状态=$state  native XDP 依赖内核版本（veth/tun 需 >= 5.11）"
+                ;;
+            *)
+                warn "  $iface$marker  driver=$driver  state=$state  no native XDP; generic/skb mode only" "  $iface$marker  驱动=$driver  状态=$state  不支持 native XDP；仅 generic/skb 模式"
+                ;;
+        esac
+        if [ -n "$attached" ]; then
+            kv "    attached xdp" "$attached"
+        fi
+    done
+
+    if [ "$real_nics" -eq 0 ]; then
+        warn "no physical NIC detected" "未检测到物理网卡"
+    elif [ "$native_nics" -eq 0 ]; then
+        warn "no NIC supports native XDP; use xdp.attachMode: auto or skb" "没有网卡支持 native XDP；xdp.attachMode 请使用 auto 或 skb"
+    fi
+    if [ -n "$default_iface" ]; then
+        kv "default route iface" "$default_iface"
+    fi
+}
+
 download_geoip_files() {
     local names="GeoLite2-City.mmdb GeoLite2-ASN.mmdb GeoLite2-Country.mmdb"
     local name=""
@@ -1232,8 +1494,7 @@ download_geoip_files() {
             run cp -a "$target" "$BACKUP_DIR/$name.geoip-original"
         fi
         if [ "$DRY_RUN" -eq 0 ]; then
-            log "downloading GeoIP: $url"
-            curl -fL --retry 3 --connect-timeout 20 -o "$tmp_target" "$url"
+            download_with_progress "$url" "$tmp_target" "$name"
             if [ -n "$sums_file" ]; then
                 expected="$(awk -v f="$name" '$2 == f {print $1}' "$sums_file" | head -n 1)"
                 if [ -z "$expected" ]; then
@@ -1771,9 +2032,8 @@ else
     log "+ write $BACKUP_DIR/manifest.current.txt"
 fi
 
-log "downloading: $DOWNLOAD_URL"
 if [ "$DRY_RUN" -eq 0 ]; then
-    curl -fL --retry 3 --connect-timeout 20 -o "$TMP_DIR/$ASSET_NAME" "$DOWNLOAD_URL"
+    download_with_progress "$DOWNLOAD_URL" "$TMP_DIR/$ASSET_NAME" "$ASSET_NAME"
     tar -xzf "$TMP_DIR/$ASSET_NAME" -C "$TMP_DIR"
     [ -f "$TMP_DIR/cloud-node" ] || die "release archive does not contain cloud-node" "Release 包中不含 cloud-node"
     if [ ! -f "$TMP_DIR/data/cloud-node-xdp-ebpf.o" ]; then
@@ -1841,6 +2101,8 @@ if [ "$AUTO_START" = "yes" ]; then
         log "+ verify ${SERVICE_NAME} is active"
     fi
 fi
+
+report_nic_xdp
 
 ok "done" "完成"
 log "previous binary backup: $BACKUP_DIR" "旧二进制备份: $BACKUP_DIR"
