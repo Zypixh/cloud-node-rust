@@ -1391,6 +1391,195 @@ fn af_xdp_tcp_reactor_refuses_new_sessions_at_limit() {
 }
 
 #[cfg(any(test, target_os = "linux"))]
+fn parse_tcp_syn_frame(
+    frame: &[u8],
+) -> (
+    af_xdp::AfXdpRouteMeta,
+    af_xdp::AfXdpTcpFlowKey,
+    bytes::Bytes,
+) {
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    (route, flow, ip_packet)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_occupancy_maps_to_pressure_ladder() {
+    use crate::l4_defense::L4PressureLevel;
+    let lvl = af_xdp::af_xdp_session_occupancy_pressure_level;
+    assert_eq!(lvl(0, 100), L4PressureLevel::Normal);
+    assert_eq!(lvl(69, 100), L4PressureLevel::Normal);
+    assert_eq!(lvl(70, 100), L4PressureLevel::Elevated);
+    assert_eq!(lvl(84, 100), L4PressureLevel::Elevated);
+    assert_eq!(lvl(85, 100), L4PressureLevel::High);
+    assert_eq!(lvl(94, 100), L4PressureLevel::High);
+    assert_eq!(lvl(95, 100), L4PressureLevel::Critical);
+    assert_eq!(lvl(100, 100), L4PressureLevel::Critical);
+    // A zero limit is treated as saturated — never Normal.
+    assert_eq!(lvl(1, 0), L4PressureLevel::Critical);
+    assert_eq!(lvl(0, 0), L4PressureLevel::Normal);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_pre_proxy_budget_scales_with_limit() {
+    // floor: small tables still admit handshakes
+    assert_eq!(
+        af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 512)
+            .pre_proxy_budget_for_test(),
+        256
+    );
+    // one eighth of capacity
+    assert_eq!(
+        af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 4096)
+            .pre_proxy_budget_for_test(),
+        512
+    );
+    // never exceeds the table itself
+    assert!(
+        af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 512)
+            .pre_proxy_budget_for_test()
+            <= 512
+    );
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_full_table_evicts_oldest_pre_proxy() {
+    // A full table of unverified sessions must still admit: the oldest
+    // unverified flow is sacrificed, never a verified one. Distinct
+    // created_at instants make the "oldest" choice deterministic.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 2);
+    let base_ms = crate::utils::time::now_timestamp_millis();
+    let at = |offset_ms: i64| smoltcp::time::Instant::from_millis(base_ms + offset_ms);
+    let (route_a, flow_a, _) =
+        parse_tcp_syn_frame(&ipv4_tcp_syn_frame_with_source(false, 40000, [192, 0, 2, 1]));
+    let (route_b, flow_b, _) =
+        parse_tcp_syn_frame(&ipv4_tcp_syn_frame_with_source(false, 40001, [192, 0, 2, 2]));
+    let (route_c, flow_c, _) =
+        parse_tcp_syn_frame(&ipv4_tcp_syn_frame_with_source(false, 40002, [192, 0, 2, 3]));
+    assert!(reactor.ensure_session_at(route_a, flow_a, af_xdp::AfXdpTcpProxyClass::TcpPlain, at(0)));
+    assert!(reactor.ensure_session_at(route_b, flow_b, af_xdp::AfXdpTcpProxyClass::TcpPlain, at(10)));
+    assert_eq!(reactor.pre_proxy_session_count(), 2);
+
+    assert!(reactor.ensure_session_at(route_c, flow_c, af_xdp::AfXdpTcpProxyClass::TcpPlain, at(20)));
+    assert_eq!(reactor.session_count(), 2);
+    assert_eq!(reactor.pre_proxy_session_count(), 2);
+    // The oldest unverified session was evicted, the newer one kept.
+    assert!(!reactor.has_session(&flow_a));
+    assert!(reactor.has_session(&flow_b));
+    assert!(reactor.has_session(&flow_c));
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_verified_sessions_are_never_evicted() {
+    // test_auto_start sessions graduate immediately (proxy_started) — a
+    // table full of verified work refuses new admissions instead of
+    // killing real flows.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 2);
+    let (route_a, flow_a, packet_a) =
+        parse_tcp_syn_frame(&ipv4_tcp_syn_frame_with_source(false, 40000, [192, 0, 2, 1]));
+    let (route_b, flow_b, packet_b) =
+        parse_tcp_syn_frame(&ipv4_tcp_syn_frame_with_source(false, 40001, [192, 0, 2, 2]));
+    assert_eq!(
+        reactor.ingest(route_a, flow_a, packet_a),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+    assert_eq!(
+        reactor.ingest(route_b, flow_b, packet_b),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+    assert_eq!(reactor.pre_proxy_session_count(), 0);
+
+    let (route_c, flow_c, _) =
+        parse_tcp_syn_frame(&ipv4_tcp_syn_frame_with_source(false, 40002, [192, 0, 2, 3]));
+    assert!(!reactor.ensure_session(route_c, flow_c, af_xdp::AfXdpTcpProxyClass::TcpPlain));
+    assert_eq!(reactor.session_count(), 2);
+    assert!(reactor.has_session(&flow_a));
+    assert!(reactor.has_session(&flow_b));
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_per_ip_pre_proxy_cap_churns_oldest() {
+    // One source IP may hold at most PRE_PROXY_PER_IP_LIMIT unverified
+    // sessions — its own oldest churns, other IPs are unaffected.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 4096);
+    let attacker = [192, 0, 2, 99];
+    let base_ms = crate::utils::time::now_timestamp_millis();
+    let mut first_flow = None;
+    for port in 0..af_xdp::AF_XDP_TCP_PRE_PROXY_PER_IP_LIMIT as u16 {
+        let (route, flow, _) =
+            parse_tcp_syn_frame(&ipv4_tcp_syn_frame_with_source(false, 40000 + port, attacker));
+        if first_flow.is_none() {
+            first_flow = Some(flow);
+        }
+        assert!(reactor.ensure_session_at(
+            route,
+            flow,
+            af_xdp::AfXdpTcpProxyClass::TcpPlain,
+            smoltcp::time::Instant::from_millis(base_ms + port as i64),
+        ));
+    }
+    assert_eq!(
+        reactor.pre_proxy_session_count(),
+        af_xdp::AF_XDP_TCP_PRE_PROXY_PER_IP_LIMIT
+    );
+
+    // One more SYN from the same IP churns ITS oldest — admitted, count
+    // pinned at the cap.
+    let (route, flow, _) = parse_tcp_syn_frame(&ipv4_tcp_syn_frame_with_source(
+        false, 41000, attacker,
+    ));
+    assert!(reactor.ensure_session_at(
+        route,
+        flow,
+        af_xdp::AfXdpTcpProxyClass::TcpPlain,
+        smoltcp::time::Instant::from_millis(base_ms + 1000),
+    ));
+    assert_eq!(
+        reactor.pre_proxy_session_count(),
+        af_xdp::AF_XDP_TCP_PRE_PROXY_PER_IP_LIMIT
+    );
+    assert!(!reactor.has_session(&first_flow.unwrap()));
+    assert!(reactor.has_session(&flow));
+
+    // A different IP is unaffected by the attacker's saturated per-IP pool.
+    let (route, flow, _) =
+        parse_tcp_syn_frame(&ipv4_tcp_syn_frame_with_source(false, 42000, [192, 0, 2, 7]));
+    assert!(reactor.ensure_session(route, flow, af_xdp::AfXdpTcpProxyClass::TcpPlain));
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_pre_proxy_count_drops_on_reap() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
+    let (route, flow, _) = parse_tcp_syn_frame(&ipv4_tcp_syn_frame(false));
+    assert!(reactor.ensure_session(route, flow, af_xdp::AfXdpTcpProxyClass::TcpPlain));
+    assert_eq!(reactor.pre_proxy_session_count(), 1);
+
+    let reap_at = smoltcp::time::Instant::from_millis(
+        crate::utils::time::now_timestamp_millis()
+            + af_xdp::AF_XDP_TCP_SESSION_IDLE_TIMEOUT.as_millis() as i64
+            + 1,
+    );
+    let _ = reactor.poll_at_for_test(reap_at);
+    assert_eq!(reactor.session_count(), 0);
+    assert_eq!(reactor.pre_proxy_session_count(), 0);
+}
+
+#[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_reaps_idle_sessions() {
     let _budget_guard = tcp_queue_budget_test_lock()
@@ -2590,7 +2779,13 @@ fn af_xdp_tcp_reactor_sweep_is_batched_not_unbounded() {
     let t0 = smoltcp::time::Instant::from_millis(crate::utils::time::now_timestamp_millis());
     let session_total = af_xdp::AF_XDP_TCP_SWEEP_BATCH_BUDGET + 44;
     for idx in 0..session_total {
-        let frame = ipv4_tcp_syn_frame_with_source_port(false, 53000 + idx as u16);
+        // Distinct source IPs keep every session below the per-IP pre-proxy
+        // cap so the sweep-batch bound is what is actually measured.
+        let frame = ipv4_tcp_syn_frame_with_source(
+            false,
+            53000 + idx as u16,
+            [10, 200, (idx / 200) as u8, (idx % 200) as u8 + 1],
+        );
         let af_xdp::AfXdpProxyFrame::Tcp { route, flow, .. } =
             af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
         else {
@@ -3306,6 +3501,15 @@ fn ipv4_tcp_syn_frame(vlan: bool) -> Vec<u8> {
 
 #[cfg(any(test, target_os = "linux"))]
 fn ipv4_tcp_syn_frame_with_source_port(vlan: bool, source_port: u16) -> Vec<u8> {
+    ipv4_tcp_syn_frame_with_source(vlan, source_port, [192, 0, 2, 10])
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn ipv4_tcp_syn_frame_with_source(
+    vlan: bool,
+    source_port: u16,
+    source_ip: [u8; 4],
+) -> Vec<u8> {
     let mut frame = ethernet_header(0x0800, vlan);
     let total_len = 20 + 20;
     frame.extend_from_slice(&[
@@ -3321,10 +3525,10 @@ fn ipv4_tcp_syn_frame_with_source_port(vlan: bool, source_port: u16) -> Vec<u8> 
         6,
         0,
         0,
-        192,
-        0,
-        2,
-        10,
+        source_ip[0],
+        source_ip[1],
+        source_ip[2],
+        source_ip[3],
         198,
         51,
         100,

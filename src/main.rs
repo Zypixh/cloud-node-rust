@@ -600,6 +600,30 @@ fn spawn_xdp_port_sync_task(rt: &tokio::runtime::Runtime, enabled: bool) {
     }
 }
 
+/// Periodic AF_XDP session-table visibility: the scalar diag counters are
+/// the only live view into the smoltcp session table from journal logs —
+/// session count, unverified share, evictions and refusals stay
+/// observable without a monitor endpoint.
+fn spawn_xdp_diag_log_task(rt: &tokio::runtime::Runtime, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    spawn_staggered(rt, Duration::from_secs(60), async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let diag = cloud_node_rust::xdp::af_xdp::tcp_diag_scalars();
+            info!("afxdp.tcp diag {}", diag);
+        }
+    });
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = rt;
+    }
+}
+
 #[cfg(target_os = "linux")]
 async fn sync_xdp_proxy_ports_once() -> anyhow::Result<Option<(usize, usize)>> {
     let Some(mut runtime_config) = RuntimeConfig::current() else {
@@ -3398,6 +3422,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         warn!("XDP initialization skipped: {}", err);
     }
     spawn_xdp_port_sync_task(&rt, runtime_config.xdp.enabled);
+    spawn_xdp_diag_log_task(&rt, runtime_config.xdp.enabled);
     if runtime_config.is_rke2() {
         cloud_node_rust::cache_manager::CACHE
             .storage

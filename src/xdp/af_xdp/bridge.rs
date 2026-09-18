@@ -971,9 +971,12 @@ pub(crate) async fn run_queue_bridge_loop(
     pub(crate) const AF_XDP_MAX_CONSECUTIVE_TX_FAILURES: u32 = 256;
     pub(crate) const AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES: u32 = 1024;
     pub(crate) const AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS: u32 = 1024;
-    // Idle backoff: busy-poll first, then exponentially back off to 1ms.
-    pub(crate) const AF_XDP_IDLE_BACKOFF_MIN: Duration = Duration::from_micros(10);
-    pub(crate) const AF_XDP_IDLE_BACKOFF_MAX: Duration = Duration::from_millis(1);
+    // Idle wait: fully event-driven — the loop sleeps until an XSK RX
+    // frame, a queued channel item, a stream-egress notify or the next
+    // smoltcp timer arrives. FLOOR bounds the timer precision; CAP is the
+    // safety bound on housekeeping latency when nothing is armed.
+    pub(crate) const AF_XDP_IDLE_WAIT_FLOOR: Duration = Duration::from_micros(10);
+    pub(crate) const AF_XDP_IDLE_WAIT_CAP: Duration = Duration::from_secs(1);
     pub(crate) const AF_XDP_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
     let AfXdpQueueCtx {
@@ -989,7 +992,6 @@ pub(crate) async fn run_queue_bridge_loop(
     } = ctx;
     let own_interface: Arc<str> = Arc::from(queue_handle.interface.as_str());
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut idle_backoff = AF_XDP_IDLE_BACKOFF_MIN;
     let mut last_route_cache_sweep_ms = crate::udp_proxy::udp_activity_now_ms();
     let mut tcp_reactor =
         AfXdpTcpReactor::new_with_session_limit(tcp_manager, http_manager, tcp_session_limit);
@@ -999,6 +1001,28 @@ pub(crate) async fn run_queue_bridge_loop(
     // T4: the reactor releases demux/CT/port state itself when a dialed
     // session reaps — never leave it to the caller.
     tcp_reactor.set_dial_registry(dial_registry.clone());
+    // Event-driven idle wait sources. The socket is bound with
+    // XDP_USE_NEED_WAKEUP, so registering the fd with the reactor's IO
+    // driver (epoll → xsk_poll) is also what wakes the NIC driver after
+    // fill-ring starvation — readability therefore signals real RX.
+    #[cfg(target_os = "linux")]
+    let xsk_rx_ready: Option<tokio::io::unix::AsyncFd<std::os::fd::BorrowedFd<'static>>> = {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+        // SAFETY: `queue_handle` outlives this AsyncFd — the socket fd it
+        // borrows stays open for the whole loop.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(queue_handle.rx.fd().as_raw_fd()) };
+        tokio::io::unix::AsyncFd::new(borrowed).ok()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let xsk_rx_ready: Option<()> = None;
+    // Items consumed by an idle-wake channel recv are stashed here and
+    // processed first at their normal drain sites.
+    let mut early_downstream: std::collections::VecDeque<crate::udp_proxy::DownstreamUdpDatagram> =
+        std::collections::VecDeque::new();
+    let mut early_fwd: std::collections::VecDeque<AfXdpForward> =
+        std::collections::VecDeque::new();
+    let mut early_requests: std::collections::VecDeque<AfXdpReactorRequest> =
+        std::collections::VecDeque::new();
     // T5/T6: transport policy comes from the lease owner — on an adopted
     // reload that is the live manager's config (the compatibility gate
     // already rejected any transport change, so old == new here).
@@ -1245,16 +1269,19 @@ pub(crate) async fn run_queue_bridge_loop(
                     );
                     return;
                 }
-                std::thread::sleep(idle_backoff);
+                std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
         };
         // T4: drain reactor requests before parsing frames so a queued
         // Dial lands before any same-round injects for its flow.
         for _ in 0..AF_XDP_REACTOR_REQUEST_BUDGET {
-            match request_rx.try_recv() {
-                Ok(AfXdpReactorRequest::Dial(req)) => tcp_reactor.dial(req),
-                Ok(AfXdpReactorRequest::InjectTcp {
+            let request = early_requests
+                .pop_front()
+                .or_else(|| request_rx.try_recv().ok());
+            match request {
+                Some(AfXdpReactorRequest::Dial(req)) => tcp_reactor.dial(req),
+                Some(AfXdpReactorRequest::InjectTcp {
                     route,
                     flow,
                     ip_packet,
@@ -1268,7 +1295,7 @@ pub(crate) async fn run_queue_bridge_loop(
                         admission_refusals = admission_refusals.saturating_add(1);
                     }
                 }
-                Ok(AfXdpReactorRequest::UdpEgress {
+                Some(AfXdpReactorRequest::UdpEgress {
                     link,
                     local,
                     remote,
@@ -1334,13 +1361,12 @@ pub(crate) async fn run_queue_bridge_loop(
                         }
                     }
                 }
-                Ok(AfXdpReactorRequest::PmtuUpdate { flow, mtu }) => {
+                Some(AfXdpReactorRequest::PmtuUpdate { flow, mtu }) => {
                     // T4-7: ICMP error quoting a dialed flow — clamp the
                     // session's send MSS to the reported next-hop MTU.
                     tcp_reactor.apply_pmtu(&flow, mtu);
                 }
-                Err(mpsc::error::TryRecvError::Empty)
-                | Err(mpsc::error::TryRecvError::Disconnected) => break,
+                None => break,
             }
         }
 
@@ -1572,10 +1598,12 @@ pub(crate) async fn run_queue_bridge_loop(
         let mut downstream_datagrams = 0usize;
         let mut downstream_budget_exhausted = false;
         for _ in 0..AF_XDP_DOWNSTREAM_DRAIN_BUDGET {
-            let datagram = match downstream_rx.try_recv() {
-                Ok(datagram) => datagram,
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            let datagram = match early_downstream
+                .pop_front()
+                .or_else(|| downstream_rx.try_recv().ok())
+            {
+                Some(datagram) => datagram,
+                None => break,
             };
             downstream_datagrams = downstream_datagrams.saturating_add(1);
             let now_ms = crate::udp_proxy::udp_activity_now_ms();
@@ -1745,10 +1773,9 @@ pub(crate) async fn run_queue_bridge_loop(
         // this thread's interface but were drained by a reactor on another
         // interface.
         for _ in 0..AF_XDP_DOWNSTREAM_DRAIN_BUDGET {
-            let fwd = match fwd_rx.try_recv() {
-                Ok(fwd) => fwd,
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            let fwd = match early_fwd.pop_front().or_else(|| fwd_rx.try_recv().ok()) {
+                Some(fwd) => fwd,
+                None => break,
             };
             // T8: resolve to a sendable unit first so shaping and ring
             // backpressure defer the same object the live path sent.
@@ -1997,21 +2024,58 @@ pub(crate) async fn run_queue_bridge_loop(
             }
         }
 
+        // Idle rounds go to an event-driven wait — whichever arrives
+        // first: an XSK RX frame, a queued channel item, a stream-egress
+        // notify, or the next smoltcp timer deadline. There is no
+        // fixed-rate poll loop; housekeeping latency stays bounded by the
+        // timer deadline or the safety cap. `has_queued_work` guards
+        // sources that carry no wake signal of their own (hot sessions,
+        // drained-but-unpumped wake marks, leftover ingress).
         if proxy_bridge_should_idle(
             polled_packets,
             parsed_frames,
             downstream_datagrams,
             tcp_egress_frames,
             downstream_budget_exhausted,
-        ) {
-            std::hint::spin_loop();
-            // Async sleep, not std::thread::sleep: the timer yields to the
-            // current-thread scheduler so spawned proxy tasks can run while
-            // the reactor backs off.
-            tokio::time::sleep(idle_backoff).await;
-            idle_backoff = (idle_backoff.saturating_mul(2)).min(AF_XDP_IDLE_BACKOFF_MAX);
-        } else {
-            idle_backoff = AF_XDP_IDLE_BACKOFF_MIN;
+        ) && !tcp_reactor.has_queued_work()
+        {
+            let wait = tcp_reactor
+                .next_timer_delay()
+                .unwrap_or(AF_XDP_IDLE_WAIT_CAP)
+                .clamp(AF_XDP_IDLE_WAIT_FLOOR, AF_XDP_IDLE_WAIT_CAP);
+            let wake_notify = tcp_reactor.wake_notify();
+            // `is_closed` guards are load-bearing: a receiver whose
+            // sender was dropped resolves `recv()` instantly every poll
+            // (e.g. per-queue `fwd_rx` for all but the first queue — its
+            // sender is dropped by the iface_fwd map), which would turn
+            // the idle wait into a hot loop on exactly those queues.
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                item = downstream_rx.recv(), if !downstream_rx.is_closed() => {
+                    if let Some(item) = item {
+                        early_downstream.push_back(item);
+                    }
+                }
+                item = fwd_rx.recv(), if !fwd_rx.is_closed() => {
+                    if let Some(item) = item {
+                        early_fwd.push_back(item);
+                    }
+                }
+                item = request_rx.recv(), if !request_rx.is_closed() => {
+                    if let Some(item) = item {
+                        early_requests.push_back(item);
+                    }
+                }
+                _ = wake_notify.notified() => {}
+                guard = wait_xsk_readable(&xsk_rx_ready) => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(mut guard) = guard {
+                        guard.clear_ready();
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = guard;
+                }
+            }
         }
         // The busy path above never awaits; without an explicit yield the
         // current-thread runtime starves tokio::spawn'ed TCP/HTTP proxy
@@ -2019,6 +2083,23 @@ pub(crate) async fn run_queue_bridge_loop(
         // is ever polled).
         tokio::task::yield_now().await;
     }
+}
+
+/// Idle-wake arm for the XSK receive ring — resolves `Some(guard)` when
+/// the fd signals POLLIN; pending forever when no socket exists (tests).
+#[cfg(target_os = "linux")]
+async fn wait_xsk_readable<'a>(
+    fd: &'a Option<tokio::io::unix::AsyncFd<std::os::fd::BorrowedFd<'static>>>,
+) -> Option<tokio::io::unix::AsyncFdReadyGuard<'a, std::os::fd::BorrowedFd<'static>>> {
+    match fd {
+        Some(fd) => fd.readable().await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn wait_xsk_readable(_: &Option<()>) -> Option<()> {
+    std::future::pending().await
 }
 
 #[cfg(any(test, target_os = "linux"))]

@@ -108,6 +108,18 @@ pub(crate) const AF_XDP_TCP_BUDGET_STALL_MAX: usize = 2 * AF_XDP_TCP_MAX_SESSION
 pub(crate) const AF_XDP_TCP_SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Unverified (pre-proxy) sessions hold a bounded share of the session
+/// table: a peer that has not completed handshake + first payload is the
+/// cheapest class to churn under pressure — scanners and SYN floods must
+/// never displace verified proxied or dialed flows.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_PRE_PROXY_MIN_BUDGET: usize = 256;
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_PRE_PROXY_BUDGET_DIVISOR: usize = 8;
+/// Per-source-IP cap on unverified sessions — one address can churn its
+/// own pre-proxy slots but cannot hold the whole unverified budget.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_PRE_PROXY_PER_IP_LIMIT: usize = 64;
 /// T4: absolute connect deadline for node-dialed flows — covers the full
 /// SYN retrain sequence; a session still not Established past it is
 /// aborted and the dial answered with a timeout, never left lingering.
@@ -153,6 +165,16 @@ static AF_XDP_TCP_DIAG_INGRESS_BUDGET_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// or a stream write suspended.
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_BUDGET_STALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_SESSIONS_CURRENT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_PER_IP_EVICTED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// T1: live per-session transport snapshots surfaced through /status.
 /// Queue workers refresh their rows during each amortized sweep; rows are
@@ -204,6 +226,30 @@ pub(crate) fn reset_tcp_diag() {
     AF_XDP_TCP_DIAG_WAKE_SIGNALS.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_INGRESS_BUDGET_DROPPED.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_BUDGET_STALLS.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_SESSIONS_CURRENT.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_PER_IP_EVICTED.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED.store(0, Ordering::Relaxed);
+}
+
+/// Compact scalar-only diag line for periodic journal visibility —
+/// per-session rows stay in `tcp_diag_snapshot` for the status endpoint.
+#[cfg(target_os = "linux")]
+pub fn tcp_diag_scalars() -> serde_json::Value {
+    serde_json::json!({
+        "sessions": AF_XDP_TCP_DIAG_SESSIONS_CURRENT.load(Ordering::Relaxed),
+        "preProxy": AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT.load(Ordering::Relaxed),
+        "accepted": AF_XDP_TCP_DIAG_ACCEPTED.load(Ordering::Relaxed),
+        "refusedAtCapacity": AF_XDP_TCP_DIAG_REFUSED_AT_CAPACITY.load(Ordering::Relaxed),
+        "preProxyTimeout": AF_XDP_TCP_DIAG_PRE_PROXY_TIMEOUT.load(Ordering::Relaxed),
+        "preProxyEvicted": AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED.load(Ordering::Relaxed),
+        "perIpPreProxyEvicted": AF_XDP_TCP_DIAG_PER_IP_EVICTED.load(Ordering::Relaxed),
+        "preProxyRefused": AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED.load(Ordering::Relaxed),
+        "proxyStarted": AF_XDP_TCP_DIAG_PROXY_STARTED.load(Ordering::Relaxed),
+        "ingressQueueDropped": AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED.load(Ordering::Relaxed),
+        "queueBudgetStalls": AF_XDP_TCP_DIAG_BUDGET_STALLS.load(Ordering::Relaxed),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -222,6 +268,11 @@ pub(crate) fn tcp_diag_snapshot() -> serde_json::Value {
         "wakeSignals": AF_XDP_TCP_DIAG_WAKE_SIGNALS.load(Ordering::Relaxed),
         "ingressBudgetDropped": AF_XDP_TCP_DIAG_INGRESS_BUDGET_DROPPED.load(Ordering::Relaxed),
         "queueBudgetStalls": AF_XDP_TCP_DIAG_BUDGET_STALLS.load(Ordering::Relaxed),
+        "sessionsCurrent": AF_XDP_TCP_DIAG_SESSIONS_CURRENT.load(Ordering::Relaxed),
+        "preProxyCurrent": AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT.load(Ordering::Relaxed),
+        "preProxyEvicted": AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED.load(Ordering::Relaxed),
+        "perIpPreProxyEvicted": AF_XDP_TCP_DIAG_PER_IP_EVICTED.load(Ordering::Relaxed),
+        "preProxyRefused": AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED.load(Ordering::Relaxed),
         "tcpQueueBytes": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes(),
         "tcpQueueBytesBudget": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes_budget(),
         "sessions": tcp_session_snapshots_json(),

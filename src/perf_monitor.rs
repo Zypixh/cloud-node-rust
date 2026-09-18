@@ -486,6 +486,13 @@ async fn handle_connection(mut stream: TcpStream, store: SharedStore) -> std::io
             let latest = store.read().await.samples.back().cloned();
             respond_json(&mut stream, 200, &latest).await
         }
+        ("GET", "/api/afxdp") => {
+            #[cfg(target_os = "linux")]
+            let body = crate::xdp::af_xdp::tcp_diag_snapshot();
+            #[cfg(not(target_os = "linux"))]
+            let body = serde_json::json!({"supported": false});
+            respond_json(&mut stream, 200, &body).await
+        }
         ("POST", "/api/clear") | ("GET", "/api/clear") => {
             store.write().await.samples.clear();
             respond_json(&mut stream, 200, &serde_json::json!({"ok": true})).await

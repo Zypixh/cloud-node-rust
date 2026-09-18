@@ -87,6 +87,10 @@ pub struct AfXdpTcpStream {
     /// EN-17: after queueing egress bytes the stream marks its flow dirty in
     /// the shared wake set so the session is pumped without a table scan.
     wake: Option<(AfXdpTcpFlowKey, Arc<DashMap<AfXdpTcpFlowKey, ()>>)>,
+    /// Optional interrupt for the reactor's event-driven idle wait —
+    /// without it a queued egress write would only be noticed at the next
+    /// poll round.
+    wake_notify: Option<Arc<tokio::sync::Notify>>,
     /// EN-17/F3: shared stall registry — a writer suspended on the queue
     /// byte budget registers here and the reactor wakes it on headroom.
     budget_stall: AfXdpTcpBudgetStallSet,
@@ -518,6 +522,9 @@ pub(crate) struct AfXdpTcpReactor {
     /// entry per live flow plus in-flight stale keys), insert is lossless
     /// (no "full" path), and the map key dedups at enqueue time.
     pub(crate) wake_set: Arc<DashMap<AfXdpTcpFlowKey, ()>>,
+    /// Streams signal this when they queue egress — the bridge's
+    /// event-driven idle wait wakes on it immediately instead of polling.
+    wake_notify: Arc<tokio::sync::Notify>,
     /// EN-17: incremental sweep cursor — a bounded batch is processed per
     /// round instead of one unbounded full-table pass. `sweep_active`
     /// distinguishes "a cycle is mid-flight" from "idle between cycles":
@@ -540,6 +547,14 @@ pub(crate) struct AfXdpTcpReactor {
     /// queue byte budget was exhausted. Re-marked hot (bounded retry) once
     /// the ledger has headroom again; TCP window shrinks meanwhile.
     ingress_stalled: std::collections::HashSet<AfXdpTcpFlowKey>,
+    /// Accepted sessions that have not started proxying yet (handshake or
+    /// first payload pending). This is the noise class — bounded by
+    /// `pre_proxy_budget()` and churned oldest-first under pressure so
+    /// scanners/SYN floods cannot occupy slots reserved for verified work.
+    pre_proxy_sessions: usize,
+    /// Per-source-IP count of the same unverified class — bounds
+    /// single-source half-open churn independently of the global budget.
+    pre_proxy_per_ip: HashMap<std::net::IpAddr, usize>,
     session_limit: usize,
     /// T1: monotonic µs transport clock — all protocol time (smoltcp
     /// instants, sweep cadence, idle reaping) derives from it; wall clock
@@ -623,6 +638,7 @@ impl AfXdpTcpReactor {
             sessions: HashMap::new(),
             hot_sessions: std::collections::VecDeque::new(),
             wake_set,
+            wake_notify: Arc::new(tokio::sync::Notify::new()),
             sweep_keys: Vec::new(),
             sweep_pos: 0,
             sweep_active: false,
@@ -630,6 +646,8 @@ impl AfXdpTcpReactor {
             last_retain: SmoltcpInstant::from_millis(0),
             budget_stall: Arc::new(parking_lot::Mutex::new(Vec::new())),
             ingress_stalled: std::collections::HashSet::new(),
+            pre_proxy_sessions: 0,
+            pre_proxy_per_ip: HashMap::new(),
             session_limit: session_limit.max(1),
             clock: TransportClock::real(),
             label: String::new(),
@@ -1166,6 +1184,34 @@ impl AfXdpTcpReactor {
         Some(self.tx_scratch.clone())
     }
 
+    /// Work already queued for the reactor — hot sessions, dirty wake
+    /// marks or undrained ingress. None of these carries its own wake
+    /// source, so the bridge must not enter an event wait while any is
+    /// non-empty.
+    pub(crate) fn has_queued_work(&self) -> bool {
+        !self.hot_sessions.is_empty()
+            || !self.wake_set.is_empty()
+            || !self.device.ingress.is_empty()
+    }
+
+    /// Shared notify the stream tasks signal when they queue egress —
+    /// the bridge waits on it so a writer's bytes are pumped immediately
+    /// rather than at the next poll round.
+    pub(crate) fn wake_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.wake_notify.clone()
+    }
+
+    /// Time until the smoltcp stack next needs polling (retransmit,
+    /// delayed ACK, time-wait expiry). `poll_delay` returns a relative
+    /// duration. None when no timer is armed — the only remaining wake
+    /// sources are RX frames and channel items.
+    pub(crate) fn next_timer_delay(&mut self) -> Option<Duration> {
+        let now = SmoltcpInstant::from_micros(self.clock.now_micros());
+        self.iface
+            .poll_delay(now, &self.sockets)
+            .map(|delay| Duration::from_micros(delay.total_micros()))
+    }
+
     /// EN-17 test hooks: observe hot-set scheduling state.
     #[cfg(test)]
     pub(crate) fn hot_session_count(&self) -> usize {
@@ -1194,6 +1240,20 @@ impl AfXdpTcpReactor {
     #[cfg(test)]
     pub(crate) fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Test hook: count of sessions still in the unverified (pre-proxy)
+    /// class — the budgeted noise pool.
+    #[cfg(test)]
+    pub(crate) fn pre_proxy_session_count(&self) -> usize {
+        self.pre_proxy_sessions
+    }
+
+    /// Test hook: the bounded share of the table the unverified class may
+    /// hold at this session limit.
+    #[cfg(test)]
+    pub(crate) fn pre_proxy_budget_for_test(&self) -> usize {
+        self.pre_proxy_budget()
     }
 
     #[cfg(test)]
@@ -1237,7 +1297,28 @@ impl AfXdpTcpReactor {
             session.last_activity = now;
             return true;
         }
-        if self.sessions.len() >= self.session_limit {
+        let peer_ip = flow.peer_addr.ip();
+        // Admission is tiered, never first-come-at-any-price: when space is
+        // short the oldest still-unverified session is sacrificed first —
+        // its peer committed nothing and a retransmitted SYN starts over,
+        // while established proxied and node-dialed flows carry real work.
+        // Only a table with nothing evictable left refuses.
+        if self.sessions.len() >= self.session_limit && !self.evict_oldest_pre_proxy(None) {
+            return false;
+        }
+        if self.pre_proxy_per_ip.get(&peer_ip).copied().unwrap_or(0)
+            >= AF_XDP_TCP_PRE_PROXY_PER_IP_LIMIT
+            && !self.evict_oldest_pre_proxy(Some(peer_ip))
+        {
+            #[cfg(target_os = "linux")]
+            AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if self.pre_proxy_sessions >= self.pre_proxy_budget()
+            && !self.evict_oldest_pre_proxy(None)
+        {
+            #[cfg(target_os = "linux")]
+            AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
@@ -1300,12 +1381,117 @@ impl AfXdpTcpReactor {
             dial_reply: None,
             dial_deadline: None,
         };
+        let count_pre_proxy = !session.proxy_started;
         self.sessions.insert(flow, session);
+        if count_pre_proxy {
+            self.note_pre_proxy_admitted(peer_ip);
+        }
+        self.publish_session_gauges();
         #[cfg(target_os = "linux")]
         if let Some(session) = self.sessions.get(&flow) {
             self.publish_session_snapshot(&flow, session);
         }
         true
+    }
+
+    /// Bounded share of the session table available to still-unverified
+    /// (pre-proxy) sessions — one eighth of capacity, floored so small
+    /// limits still admit handshakes, capped so it never exceeds the
+    /// table itself.
+    fn pre_proxy_budget(&self) -> usize {
+        (self.session_limit / AF_XDP_TCP_PRE_PROXY_BUDGET_DIVISOR)
+            .max(AF_XDP_TCP_PRE_PROXY_MIN_BUDGET)
+            .min(self.session_limit)
+    }
+
+    fn note_pre_proxy_admitted(&mut self, peer_ip: std::net::IpAddr) {
+        self.pre_proxy_sessions = self.pre_proxy_sessions.saturating_add(1);
+        *self.pre_proxy_per_ip.entry(peer_ip).or_insert(0) += 1;
+    }
+
+    /// A session left the unverified class — graduated to proxying,
+    /// reaped, or evicted.
+    fn note_pre_proxy_departed(&mut self, peer_ip: std::net::IpAddr) {
+        self.pre_proxy_sessions = self.pre_proxy_sessions.saturating_sub(1);
+        if let Some(count) = self.pre_proxy_per_ip.get_mut(&peer_ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.pre_proxy_per_ip.remove(&peer_ip);
+            }
+        }
+    }
+
+    /// Evict the oldest still-unverified session (optionally restricted to
+    /// one peer IP) so a new admission can take its slot. The session is
+    /// reaped synchronously — the slot is free before the caller proceeds.
+    /// Returns false when nothing evictable exists (every unverified slot
+    /// is already closing, or the table holds only verified flows).
+    fn evict_oldest_pre_proxy(&mut self, only_peer: Option<std::net::IpAddr>) -> bool {
+        let victim = self
+            .sessions
+            .iter()
+            .filter(|(flow, session)| {
+                !session.proxy_started
+                    && !session.dialed
+                    && !session.closing
+                    && only_peer.map_or(true, |ip| flow.peer_addr.ip() == ip)
+            })
+            .min_by_key(|(_, session)| session.created_at)
+            .map(|(flow, _)| *flow);
+        let Some(flow) = victim else {
+            return false;
+        };
+        self.ingress_stalled.remove(&flow);
+        #[cfg(target_os = "linux")]
+        self.drop_session_snapshot(&flow);
+        if let Some(session) = self.sessions.remove(&flow) {
+            let socket = self
+                .sockets
+                .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
+            socket.abort();
+            let _ = self.sockets.remove(session.socket);
+        }
+        self.note_pre_proxy_departed(flow.peer_addr.ip());
+        self.publish_session_gauges();
+        #[cfg(target_os = "linux")]
+        if only_peer.is_some() {
+            AF_XDP_TCP_DIAG_PER_IP_EVICTED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_l4_event_for_ip(
+            flow.peer_addr.ip(),
+            crate::l4_defense::L4DefenseKind::SynBacklogPressure,
+            crate::l4_defense::L4PressureLevel::High,
+            format!(
+                "peer={} local={} phase=af_xdp_pre_proxy_evicted sessions={} pre_proxy={} budget={} per_ip={}",
+                flow.peer_addr,
+                flow.local_addr,
+                self.sessions.len(),
+                self.pre_proxy_sessions,
+                self.pre_proxy_budget(),
+                only_peer.is_some(),
+            ),
+        );
+        tracing::debug!(
+            "AF_XDP TCP reactor evicted oldest pre-proxy session local={} peer={} pre_proxy={} budget={} per_ip={}",
+            flow.local_addr,
+            flow.peer_addr,
+            self.pre_proxy_sessions,
+            self.pre_proxy_budget(),
+            only_peer.is_some(),
+        );
+        true
+    }
+
+    fn publish_session_gauges(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            AF_XDP_TCP_DIAG_SESSIONS_CURRENT
+                .store(self.sessions.len() as u64, Ordering::Relaxed);
+            AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT
+                .store(self.pre_proxy_sessions as u64, Ordering::Relaxed);
+        }
     }
 
     /// T4: the bridge installs the generation's dial registry before the
@@ -1336,6 +1522,11 @@ impl AfXdpTcpReactor {
                 format!("AF_XDP dialed flow {} -> {} already exists", req.local, req.remote),
             )));
             return;
+        }
+        // A node-dialed flow is verified work by definition — inbound
+        // noise holding unverified slots must not starve it.
+        if self.sessions.len() >= self.session_limit {
+            self.evict_oldest_pre_proxy(None);
         }
         if self.sessions.len() >= self.session_limit {
             let _ = req.reply.send(Err(io::Error::new(
@@ -1404,6 +1595,7 @@ impl AfXdpTcpReactor {
         };
         self.sessions.insert(flow, session);
         self.mark_hot(flow);
+        self.publish_session_gauges();
         #[cfg(target_os = "linux")]
         if let Some(session) = self.sessions.get(&flow) {
             self.publish_session_snapshot(&flow, session);
@@ -1497,13 +1689,14 @@ impl AfXdpTcpReactor {
         http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
         session: &mut AfXdpTcpSession,
         wake_set: Arc<DashMap<AfXdpTcpFlowKey, ()>>,
+        wake_notify: Arc<tokio::sync::Notify>,
         budget_stall: AfXdpTcpBudgetStallSet,
     ) -> bool {
         let peer_addr = session.flow.peer_addr;
         let listen_addr = session.flow.local_addr;
         let listen_port = listen_addr.port();
         let AfXdpTcpStreamParts {
-            stream,
+            mut stream,
             ingress_tx,
             egress_rx,
             budget_stall: _,
@@ -1513,6 +1706,7 @@ impl AfXdpTcpReactor {
             wake_set,
             budget_stall,
         );
+        stream.set_wake_notify(wake_notify);
         match session.proxy_class {
             AfXdpTcpProxyClass::TcpPlain | AfXdpTcpProxyClass::TcpTls => {
                 let Some(tcp_manager) = tcp_manager else {
@@ -1767,7 +1961,7 @@ impl AfXdpTcpReactor {
                 match socket.state() {
                     SmoltcpTcp::State::Established | SmoltcpTcp::State::CloseWait => {
                         let AfXdpTcpStreamParts {
-                            stream,
+                            mut stream,
                             ingress_tx,
                             egress_rx,
                             ..
@@ -1777,6 +1971,7 @@ impl AfXdpTcpReactor {
                             self.wake_set.clone(),
                             self.budget_stall.clone(),
                         );
+                        stream.set_wake_notify(self.wake_notify.clone());
                         session.ingress_tx = Some(ingress_tx);
                         session.egress_rx = Some(egress_rx);
                         session.proxy_started = true;
@@ -1839,12 +2034,30 @@ impl AfXdpTcpReactor {
                         http_manager.clone(),
                         session,
                         self.wake_set.clone(),
+                        self.wake_notify.clone(),
                         self.budget_stall.clone(),
                     ) {
                         socket.abort();
                         session.closing = true;
                         return;
                     }
+                    // The session just graduated out of the unverified
+                    // class (spawn sets proxy_started). Disjoint field
+                    // borrows: `session` borrows self.sessions while these
+                    // counters are separate fields.
+                    self.pre_proxy_sessions =
+                        self.pre_proxy_sessions.saturating_sub(1);
+                    if let Some(count) =
+                        self.pre_proxy_per_ip.get_mut(&flow.peer_addr.ip())
+                    {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            self.pre_proxy_per_ip.remove(&flow.peer_addr.ip());
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT
+                        .store(self.pre_proxy_sessions as u64, Ordering::Relaxed);
                 } else {
                     // A pre-proxy socket that reached a terminal state on
                     // its own (peer RST during the handshake) has no
@@ -2117,6 +2330,10 @@ impl AfXdpTcpReactor {
             #[cfg(target_os = "linux")]
             self.drop_session_snapshot(&flow);
             if let Some(mut session) = self.sessions.remove(&flow) {
+                if !session.proxy_started && !session.dialed {
+                    self.note_pre_proxy_departed(flow.peer_addr.ip());
+                }
+                self.publish_session_gauges();
                 if session.dialed {
                     // T4: every terminal reap of a dialed flow releases
                     // its registry state (source port, demux entry,
@@ -2207,9 +2424,51 @@ impl AfXdpTcpReactor {
         {
             return;
         }
-        self.cached_pressure_level = crate::l4_defense::current_pressure_level();
-        self.cached_proxy_idle_timeout = effective_af_xdp_tcp_idle_timeout();
+        // Session occupancy is its own pressure channel: the shared L4
+        // ladder is computed from connection-admission bytes, kernel SYN
+        // backlog and fd usage — none of which see the smoltcp session
+        // table. Without this feed the table could fill to the refusal
+        // limit while pressure stayed Normal, so the timeout ladder and
+        // pre-proxy budget never tightened before capacity ran out.
+        self.cached_pressure_level = crate::l4_defense::current_pressure_level()
+            .max(af_xdp_session_occupancy_pressure_level(
+                self.sessions.len(),
+                self.session_limit,
+            ));
+        // Occupancy also tightens the established-session idle timeout:
+        // a table under real pressure sheds its idlest verified sessions
+        // first, so slow-drip keepalive traffic cannot hold the table.
+        self.cached_proxy_idle_timeout = match self.cached_pressure_level {
+            crate::l4_defense::L4PressureLevel::Critical => effective_af_xdp_tcp_idle_timeout()
+                .min(Duration::from_secs(60)),
+            crate::l4_defense::L4PressureLevel::High => effective_af_xdp_tcp_idle_timeout()
+                .min(Duration::from_secs(120)),
+            _ => effective_af_xdp_tcp_idle_timeout(),
+        };
         self.idle_profile_refreshed_at = now;
+    }
+}
+
+/// Session-table occupancy mapped onto the same 70/85/95 escalation
+/// thresholds the shared utilization ladder uses. Kept separate from
+/// `utilization_pressure_level_hysteretic` because that function owns
+/// global hysteresis state for the byte-based connection signal.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn af_xdp_session_occupancy_pressure_level(
+    sessions: usize,
+    session_limit: usize,
+) -> crate::l4_defense::L4PressureLevel {
+    let pct = (sessions as u64)
+        .saturating_mul(100)
+        .saturating_div(session_limit.max(1) as u64);
+    if pct >= 95 {
+        crate::l4_defense::L4PressureLevel::Critical
+    } else if pct >= 85 {
+        crate::l4_defense::L4PressureLevel::High
+    } else if pct >= 70 {
+        crate::l4_defense::L4PressureLevel::Elevated
+    } else {
+        crate::l4_defense::L4PressureLevel::Normal
     }
 }
 
@@ -2393,6 +2652,7 @@ impl AfXdpTcpStream {
                 incoming_rx,
                 outgoing_tx: Some(outgoing_tx),
                 wake: None,
+                wake_notify: None,
                 budget_stall: budget_stall.clone(),
                 read_buf: AfXdpTcpChargedBytes::empty(),
                 write_permit: None,
@@ -2440,12 +2700,22 @@ impl AfXdpTcpStream {
         Self::channel_pair(AF_XDP_TCP_STREAM_CHANNEL_DEPTH)
     }
 
+    /// Attach the reactor's wake notify — `signal_wake` then also
+    /// interrupts the reactor's event-driven idle wait instead of only
+    /// being noticed at the next poll round.
+    pub(crate) fn set_wake_notify(&mut self, notify: Arc<tokio::sync::Notify>) {
+        self.wake_notify = Some(notify);
+    }
+
     /// Mark this flow dirty for the reactor. Insert is lossless and dedup'd
     /// by the map — a second mark while the entry is still pending costs
     /// nothing and nothing can be dropped.
     fn signal_wake(&self) {
         if let Some((flow, set)) = &self.wake {
             set.insert(*flow, ());
+        }
+        if let Some(notify) = &self.wake_notify {
+            notify.notify_one();
         }
     }
 }
