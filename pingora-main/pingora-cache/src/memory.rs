@@ -445,7 +445,7 @@ mod test {
         let internal = crate::meta::InternalMeta::default();
         CacheMeta(Box::new(crate::meta::CacheMetaInner {
             internal,
-            header,
+            header: header.into(),
             extensions: http::Extensions::new(),
         }))
     }
