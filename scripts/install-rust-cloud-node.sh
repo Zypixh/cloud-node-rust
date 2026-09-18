@@ -32,6 +32,10 @@ NODE_SECRET="${NODE_SECRET:-}"
 TIMEZONE="${TIMEZONE:-}"
 ASSUME_YES=0
 DRY_RUN=0
+# XDP dataplane is enabled by default (bidirectional: inbound proxy +
+# outbound AF_XDP upstream). --no-xdp / ENABLE_XDP=no opts out explicitly.
+ENABLE_XDP="${ENABLE_XDP:-yes}"
+XDP_IFACE="${XDP_IFACE:-}"
 
 # Backwards-compatible environment mappings from the previous installer.
 case "${START_MODE:-}" in
@@ -89,6 +93,14 @@ Options / 选项:
   --secret SECRET        secret for fresh install. / 全新安装的 secret。
   --timezone TZ          Set system timezone on fresh install, e.g. Asia/Shanghai.
                          全新安装时设置系统时区，例如 Asia/Shanghai。
+  --xdp                  Enable the XDP dataplane (default). Bidirectional:
+                         inbound proxy + outbound AF_XDP upstream.
+                         启用 XDP 数据面（默认）。双向：入向代理 + 出向 AF_XDP 回源。
+  --no-xdp               Disable the XDP dataplane explicitly.
+                         显式禁用 XDP 数据面。
+  --xdp-iface NAME       Bind XDP to interface NAME. Default: auto-detect the
+                         default-route interface.
+                         XDP 绑定的网卡名；默认自动探测默认路由网卡。
   --no-start             Do not start/restart the service after install.
                          安装后不启动/重启服务。
   --dry-run              Print actions without changing files.
@@ -101,7 +113,7 @@ Options / 选项:
 Environment variables with the same names are also supported:
   REPO, VERSION, SERVICE_NAME, INSTALL_DIR, INSTALL_BINARY, BACKUP_ROOT,
   AUTO_START, GEOIP_DIR, GEOIP_BASE_URL, RESTORE_BACKUP, API_ENDPOINTS,
-  NODE_ID, NODE_SECRET, TIMEZONE.
+  NODE_ID, NODE_SECRET, TIMEZONE, ENABLE_XDP, XDP_IFACE.
 USAGE
 }
 
@@ -434,6 +446,18 @@ while [ "$#" -gt 0 ]; do
             ;;
         --timezone)
             TIMEZONE="${2:?missing timezone}"
+            shift 2
+            ;;
+        --xdp)
+            ENABLE_XDP="yes"
+            shift
+            ;;
+        --no-xdp)
+            ENABLE_XDP="no"
+            shift
+            ;;
+        --xdp-iface)
+            XDP_IFACE="${2:?missing interface name}"
             shift 2
             ;;
         --no-start)
@@ -1236,6 +1260,17 @@ find_existing_api_config() {
     done
 }
 
+existing_api_config_path() {
+    [ -n "$EXISTING_API_CONFIG_DIR" ] || return 1
+    if [ -e "$EXISTING_API_CONFIG_DIR/configs/api_node.yaml" ]; then
+        printf '%s\n' "$EXISTING_API_CONFIG_DIR/configs/api_node.yaml"
+    elif [ -e "$EXISTING_API_CONFIG_DIR/api_node.yaml" ]; then
+        printf '%s\n' "$EXISTING_API_CONFIG_DIR/api_node.yaml"
+    else
+        return 1
+    fi
+}
+
 glibc_is_older_than_228() {
     local version=""
     local major=""
@@ -1319,6 +1354,11 @@ geoip_url_for() {
         # repository owner.
         printf 'https://github.com/%s/raw/main/geoip/%s\n' "$REPO" "$name"
     fi
+}
+
+default_route_iface() {
+    command -v ip >/dev/null 2>&1 || return 0
+    ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
 }
 
 nic_driver() {
@@ -1416,9 +1456,7 @@ report_nic_xdp() {
         return 0
     fi
 
-    if command -v ip >/dev/null 2>&1; then
-        default_iface="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-    fi
+    default_iface="$(default_route_iface)"
 
     for path in /sys/class/net/*; do
         iface="$(basename "$path")"
@@ -1539,6 +1577,34 @@ collect_api_config() {
     [ -n "$NODE_SECRET" ] || die "no existing api_node.yaml found; fresh install requires --secret" "未找到可迁移的 api_node.yaml；全新安装需要 --secret"
 }
 
+# Interactive XDP dataplane choice. Default is enabled (bidirectional:
+# inbound proxy + outbound AF_XDP upstream). Skipped when an existing
+# config already defines an xdp: section — that config stays authoritative.
+collect_xdp_choice() {
+    local cfg=""
+    if [ "$IS_FRESH" -eq 0 ]; then
+        cfg="$(existing_api_config_path || true)"
+        if [ -n "$cfg" ] && grep -q '^xdp:' "$cfg" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    if prompt_available && [ "$ASSUME_YES" -eq 0 ]; then
+        if ask_yes_no \
+            "启用 XDP 数据面？（双向：入向代理 + 出向 AF_XDP 回源）" \
+            "Enable XDP dataplane? (bidirectional: inbound proxy + outbound AF_XDP upstream)" \
+            "yes"; then
+            ENABLE_XDP="yes"
+        else
+            ENABLE_XDP="no"
+        fi
+    fi
+    if [ "$ENABLE_XDP" = "yes" ]; then
+        log "XDP dataplane: enabled (bidirectional)" "XDP 数据面：启用（双向）"
+    else
+        log "XDP dataplane: disabled" "XDP 数据面：禁用"
+    fi
+}
+
 migrate_runtime_layout() {
     local config_path="$INSTALL_DIR/configs/api_node.yaml"
     local config_candidate=""
@@ -1603,6 +1669,31 @@ migrate_runtime_layout() {
     done
 }
 
+# Emits the xdp: YAML block. Enabled (default) means the bidirectional
+# dataplane: inbound XDP/AF_XDP proxy plus node-originated upstream TCP via
+# the AF_XDP dial path (upstream.mode=afxdp). Disabled writes an explicit
+# enabled: false so the runtime default-on is overridden observably.
+write_xdp_config_block() {
+    local iface="$XDP_IFACE"
+    if [ "$ENABLE_XDP" != "yes" ]; then
+        printf 'xdp:\n'
+        printf '  enabled: false\n'
+        return
+    fi
+    [ -n "$iface" ] || iface="$(default_route_iface || true)"
+    printf 'xdp:\n'
+    printf '  enabled: true\n'
+    printf '  attachMode: auto\n'
+    if [ -n "$iface" ]; then
+        printf '  interfaces:\n'
+        printf '    - name: %s\n' "$(yaml_quote "$iface")"
+    else
+        printf '  interfaces: []\n'
+    fi
+    printf '  upstream:\n'
+    printf '    mode: afxdp\n'
+}
+
 write_api_node_config() {
     local config_path="$INSTALL_DIR/configs/api_node.yaml"
     local endpoint=""
@@ -1640,6 +1731,7 @@ write_api_node_config() {
             printf 'secret: %s\n' "$(yaml_quote "$NODE_SECRET")"
             printf 'relay:\n'
             printf '  zeroCopy: false\n'
+            write_xdp_config_block
         } > "$config_path"
         chmod 0600 "$config_path" 2>/dev/null || true
     else
@@ -1648,6 +1740,41 @@ write_api_node_config() {
         printf '  nodeId: %s\n' "$(yaml_quote "$NODE_ID")"
         printf '  secret: ******\n'
         printf '  relay.zeroCopy: false\n'
+        write_xdp_config_block | sed 's/^/  /'
+    fi
+}
+
+# Appends the xdp: block to a migrated config that never defined one, so
+# upgrades get the same explicit bidirectional default as fresh installs.
+# A config that already has an xdp: key is authoritative and never touched.
+ensure_existing_config_xdp() {
+    local cfg=""
+    # Runs after migrate_runtime_layout, so the installed copy is the target;
+    # fall back to the discovered source path only when nothing was copied.
+    if [ -e "$INSTALL_DIR/configs/api_node.yaml" ]; then
+        cfg="$INSTALL_DIR/configs/api_node.yaml"
+    else
+        cfg="$(existing_api_config_path || true)"
+    fi
+    [ -n "$cfg" ] || return 0
+    if grep -q '^xdp:' "$cfg" 2>/dev/null; then
+        return 0
+    fi
+    if [ -e "$cfg" ]; then
+        run cp -a "$cfg" "$BACKUP_DIR/api_node.yaml.pre-xdp"
+    fi
+    if [ "$DRY_RUN" -eq 0 ]; then
+        printf '\n' >> "$cfg"
+        write_xdp_config_block >> "$cfg"
+    else
+        log "+ append xdp block to $cfg"
+        write_xdp_config_block | sed 's/^/  /'
+    fi
+    if [ "$ENABLE_XDP" = "yes" ]; then
+        ok "appended xdp.enabled=true + upstream.mode=afxdp (bidirectional) to $cfg" \
+            "已在 $cfg 追加 xdp.enabled=true + upstream.mode=afxdp（双向 XDP）"
+    else
+        ok "appended xdp.enabled=false to $cfg" "已在 $cfg 追加 xdp.enabled=false"
     fi
 }
 
@@ -1894,6 +2021,7 @@ if [ -z "$EXISTING_API_CONFIG_DIR" ]; then
 fi
 
 collect_api_config
+collect_xdp_choice
 
 BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
 ASSET_NAME="$(detect_asset_name)"
@@ -2065,6 +2193,7 @@ else
 fi
 
 write_api_node_config
+ensure_existing_config_xdp
 
 if [ "$DRY_RUN" -eq 0 ]; then
     (cd "$INSTALL_DIR" && "$INSTALL_BINARY" install)
