@@ -145,6 +145,7 @@ pub async fn proxy_smoke(
     duration: std::time::Duration,
     ready_file: Option<std::path::PathBuf>,
     kernel_mode: bool,
+    remote: Option<std::net::IpAddr>,
 ) -> anyhow::Result<serde_json::Value> {
     af_xdp::reset_tcp_diag();
     crate::tcp_proxy::reset_af_xdp_tcp_proxy_diag();
@@ -152,12 +153,12 @@ pub async fn proxy_smoke(
     let ports = xdp_proxy_smoke_ports(&manager.config)?;
 
     if kernel_mode {
-        return proxy_smoke_kernel(ports, duration, ready_file).await;
+        return proxy_smoke_kernel(ports, duration, ready_file, remote).await;
     }
 
     manager.initialize().await?;
     start_rule_sweeper(&manager);
-    let services = match XdpProxySmokeServices::start().await {
+    let services = match XdpProxySmokeServices::start(remote).await {
         Ok(services) => services,
         Err(err) => {
             if let Err(detach_err) = detach(false).await {
@@ -207,7 +208,7 @@ pub async fn proxy_reload_smoke(
         .await
         .map_err(|err| anyhow::anyhow!("AF_XDP reload initial initialize failed: {err}"))?;
     start_rule_sweeper(&old_manager);
-    let services = match XdpProxySmokeServices::start().await {
+    let services = match XdpProxySmokeServices::start(None).await {
         Ok(services) => services,
         Err(err) => {
             if let Err(detach_err) = detach(false).await {
@@ -375,7 +376,7 @@ pub async fn dial_smoke(
     let ports = xdp_proxy_smoke_ports(&manager.config)?;
     manager.initialize().await?;
     start_rule_sweeper(&manager);
-    let services = match XdpProxySmokeServices::start().await {
+    let services = match XdpProxySmokeServices::start(None).await {
         Ok(services) => services,
         Err(err) => {
             if let Err(detach_err) = detach(false).await {
@@ -708,8 +709,9 @@ async fn proxy_smoke_kernel(
     ports: XdpProxySmokePorts,
     duration: std::time::Duration,
     ready_file: Option<std::path::PathBuf>,
+    remote: Option<std::net::IpAddr>,
 ) -> anyhow::Result<serde_json::Value> {
-    let services = XdpProxySmokeServices::start().await?;
+    let services = XdpProxySmokeServices::start(remote).await?;
     let (quic_demux, tcp_manager, http_manager) =
         xdp_proxy_smoke_managers(&services, &ports).await?;
     let listener_tasks: Vec<tokio::task::JoinHandle<()>> = {
@@ -898,7 +900,12 @@ struct XdpProxySmokeServices {
 
 #[cfg(target_os = "linux")]
 impl XdpProxySmokeServices {
-    async fn start() -> anyhow::Result<Self> {
+    /// `remote = Some(ip)` points upstreams at a backend fleet on that host
+    /// (port convention: 19000 http/h3, 19002 tcp-echo, 19003 udp-echo,
+    /// 19005 sni-tls). The QUIC backend stays in-process — a remote QUIC
+    /// endpoint is not part of the remote fleet contract. Per-backend
+    /// counters stay zero in remote mode.
+    async fn start(remote: Option<std::net::IpAddr>) -> anyhow::Result<Self> {
         let http_requests = std::sync::Arc::new(AtomicU64::new(0));
         let https_requests = std::sync::Arc::new(AtomicU64::new(0));
         let tcp_connections = std::sync::Arc::new(AtomicU64::new(0));
@@ -906,6 +913,28 @@ impl XdpProxySmokeServices {
         let h3_requests = std::sync::Arc::new(AtomicU64::new(0));
         let sni_connections = std::sync::Arc::new(AtomicU64::new(0));
         let quic_requests = std::sync::Arc::new(AtomicU64::new(0));
+
+        if let Some(ip) = remote {
+            let (quic_addr, quic_task) =
+                start_xdp_smoke_quic_backend(quic_requests.clone()).await?;
+            return Ok(Self {
+                http_addr: std::net::SocketAddr::new(ip, 19000),
+                https_addr: std::net::SocketAddr::new(ip, 19000),
+                tcp_addr: std::net::SocketAddr::new(ip, 19002),
+                udp_addr: std::net::SocketAddr::new(ip, 19003),
+                h3_addr: std::net::SocketAddr::new(ip, 19000),
+                sni_addr: std::net::SocketAddr::new(ip, 19005),
+                quic_addr,
+                http_requests,
+                https_requests,
+                tcp_connections,
+                udp_datagrams,
+                h3_requests,
+                sni_connections,
+                quic_requests,
+                tasks: vec![quic_task],
+            });
+        }
 
         let (http_addr, http_task) =
             start_xdp_smoke_http_backend(http_requests.clone(), b"xdp-http-smoke\n").await?;
@@ -1602,6 +1631,7 @@ pub async fn proxy_smoke(
     _duration: std::time::Duration,
     _ready_file: Option<std::path::PathBuf>,
     _kernel_mode: bool,
+    _remote: Option<std::net::IpAddr>,
 ) -> anyhow::Result<serde_json::Value> {
     anyhow::bail!("XDP proxy smoke is supported on Linux only")
 }

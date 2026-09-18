@@ -441,6 +441,11 @@ enum XdpCommands {
         /// supplies the listen ports)
         #[arg(long)]
         kernel: bool,
+        /// Point upstreams at a remote backend fleet on this host instead of
+        /// spawning in-process backends (remote port convention: 19000 http,
+        /// 19002 tcp-echo, 19003 udp-echo, 19005 sni-tls; quic stays local)
+        #[arg(long)]
+        remote: Option<std::net::IpAddr>,
     },
     /// Verify an in-process XDP reload while AF_XDP proxy bridge is active
     #[command(name = "proxy-reload-smoke")]
@@ -1085,6 +1090,7 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             duration_ms,
             ready_file,
             kernel,
+            remote,
         } => {
             let runtime_config = RuntimeConfig::load_default()?;
             RuntimeConfig::set_current(runtime_config);
@@ -1092,8 +1098,9 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
                 .enable_all()
                 .build()?;
             let duration = Duration::from_millis(duration_ms.max(1));
-            let report =
-                rt.block_on(cloud_node_rust::xdp::proxy_smoke(duration, ready_file, kernel))?;
+            let report = rt.block_on(cloud_node_rust::xdp::proxy_smoke(
+                duration, ready_file, kernel, remote,
+            ))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         XdpCommands::ProxyReloadSmoke {
