@@ -87,4 +87,10 @@ kernel 臂说明：该机器为共享主机，另一租户节点通过 SO_REUSEP
 - 单元测试：`af_xdp_tcp` 相关 37 个测试全过；既有测试 `keeps_stream_read_side_open_during_half_close` 原断言"CloseWait 读端保持开放"——该断言本身编码了 bug，已修正为断言 CloseWait 必须 EOF；dial/governor 相关 53 个测试全过。
 - fd 限额告警：`memory_governor` 在 fd 派生限额低于类名义下限时输出一次性 warn（含类、实际限额、nofile soft、名义下限），`nofile=1024 → TcpConnection=128` 不再是黑盒。
 - **veth churn 复现验证（修复后，90s）**：FIN 半关闭 churn 1500 周期 @346/s + RST 中止 churn 1500 周期 @506/s，0 错误。报告计数器：`relayStart=3000 / relayDone=3000 / relayLeak=0`，`backendConnectStart=Ok=3000`，`sessions=0`，`drop=0 / xskDrops=0`。对比修复前同拓扑：`backendConnectOk=3696` vs `relayDone=3568`，差值恰 128 且 `sessions` 滞留——泄漏消除，终态会话在 250ms 扫表节奏内即时回收。
-- 验证范围说明：本轮为 veth-skb 拓扑（与先前本地复现同环境），验证的是缺陷机制本身；真机 ens17 drv 臂的吞吐复测与 ~99ms 拨号改善幅度需下一轮短程远端验证，尚未重测。
+- **真机 ens17 drv 臂修复后验证（2025-09-18，`xdp.upstream.mode=afxdp`，75s 窗口，churn 全程在窗口内）**：
+  - churn 探针从 .120 经 ~4ms WAN 打 `160.202.234.171:80`（AF_XDP 入向 + AF_XDP 上游双腿）：FIN 半关闭 250 周期 1 错误 @11.9/s；RST 中止 250 周期 0 错误 @21.9/s。
+  - 计数器：`backendConnectStart=501 / Ok=501 / Fail=0`——修复前同拓扑精确冻结在 128 的现象完全消失；`relayStart=501 / relayDone=500 / relayErrors=0`（差值 1 为服务停用快照瞬间的在途任务，非泄漏）；`sessions.total=38`（26 CLOSE-WAIT 为停用瞬间在途半关闭行，有界且不持有准入许可）；`drop=0 / mapMiss=0 / xskDrops=0 / refusedAtCapacity=0`。
+  - **路由缓存实测**：`/usr/bin/ip` wrapper 计数以进程内 PATH 观测子进程——501 次上游拨号共产生 66 次 `ip` 调用（22 组 route+neigh+link 解析，TTL=5s 到期重解析 + 并发 miss 少量重复）。无缓存应为 ~1503 次（501×3），**子进程开销减少 ~95.6%**。首拨冷缓存解析一次、TTL 内全命中，与实现一致。
+  - 同臂另一次窗口部分错位的运行（FIN 段 47s 超出节点 60s 存活）：`backendConnectStart=489 / Ok=488 / Fail=0`，同样无 128 冻结。
+- **fail-closed 契约顺带实测验证**：一次 PATH 缺 `/usr/sbin` 的运行中 `nft` 不可执行 → `ensure_dial_guard` 显式失败 → dial registry 不发布 → 全部 799 次拨号显式报 "no live AF_XDP dial registry"（`backendConnectFail=799`），**未发生任何静默内核回退**——证明缺失护栏时的显式报错路径按设计工作，且该错误路径不产生 `ip` 子进程（拨号在路由解析前拒绝）。
+- 验证范围说明：veth 与真机 ens17 均已验证缺陷机制修复（128 冻结消除、relay 任务随会话终止退出、准入许可正常流转、终态会话有界回收、拨号路由缓存生效）。上述为短程缺陷复现验证，非完整性能矩阵——修复后全协议吞吐对比仍需单独一轮完整基准；churn 速率（~12/s FIN、~22/s RST @8 workers）为功能探针口径，不代表吞吐上限。
