@@ -192,7 +192,7 @@ jobs:
           # bpf-linker's build script resolves LLVM via LLVM_PREFIX or via
           # llvm-config's location on PATH; /usr/bin/llvm-config resolves to
           # basedir=/usr which lacks libLLVM, so pin the real prefix.
-          echo "LLVM_PREFIX=$(llvm-config --prefix)" >> "$GITHUB_ENV"
+          export LLVM_PREFIX="$(llvm-config --prefix)"
           cargo +"$EBPF_NIGHTLY" install bpf-linker --version "$BPF_LINKER_VERSION" --locked
           bpf-linker --version
 
