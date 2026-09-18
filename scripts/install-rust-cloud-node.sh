@@ -36,6 +36,13 @@ DRY_RUN=0
 # outbound AF_XDP upstream). --no-xdp / ENABLE_XDP=no opts out explicitly.
 ENABLE_XDP="${ENABLE_XDP:-yes}"
 XDP_IFACE="${XDP_IFACE:-}"
+# Outbound dataplane mode written into configs/runtime.yaml. afxdp is the
+# default — it requires the nftables dial guard; when nft is unavailable
+# and cannot be installed the installer FAILS CLOSED with remediation
+# steps — kernel outbound is only ever an explicit operator choice
+# (--xdp-upstream kernel / XDP_UPSTREAM_MODE=kernel), never a silent
+# fallback.
+XDP_UPSTREAM_MODE="${XDP_UPSTREAM_MODE:-afxdp}"
 
 # Backwards-compatible environment mappings from the previous installer.
 case "${START_MODE:-}" in
@@ -101,6 +108,13 @@ Options / 选项:
   --xdp-iface NAME       Bind XDP to interface NAME. Default: auto-detect the
                          default-route interface.
                          XDP 绑定的网卡名；默认自动探测默认路由网卡。
+  --xdp-upstream MODE    Outbound upstream mode: afxdp (default; needs the
+                         nftables dial guard) or kernel. When nftables is
+                         missing and cannot be installed, afxdp aborts the
+                         install — pick kernel explicitly to opt out.
+                         出向回源模式：afxdp（默认，需要 nftables 守护规则）或
+                         kernel。nftables 缺失且无法安装时 afxdp 会中止安装——
+                         需要 kernel 出向请显式选择。
   --no-start             Do not start/restart the service after install.
                          安装后不启动/重启服务。
   --dry-run              Print actions without changing files.
@@ -113,7 +127,7 @@ Options / 选项:
 Environment variables with the same names are also supported:
   REPO, VERSION, SERVICE_NAME, INSTALL_DIR, INSTALL_BINARY, BACKUP_ROOT,
   AUTO_START, GEOIP_DIR, GEOIP_BASE_URL, RESTORE_BACKUP, API_ENDPOINTS,
-  NODE_ID, NODE_SECRET, TIMEZONE, ENABLE_XDP, XDP_IFACE.
+  NODE_ID, NODE_SECRET, TIMEZONE, ENABLE_XDP, XDP_IFACE, XDP_UPSTREAM_MODE.
 USAGE
 }
 
@@ -458,6 +472,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --xdp-iface)
             XDP_IFACE="${2:?missing interface name}"
+            shift 2
+            ;;
+        --xdp-upstream)
+            XDP_UPSTREAM_MODE="${2:?missing upstream mode (afxdp|kernel)}"
             shift 2
             ;;
         --no-start)
@@ -1298,6 +1316,32 @@ existing_api_config_path() {
     fi
 }
 
+# The runtime reads dataplane config from configs/runtime.yaml — a
+# separate file from api_node.yaml (API credentials only).
+existing_runtime_config_path() {
+    [ -n "$EXISTING_API_CONFIG_DIR" ] || return 1
+    if [ -e "$EXISTING_API_CONFIG_DIR/configs/runtime.yaml" ]; then
+        printf '%s\n' "$EXISTING_API_CONFIG_DIR/configs/runtime.yaml"
+    elif [ -e "$EXISTING_API_CONFIG_DIR/runtime.yaml" ]; then
+        printf '%s\n' "$EXISTING_API_CONFIG_DIR/runtime.yaml"
+    else
+        return 1
+    fi
+}
+
+# Any config that already defines xdp: stays authoritative — including a
+# dead block an older installer wrote into api_node.yaml, which is moved
+# verbatim into runtime.yaml by migrate_dead_xdp_block.
+existing_config_has_xdp() {
+    local cfg=""
+    for cfg in "$(existing_runtime_config_path || true)" "$(existing_api_config_path || true)"; do
+        if [ -n "$cfg" ] && grep -q '^xdp:' "$cfg" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 glibc_is_older_than_228() {
     local version=""
     local major=""
@@ -1608,12 +1652,8 @@ collect_api_config() {
 # inbound proxy + outbound AF_XDP upstream). Skipped when an existing
 # config already defines an xdp: section — that config stays authoritative.
 collect_xdp_choice() {
-    local cfg=""
-    if [ "$IS_FRESH" -eq 0 ]; then
-        cfg="$(existing_api_config_path || true)"
-        if [ -n "$cfg" ] && grep -q '^xdp:' "$cfg" 2>/dev/null; then
-            return 0
-        fi
+    if [ "$IS_FRESH" -eq 0 ] && existing_config_has_xdp; then
+        return 0
     fi
     if prompt_available && [ "$ASSUME_YES" -eq 0 ]; then
         if ask_yes_no \
@@ -1712,13 +1752,21 @@ write_xdp_config_block() {
     printf '  enabled: true\n'
     printf '  attachMode: auto\n'
     if [ -n "$iface" ]; then
+        # mode: proxy is required — the default interface mode is
+        # observe (XDP statistics only, no AF_XDP sockets). Queues and
+        # proxy ports are filled at runtime: refresh_xdp_interface_queues
+        # reads the NIC's real RX queue count and the 30s port-sync task
+        # derives proxy.ports from the live node config.
         printf '  interfaces:\n'
         printf '    - name: %s\n' "$(yaml_quote "$iface")"
+        printf '      mode: proxy\n'
     else
+        # Empty interfaces lets ensure_current_xdp_auto_config derive the
+        # full dataplane (interface, mode=proxy, queues) at startup.
         printf '  interfaces: []\n'
     fi
     printf '  upstream:\n'
-    printf '    mode: afxdp\n'
+    printf '    mode: %s\n' "$XDP_UPSTREAM_MODE"
 }
 
 write_api_node_config() {
@@ -1758,7 +1806,6 @@ write_api_node_config() {
             printf 'secret: %s\n' "$(yaml_quote "$NODE_SECRET")"
             printf 'relay:\n'
             printf '  zeroCopy: false\n'
-            write_xdp_config_block
         } > "$config_path"
         chmod 0600 "$config_path" 2>/dev/null || true
     else
@@ -1767,41 +1814,125 @@ write_api_node_config() {
         printf '  nodeId: %s\n' "$(yaml_quote "$NODE_ID")"
         printf '  secret: ******\n'
         printf '  relay.zeroCopy: false\n'
-        write_xdp_config_block | sed 's/^/  /'
     fi
 }
 
-# Appends the xdp: block to a migrated config that never defined one, so
-# upgrades get the same explicit bidirectional default as fresh installs.
-# A config that already has an xdp: key is authoritative and never touched.
-ensure_existing_config_xdp() {
-    local cfg=""
-    # Runs after migrate_runtime_layout, so the installed copy is the target;
-    # fall back to the discovered source path only when nothing was copied.
-    if [ -e "$INSTALL_DIR/configs/api_node.yaml" ]; then
-        cfg="$INSTALL_DIR/configs/api_node.yaml"
-    else
-        cfg="$(existing_api_config_path || true)"
-    fi
-    [ -n "$cfg" ] || return 0
-    if grep -q '^xdp:' "$cfg" 2>/dev/null; then
+# AF_XDP upstream (upstream.mode=afxdp) requires the nftables dial guard —
+# the reserved source-port DROP rule lives in an inet table managed via
+# the nft binary. Without it every outbound dial would RST during XDP
+# detach windows (reload/upgrade/rollback), so the runtime fails closed.
+# The installer does the same: it tries to install nftables, and when that
+# is impossible it ABORTS with remediation — kernel outbound is only ever
+# an explicit operator choice (--xdp-upstream kernel), never a silent or
+# automatic fallback.
+ensure_upstream_prereqs() {
+    [ "$ENABLE_XDP" = "yes" ] || return 0
+    case "$XDP_UPSTREAM_MODE" in
+        afxdp) ;;
+        kernel) return 0 ;;
+        *) die "invalid upstream mode '$XDP_UPSTREAM_MODE' (expected afxdp|kernel)" \
+               "无效的出向模式 '$XDP_UPSTREAM_MODE'（应为 afxdp|kernel）" ;;
+    esac
+    if command -v nft >/dev/null 2>&1; then
         return 0
     fi
-    if [ -e "$cfg" ]; then
-        run cp -a "$cfg" "$BACKUP_DIR/api_node.yaml.pre-xdp"
+    log "nftables not found; upstream.mode=afxdp needs the nft dial guard — attempting install" \
+        "未检测到 nftables；upstream.mode=afxdp 需要 nft 守护规则——尝试安装"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables >/dev/null 2>&1 || true
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y -q nftables >/dev/null 2>&1 || true
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y -q nftables >/dev/null 2>&1 || true
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -S --noconfirm --needed nftables >/dev/null 2>&1 || true
+        fi
+    else
+        log "dry-run: would try to install nftables via the system package manager" \
+            "dry-run：将尝试通过系统包管理器安装 nftables"
+        return 0
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        ok "nftables installed; AF_XDP dial guard available" "已安装 nftables，AF_XDP 拨号守护可用"
+        return 0
+    fi
+    # Fail closed — bidirectional XDP was requested but its prerequisite
+    # cannot be met. Tell the operator both ways forward: install
+    # nftables, or explicitly opt into kernel-only outbound.
+    die "nftables is required for upstream.mode=afxdp and could not be installed. Install nftables (e.g. 'apt-get install nftables') and re-run, or opt into kernel outbound explicitly with --xdp-upstream kernel / XDP_UPSTREAM_MODE=kernel" \
+        "upstream.mode=afxdp 需要 nftables 且自动安装失败。请手动安装 nftables（如 'apt-get install nftables'）后重跑，或用 --xdp-upstream kernel / XDP_UPSTREAM_MODE=kernel 显式选择内核出向"
+}
+
+# Older installers wrote the xdp: block into api_node.yaml, which the
+# runtime never reads — dataplane config lives in runtime.yaml. Move the
+# block verbatim so an existing explicit choice (enabled: false, tuned
+# interfaces, kernel upstream) is preserved, then leave api_node.yaml for
+# API credentials only.
+migrate_dead_xdp_block() {
+    local api_cfg=""
+    if [ -e "$INSTALL_DIR/configs/api_node.yaml" ]; then
+        api_cfg="$INSTALL_DIR/configs/api_node.yaml"
+    else
+        api_cfg="$(existing_api_config_path || true)"
+    fi
+    [ -n "$api_cfg" ] && [ -e "$api_cfg" ] || return 0
+    grep -q '^xdp:' "$api_cfg" 2>/dev/null || return 0
+    local rt="$INSTALL_DIR/configs/runtime.yaml"
+    if grep -q '^xdp:' "$rt" 2>/dev/null; then
+        return 0
     fi
     if [ "$DRY_RUN" -eq 0 ]; then
-        printf '\n' >> "$cfg"
-        write_xdp_config_block >> "$cfg"
+        run mkdir -p "$INSTALL_DIR/configs"
+        [ -e "$rt" ] && run cp -a "$rt" "$BACKUP_DIR/runtime.yaml.pre-xdp-move"
+        run cp -a "$api_cfg" "$BACKUP_DIR/api_node.yaml.pre-xdp-move"
+        # Extract the top-level xdp: block (the key line plus its indented
+        # children, stopping at the next top-level key).
+        awk '
+            /^xdp:[[:space:]]*$/ { inblk=1; print; next }
+            inblk && /^[[:alnum:]_.]/ { inblk=0 }
+            inblk { print }
+        ' "$api_cfg" >> "$rt"
+        # Strip it from api_node.yaml.
+        awk '
+            /^xdp:[[:space:]]*$/ { inblk=1; next }
+            inblk && /^[[:alnum:]_.]/ { inblk=0 }
+            !inblk { print }
+        ' "$api_cfg" > "$api_cfg.xdp-moved" && mv "$api_cfg.xdp-moved" "$api_cfg"
+        chmod 0600 "$rt" 2>/dev/null || true
     else
-        log "+ append xdp block to $cfg"
+        log "+ move xdp block $api_cfg -> $rt"
+    fi
+    warn "moved xdp: block from api_node.yaml to runtime.yaml — the runtime only reads dataplane config from runtime.yaml; the api_node.yaml copy never took effect" \
+        "已将 xdp: 配置块从 api_node.yaml 移至 runtime.yaml——运行时仅从 runtime.yaml 读取数据面配置，api_node.yaml 中的副本从未生效"
+}
+
+# Writes the xdp: block into configs/runtime.yaml — the file
+# RuntimeConfig::load_default actually parses. api_node.yaml stays API
+# credentials only. A runtime.yaml that already has an xdp: key is
+# authoritative and never touched.
+write_runtime_config() {
+    local config_path="$INSTALL_DIR/configs/runtime.yaml"
+    if grep -q '^xdp:' "$config_path" 2>/dev/null; then
+        return 0
+    fi
+    run mkdir -p "$INSTALL_DIR/configs"
+    if [ -e "$config_path" ]; then
+        run cp -a "$config_path" "$BACKUP_DIR/runtime.yaml.pre-xdp"
+    fi
+    if [ "$DRY_RUN" -eq 0 ]; then
+        write_xdp_config_block >> "$config_path"
+        chmod 0600 "$config_path" 2>/dev/null || true
+    else
+        log "+ write xdp block to $config_path"
         write_xdp_config_block | sed 's/^/  /'
     fi
     if [ "$ENABLE_XDP" = "yes" ]; then
-        ok "appended xdp.enabled=true + upstream.mode=afxdp (bidirectional) to $cfg" \
-            "已在 $cfg 追加 xdp.enabled=true + upstream.mode=afxdp（双向 XDP）"
+        ok "wrote xdp.enabled=true + upstream.mode=$XDP_UPSTREAM_MODE to $config_path" \
+            "已在 $config_path 写入 xdp.enabled=true + upstream.mode=$XDP_UPSTREAM_MODE（双向 XDP）"
     else
-        ok "appended xdp.enabled=false to $cfg" "已在 $cfg 追加 xdp.enabled=false"
+        ok "wrote xdp.enabled=false to $config_path" "已在 $config_path 写入 xdp.enabled=false"
     fi
 }
 
@@ -2123,6 +2254,10 @@ elif [ "$EXISTING_RUNTIME" = "unknown" ]; then
 fi
 
 confirm_install
+# Install/verify the nftables dial-guard prerequisite before touching
+# anything — when it cannot be satisfied the install aborts here with
+# remediation, leaving the existing deployment fully intact.
+ensure_upstream_prereqs
 apply_timezone
 
 TMP_DIR="$(mktemp -d)"
@@ -2220,7 +2355,8 @@ else
 fi
 
 write_api_node_config
-ensure_existing_config_xdp
+migrate_dead_xdp_block
+write_runtime_config
 
 if [ "$DRY_RUN" -eq 0 ]; then
     (cd "$INSTALL_DIR" && "$INSTALL_BINARY" install)
