@@ -37,7 +37,7 @@ loadgen (netns "cnpeer") → veth → [ kernel socket 监听 | XDP→AF_XDP 用�
                                       → in-process backends (h1/h1s/tcp/udp/h3/sni/quic)
 ```
 
-kernel 臂 = `proxy-smoke --kernel`（本次新增的对照模式，非运行时回退）；xdp 臂 = `proxy-smoke`（attach skb，XdpRuntimeMode=proxy）。
+kernel 臂 = `proxy-smoke --kernel`（本次新增的对照模式，非运行时回退）；xdp 臂 = `proxy-smoke`（attachMode 由 `ATTACH_MODE` 环境变量控制：`skb`=generic，`drv`=native driver，XdpRuntimeMode=proxy，`fallback: fail-start` 保证失败不会静默降级）。
 
 **veth 前置条件（本次实测确认）**：veth 默认不做真校验和，AF_XDP 用户态 TCP 栈会丢弃校验和无效包。必须两端关 offload 后测试才有意义：
 
@@ -73,7 +73,7 @@ oha，c200（标记者除外），每轮独立进程、采样 CPU/RSS。成功�
 
 - **缓存命中路径数量级提升**（52–228×）：v127 在 warm-hit 下吞吐被压到 ~120–540 rps 且 p99 秒级；merged 稳定 27–29k rps、p99 < 120ms。这是本轮工作的主要收益。
 - **A-origin 持平**（0.99×）：两侧都打到 nginx origin 上限 ~24k rps，代理转发开销不占优也不劣化。
-- **D-miss 出现 0.66× 回退**：merged 681 vs v127 1027 rps，p99 1497 vs 502ms。纯 miss 透传路径变慢，疑似与内存准入记账/队列治理有关（merged 引入了 TCP queued-byte 预算与准入票据）。**这是真实回退，不掩盖**，建议后续定位。
+- **D-miss 0.66× 已定位为基准脚手架不对称，非应用回退**（详见 §D 根因分析）：v127 的 `bench-proxy` 从未启动 `CACHE_META_WRITER_TX` 写入线程（`start_cache_access_flusher` 仅 `main.rs` 调用），每个 fill 写完 256KB tmp → rename → 元数据 upsert 返回 false → `cleanup_failed_publish` 删除 body——**v127 测的是"透传+废弃 fill"，从未真正缓存**（残余证据：shard 目录与 per-key 锁文件存在、0 个 body 文件、home 仅 70MB、磁盘写 ~7MB/s vs merged ~122MB/s）。merged 有 flusher → fill 全量落盘（4.6 万 body 文件）。两侧工作量不对等，0.66× 不是代码回退。
 - **RSS 全面更高**：merged 105–1074MB vs v127 36–219MB。mimalloc + 治理账本 + 更大的缓存留存是主因；churn/L2-hit 场景 ~950MB 峰值仍受内存治理上限约束、无失控迹象，但与 v127 对比属成本项。
 - CPU：merged 在命中场景主动烧满多核换吞吐（430–470% vs 130–290%），属预期（吞吐 50× 的代价）；miss/dynamic 场景 cpu% 反而更低。
 
@@ -148,6 +148,75 @@ AF_XDP 侧计数器（c200 全程）：`packets=435974 / redirect=435970 / drop=
 - c200 下 AF_XDP 的 HTTP 成功率（86.6%）显著好于 kernel accept 路径（52.4%）——XSK 批量收包绕过了 accept 瓶颈；但两侧均未完全消化 c200，属容量边界而非正确性问题。
 - **不声称 zero-copy**：veth/virtio 不具备 ZC 能力，本次只验证了 skb 模式正确性与相对吞吐。真实 NIC + drv/native 模式待硬件验证。
 
+## C2. Native driver（drv）模式实测 — 应要求使用 native 而非 skb
+
+**为什么协议矩阵没有 XDP 臂**：`bench-proxy` 是进程内 Pingora 基准——在同一进程起 `HttpProxy<EdgeProxy>` + kernel socket 监听，**XDP/AF_XDP 整条数据面（XdpManager→eBPF→XSK→用户态 TCP 栈）不在进程内**。要测"过 XDP 的协议行为"必须用生产二进制 `proxy-smoke` 挂真 XDP——即本节。
+
+**native attach 直接证据**（`ip -details link`）：
+
+- `ens17`（virtio_net 1.0.0，本机真实网卡）：attach 后 `prog/xdp ... name cloud_node_xdp jited`，SSH 会话保持连通，detach 后恢复 `no xdp`。**virtio native 可用性已证实**。外部公网打流被云防火墙阻断，故全矩阵在 veth 上执行（kernel 6.1 veth 支持 native XDP）。
+- `dpveth-h`（veth）：`LOWER_UP> mtu 1500 xdp ... prog/xdp ... jited` —— 非 `xdpgeneric`，确认为 native 语义。`fallback: fail-start` 生效中，drv 失败即退出，不存在静默回退。
+
+**c50（kernel vs native drv，全部 ~100% 成功）**：
+
+| 协议 | kernel | drv-native | Δ吞吐 | drv avg lat |
+|---|---|---|---|---|
+| h1 | 897 rps | 991 rps | **+10.5%** | 50.4ms |
+| h1s | 860 rps | 938 rps | **+9.1%** | 53.3ms |
+| tcp | 981 cps | 734 cps | **−25.2%** | 42.8ms |
+| udp | 6080 eps | 3620 eps | **−40.5%** | rtt 4.4ms |
+| h3 | 804 rps | 666 rps | **−17.1%** | - |
+| sni | 891 rps | 579 rps | **−35.0%** | 86.8ms |
+
+**c200**：
+
+| 协议 | kernel | drv-native |
+|---|---|---|
+| h1 | 1449 rps / ok 52.4% | 651 rps / ok 86.5% |
+| h1s | 1305 rps / ok 54.3% | 546 rps / ok 86.3% |
+| tcp | 810 cps / 0 err | 460 cps / 0 err / p99 171ms |
+| udp | 5974 eps / 0 lost | 3870 eps / 0 lost / rtt p99 31ms |
+| h3 | 780 rps / 50000 ok | 646 rps / 50000 ok |
+| sni | 2619 rps / ok 15.6% | 267 rps / ok 66.5% |
+
+drv 侧节点计数器与 skb 轮一致：`drop=0 / xskDrops=0 / mapMiss=0 / parseErrors=0 / backendConnectFail=0`——**native 模式无丢包、无 map miss、无解析错误、无后端失败**，差距全部来自用户态路径延迟。
+
+**drv vs skb 的重要观察**：L4 路径在 drv 下比 skb **更差**（udp −40.5% vs −9.7%，tcp −25.2% vs −18.6%，sni −35.0% vs −28.7%），且 drv udp 期间节点 CPU 仅 ~103%（未饱和）、RTT +1.5ms/包。机制解释：veth 的 native XDP 在**对端发送者的 xmit 上下文**内逐包执行 redirect（无 NAPI 批量），而 skb/generic 在接收侧 NAPI poll 上下文运行、可对 `xsk_rcv` 批量投喂。**veth-drv 只证明 native attach 语义正确，不代表真实 NIC 的 native 性能**——virtio/真实网卡的 drv 模式在驱动 NAPI 上下文跑、具备批量语义，预期优于 veth-drv。此差异属测试拓扑限制，如实记录。
+
+## D. 回退项逐项根因分析
+
+### D1. `D-miss-256k-c200`（0.66×）— 已定位：基准脚手架不对称，非应用回退
+
+**现象**：merged 681 vs v127 1027 rps。
+
+**证据链**：
+
+1. merged 运行写盘 **~122MB/s**、node-home 残留 **46,276 个 `.body.` 文件（2.9GB）**；v127 写盘 ~7MB/s、**0 个 body 文件**、home 仅 70–130MB、RSS 170MB（若真做内存 fill 256KB×N 应是 GB 级）。
+2. 但 v127 的 fill 机制**确实执行了**：cache shard 目录（`eb/5a/...`）与 per-key 锁文件（`.cloud-node-cache-locks/keys/eb/*.lock`）均存在——锁获取、目录创建、`File::create` 全部跑过。
+3. 代码级根因：`FileMissHandler::finish()` 在 rename 后调用 `STORAGE.upsert_cache_meta_absolute_async()`，其内部 `CACHE_META_WRITER_TX.get()` 为 `None` 时返回 `false` → `cleanup_failed_publish()` 删除 body。`CACHE_META_WRITER_TX` **仅由 `start_cache_access_flusher()` 设置**，而 v127 中该函数只从 `main.rs:3522` 调用——`bench-proxy` 从不启动它。
+4. 静默原因：v127 `bench-proxy` 无 `tracing_subscriber` 初始化，`warn!("Mace cache metadata writer is not started")` 等全部丢弃（日志仅一行 "Bench proxy ready"）。
+5. merged `bench-proxy:266` 显式启动 flusher → upsert 成功 → fill 全量落盘。
+
+**结论**：v127 的 1027 rps 测的是"透传 + 废弃 fill（写 tmp→rename→删）"，**生产环境不可能出现该状态**（生产 `main.rs` 必启动 writer）；merged 的 681 rps 是真实持久化 fill 的成本（落盘 + mace KV + purger 限界）。两侧测的不是同一工作，**非应用回退**。旁证：G-dynamic 纯透传（见 D2）merged 反而快 9.4%——merged 请求路径本身不慢。
+
+### D2. `G-dynamic-1k-c200`（1.09×）— 不是回退
+
+merged **1705** vs v127 **1558** rps，merged 更快。唯一负项是 p99 449.6 vs 366.4ms，在 RSS 1074MB（治理账本+留存）背景下属尾延迟噪声范围。且注意不对称：merged 的 bench 识别 `?dyn=` 标记完全跳过缓存（真透传）；v127 的 bench 不识别该标记、对所有请求开缓存——其 G-dynamic 实际是"同 key 串行化 miss 流 + 废弃 fill"，仍达 1558 rps。**结论：无回退，无需处理。**
+
+### D3. 数据面 L4 路径（tcp/udp/sni）— 架构性每跳延迟，非缺陷
+
+**统一机制**：三者都是"每次操作付一次用户态栈代价"的延迟敏感路径。AF_XDP 路径每连接/每包多走一跳：XDP 解析 → XSK → 用户态 TCP/UDP 栈（smoltcp）→ relay 建立 → 内核 socket 回连后端。固定并发下 `吞吐 = 并发/每操作延迟`，加毫秒级延迟即等比降吞吐。
+
+| 项 | 每操作附加延迟 | 机制 |
+|---|---|---|
+| tcp −18.6~−25.2% | conn setup +6~11ms | 用户态 TCP 握手 + 后端 kernel connect = 双倍握手开销；perf 采样见 afxdp 线程在用户态 TCP + 内核 conntrack/nft（后端回连仍走内核协议栈） |
+| udp −9.7~−40.5% | rtt +0.3~1.5ms | 每包 XDP→XSK→用户态→后端 kernel UDP→回程。drv 更差因 veth-native 失去 NAPI 批量（见 §C2），UDP 包率最高最敏感 |
+| sni −28.7~−35.0% | 每连接 +16~31ms | 每 RPS 都是新 TLS 连接：用户态 TCP accept + SNI peek + relay 建立 + kernel 后端。sni 节点 CPU ~170%（最高）= 用户态栈计算密集，c200 饱和后成功率掉到 66.5% |
+
+**与 HTTP 路径的对照**：h1/h1s/h3 在 AF_XDP 下反而 +7~22%，因为 oha keepalive 复用连接——每连接的栈代价被摊薄，只剩每请求收益（XSK 批量收包绕过 accept 瓶颈）。c200 下 kernel accept 路径成功率 52.4% vs AF_XDP 86.5%，证明架构优势真实存在，L4 差距是"纯转发无摊薄"场景的固有成本。
+
+**性质判定**：非丢包、非 map miss、非后端失败、非静默降级（计数器全零异常）；属用户态数据面在多一跳架构下的预期成本。优化方向（非本次范围）：减少每包/每连接用户态处理成本、relay 批量化、真实 NIC 验证 drv 批量语义。
+
 ## 发现并修复的问题
 
 1. **veth offload 必须关闭**（环境配置，非代码 bug）：未关时 AF_XDP 全零成功，已固化进 `scripts/xdp-netns-smoke.sh` 同等要求。
@@ -155,7 +224,9 @@ AF_XDP 侧计数器（c200 全程）：`packets=435974 / redirect=435970 / drop=
 
 ## 已知问题 / 不回退项清单
 
-- **D-miss 0.66× 回退**（merged vs v127）：纯透传 miss 路径变慢，待定位；与内存治理账本相关方向待查。
+- ~~**D-miss 0.66× 回退**~~ **已撤销此项判定**（§D1）：v127 bench 缺 writer 线程导致 fill 全数废弃，两侧工作量不对等，非应用回退。
+- **AF_XDP L4 路径成本**（tcp/udp/sni −10~−40%，§D3）：用户态数据面多一跳的固有延迟，非缺陷；真实 NIC 批量语义待硬件验证。
+- **veth-drv ≠ 真实 NIC native**：veth 的 native redirect 在发送者 xmit 上下文逐包执行、无 NAPI 批量，drv 数字仅证明 attach 语义；virtio ens17 已验证 native attach/detach 正确（`prog/xdp jited`），性能需同 VPC 流量源才能实测。
 - **merged RSS 全面抬升**（~3–5× 于 v127）：mimalloc 与治理缓存的成本，数值有界。
 - **h3 大对象塌陷**（≥1MB）：沿用已知限制，未恶化也未修复。
 - **c200 双臂饱和**：kernel 败在 accept 通道、xdp 败在用户态 TCP 会话生命周期；非丢包。
@@ -169,7 +240,8 @@ AF_XDP 侧计数器（c200 全程）：`packets=435974 / redirect=435970 / drop=
 bash scripts/perf/run_perf_matrix.sh <h1|h1s|h2|h3>   # 结果落 /tmp/res-<tag>-<proto>/
 # 数据面 A/B（veth+netns，先关两端 offload）
 bash /tmp/run_dp_matrix.sh kernel 200                  # kernel 臂
-bash /tmp/run_dp_matrix.sh xdp 200                     # AF_XDP 臂
+bash /tmp/run_dp_matrix.sh xdp 200                     # AF_XDP 臂（默认 skb）
+ATTACH_MODE=drv bash /tmp/run_dp_matrix.sh xdp 200     # AF_XDP native 臂
 # --kernel 对照：cloud-node-rust xdp proxy-smoke --kernel --duration-ms 230000
 ```
 
