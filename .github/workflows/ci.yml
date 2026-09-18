@@ -17,6 +17,13 @@ jobs:
     name: Check / Clippy - linux-x64
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    env:
+      # .cargo/config.toml sets target-cpu=native, but rust-cache restores
+      # target/ across heterogeneous runner hardware — a proc-macro .so
+      # compiled for a newer CPU SIGILLs inside rustc on an older runner
+      # (observed twice compiling pingora-pool). RUSTFLAGS env overrides
+      # config.toml; pin the CI baseline to the minimum release target.
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -119,6 +126,10 @@ jobs:
     name: Test - linux-x64
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    env:
+      # Same rationale as the check job: target-cpu=native artifacts in the
+      # shared rust-cache SIGILL on older runner hardware.
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
