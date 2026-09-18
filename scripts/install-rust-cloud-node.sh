@@ -1148,7 +1148,7 @@ download_with_progress() {
 
     if ! tty_progress; then
         log "downloading: $url"
-        curl -fL --retry 3 --connect-timeout 20 -o "$dest" "$url"
+        curl -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 -C - -o "$dest" "$url"
         return $?
     fi
 
@@ -1159,7 +1159,7 @@ download_with_progress() {
     total="${total:-0}"
 
     printf '%s[cloud-node]%s %s\n' "$BLUE" "$RESET" "$label" >&2
-    curl -fL --retry 3 --connect-timeout 20 -o "$dest" "$url" &
+    curl -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 -C - -o "$dest" "$url" &
     local curl_pid=$!
     local started
     started="$(date +%s)"
@@ -1192,6 +1192,25 @@ download_with_progress() {
         printf '\n' >&2
     fi
     return "$rc"
+}
+
+# Retries a download across whole-invocation attempts. `-C -` resume in
+# download_with_progress makes each attempt continue from partial bytes,
+# so transient resets (CURLE_SEND_ERROR etc.) do not strand the install.
+download_checked() {
+    local url="$1"
+    local dest="$2"
+    local label="$3"
+    local attempts="${4:-4}"
+    local attempt=0
+    until download_with_progress "$url" "$dest" "$label"; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge "$attempts" ]; then
+            die "download failed after $attempts attempts: $label" "下载失败（已尝试 $attempts 次）: $label"
+        fi
+        warn "download of $label failed; retrying ($attempt/$attempts)" "$label 下载失败；重试 ($attempt/$attempts)"
+        sleep 2
+    done
 }
 
 sanitize_path() {
@@ -1540,7 +1559,7 @@ download_geoip_files() {
             run cp -a "$target" "$BACKUP_DIR/$name.geoip-original"
         fi
         if [ "$DRY_RUN" -eq 0 ]; then
-            download_with_progress "$url" "$tmp_target" "$name"
+            download_checked "$url" "$tmp_target" "$name"
             if [ -n "$sums_file" ]; then
                 expected="$(awk -v f="$name" '$2 == f {print $1}' "$sums_file" | head -n 1)"
                 if [ -z "$expected" ]; then
@@ -2169,7 +2188,7 @@ else
 fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
-    download_with_progress "$DOWNLOAD_URL" "$TMP_DIR/$ASSET_NAME" "$ASSET_NAME"
+    download_checked "$DOWNLOAD_URL" "$TMP_DIR/$ASSET_NAME" "$ASSET_NAME"
     tar -xzf "$TMP_DIR/$ASSET_NAME" -C "$TMP_DIR"
     [ -f "$TMP_DIR/cloud-node" ] || die "release archive does not contain cloud-node" "Release 包中不含 cloud-node"
     if [ ! -f "$TMP_DIR/data/cloud-node-xdp-ebpf.o" ]; then
