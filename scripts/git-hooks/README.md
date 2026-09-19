@@ -19,7 +19,8 @@ git config --get core.hooksPath   # -> scripts/git-hooks
 | 文件 | 作用 |
 | --- | --- |
 | `commit-msg` | git 调用的钩子入口，`git commit` 时检查提交信息 |
-| `check-attribution.sh` | 实际规则；本地钩子与 CI（`.github/workflows/commit-hygiene.yml`）共用，避免两套标准漂移 |
+| `check-attribution.sh` | 署名规则；本地钩子与 CI（`.github/workflows/commit-hygiene.yml`）共用，避免两套标准漂移 |
+| `check-suppression.sh` | 禁止新增屏蔽警告的手段；同样由本地复核与 CI 共用 |
 
 ## 手工检查
 
@@ -29,6 +30,7 @@ bash scripts/git-hooks/check-attribution.sh --message-file .git/COMMIT_EDITMSG
 
 # 检查一段提交范围
 bash scripts/git-hooks/check-attribution.sh --range origin/main..HEAD
+bash scripts/git-hooks/check-suppression.sh --range origin/main..HEAD
 ```
 
 ## 绕过与关闭
