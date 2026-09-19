@@ -826,11 +826,13 @@ async fn connect_upstream_afxdp(
     toa_config: Option<TOAConfig>,
     connect_timeout: Duration,
 ) -> Result<UpstreamL4Stream> {
-    let backend = tokio::net::lookup_host(backend_addr)
+    let backends: Vec<SocketAddr> = tokio::net::lookup_host(backend_addr)
         .await
         .with_context(|| format!("failed to resolve AF_XDP upstream {}", backend_addr))?
-        .next()
-        .ok_or_else(|| anyhow!("no socket address resolved for AF_XDP upstream {backend_addr}"))?;
+        .collect();
+    if backends.is_empty() {
+        anyhow::bail!("no socket address resolved for AF_XDP upstream {backend_addr}");
+    }
     let toa_enabled = toa_config.map(|cfg| cfg.is_on).unwrap_or(false);
     // TOA on the AF_XDP path is a SYN option we write ourselves — the
     // cloud_toa_sender kernel module never sees these packets (no
@@ -840,14 +842,30 @@ async fn connect_upstream_afxdp(
     } else {
         Vec::new()
     };
-    let stream = timeout(
-        connect_timeout,
-        crate::xdp::af_xdp_dial_tcp(backend, syn_extra_options),
-    )
-    .await
-    .with_context(|| format!("timed out connecting AF_XDP upstream {}", backend_addr))?
-    .with_context(|| format!("failed to connect AF_XDP upstream {}", backend_addr))?;
-    Ok(UpstreamL4Stream::AfXdp(stream))
+    // Mirror kernel TcpStream::connect semantics: try every resolved
+    // address, not just the first. A hostname can resolve to an
+    // unreachable family or a stale first answer that the kernel path
+    // would skip automatically; every attempt's failure is reported.
+    let dial_all = async {
+        let mut attempts = String::new();
+        for backend in &backends {
+            match crate::xdp::af_xdp_dial_tcp(*backend, syn_extra_options.clone()).await {
+                Ok(stream) => return Ok(UpstreamL4Stream::AfXdp(stream)),
+                Err(err) => {
+                    use std::fmt::Write as _;
+                    let _ = writeln!(attempts, "  {backend}: {err:#}");
+                }
+            }
+        }
+        Err(anyhow!(
+            "all {} resolved address(es) failed:\n{attempts}",
+            backends.len()
+        ))
+    };
+    timeout(connect_timeout, dial_all)
+        .await
+        .with_context(|| format!("timed out connecting AF_XDP upstream {}", backend_addr))?
+        .with_context(|| format!("failed to connect AF_XDP upstream {}", backend_addr))
 }
 
 #[cfg(test)]

@@ -104,9 +104,6 @@ pub async fn start_origin_health_reporter(api_config: ApiConfig) {
         // only removed/disabled origins age out. Runs even when not leader
         // so a long follower stint cannot strand stale entries.
         gc_stale_origin_health(crate::utils::time::now_timestamp());
-        if !crate::cluster::leader::require_leader("origin_health_reporter") {
-            continue;
-        }
         if ORIGIN_HEALTH_MAP.is_empty() {
             continue;
         }
@@ -404,19 +401,8 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
 
     loop {
         interval.tick().await;
-        let is_leader = crate::cluster::leader::is_leader();
         let snapshots = crate::metrics::METRICS.take_snapshots();
 
-        // Always refresh baselines so deltas are accurate when leadership
-        // resumes — otherwise the first delta after becoming leader spans the
-        // entire non-leader gap and produces a huge phantom bandwidth spike.
-        if !is_leader {
-            for snap_tuple in &snapshots {
-                let snap = &snap_tuple.1;
-                last_snapshots.insert(snap.server_id, snap.clone());
-            }
-            continue;
-        }
         let now = crate::utils::time::now_local();
         let day = now.format("%Y%m%d").to_string();
         let minute_floor = (now.minute() / 5) * 5;
@@ -557,18 +543,8 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
 
     loop {
         interval.tick().await;
-        let is_leader = crate::cluster::leader::is_leader();
         let snapshots = crate::metrics::METRICS.take_snapshots();
 
-        // Keep baselines fresh even when not leader so that deltas are
-        // accurate when leadership resumes.
-        if !is_leader {
-            for snap_tuple in &snapshots {
-                let snap = &snap_tuple.1;
-                last_snapshots.insert(snap.server_id, snap.clone());
-            }
-            continue;
-        }
         let now = crate::utils::time::now_local();
         let day = now.format("%Y%m%d").to_string();
         let minute_floor = (now.minute() / 5) * 5;
@@ -887,9 +863,6 @@ pub async fn start_metric_stat_reporter(
 
     loop {
         interval.tick().await;
-        if !crate::cluster::leader::require_leader("metric_stat_reporter") {
-            continue;
-        }
         let metric_items = config_store.get_metric_items().await;
         if metric_items.is_empty() {
             continue;
@@ -1020,9 +993,6 @@ pub async fn start_metrics_aggregator_reporter(config_store: ConfigStore, api_co
 
     loop {
         interval.tick().await;
-        if !crate::cluster::leader::require_leader("metrics_aggregator_reporter") {
-            continue;
-        }
 
         let client = match SharedRpcClient::get(&api_config).await {
             Ok(shared) => shared.as_rpc_client(),
@@ -1209,9 +1179,6 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
 
     loop {
         interval.tick().await;
-        if !crate::cluster::leader::require_leader("top_ip_stat_reporter") {
-            continue;
-        }
         let rows = crate::metrics::top_ip::TOP_IP_TRACKER.flush();
         if rows.is_empty() {
             continue;

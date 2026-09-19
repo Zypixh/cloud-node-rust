@@ -8,7 +8,7 @@
 
 - 仅 Linux 生产环境启用。
 - 需要 root，或至少具备 `CAP_BPF`、`CAP_NET_ADMIN`、`CAP_NET_RAW`。
-- XDP 默认启用；RKE2 集群模式下强制关闭（AF_XDP 会独占网卡队列，影响 Kubernetes 网络）。
+- XDP 默认启用；启用后固定为双向数据面（入向代理 + 出向 AF_XDP 回源），没有内核出向选项。
 - 标准 MTU 是当前主要验收目标；proxy 模式遇到 jumbo/multi-buffer 风险时会在 doctor 或启动阶段拒绝或回退。
 - `fallback: pass`（默认）会 fail-open 到原 socket 路径并记录 fallback 原因；`fallback: fail-start` 会在无法满足 XDP 启动条件时返回错误。
 
@@ -21,7 +21,7 @@
 XDP 只需要一个开关，优先级为：默认值（启用）< `CLOUD_NODE_XDP` 环境变量 < 配置文件显式值。
 
 ```text
-configs/runtime.yaml   # 可选；不存在时不会自动生成
+configs/api_node.yaml   # 唯一的本地配置文件；xdp 段与 API 连接信息同文件
 ```
 
 - 不配置任何文件也不设环境变量 → XDP 启用，其余全部自动推导。
@@ -35,7 +35,7 @@ xdp:
 
 `cloud-node xdp start` 写入 `xdp.enabled: true`，`cloud-node xdp stop` 写入 `xdp.enabled: false`；两者都保留文件中的其他内容，不会把推导出的运行时状态写回配置。
 
-除 `enabled` 之外的字段（`attachMode`、`fallback`、`interfaces`、`proxy`、`rateLimit`）仍可在文件中显式提供以覆盖自动推导结果，但正常部署不需要；自动推导的状态只存在于内存，不会写回 `runtime.yaml`。
+除 `enabled` 之外的字段（`attachMode`、`fallback`、`interfaces`、`proxy`、`rateLimit`）仍可在文件中显式提供以覆盖自动推导结果，但正常部署不需要；自动推导的状态只存在于内存，不会写回 `api_node.yaml`。
 
 字段说明（显式覆盖时）：
 

@@ -1,7 +1,7 @@
 # scripts/edge — 分层测试与证据工具（EN-02）
 
 边界：本目录只使用独立资源——netns `en2-ns`、veth `en2-a`/`en2-b`、配置
-`configs/en2-runtime.yaml`（运行时临时提升为 `configs/runtime.yaml`，结束
+`configs/en2-api-node.yaml`（运行时临时提升为 `configs/api_node.yaml`，结束
 还原）。不触碰现有公共接口、生产网卡或 smoke 的 `cn-*` 资源。
 
 ## 组成

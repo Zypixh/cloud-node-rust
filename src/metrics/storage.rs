@@ -1264,15 +1264,7 @@ fn mace_open_error(err: OpCode) -> anyhow::Error {
 
 pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
     let node_paths = crate::paths::NodePaths::current();
-    let path = if let Some(config) = crate::runtime_mode::RuntimeConfig::current()
-        && config.is_rke2()
-    {
-        let path = config.cluster.cache.local_meta_dir.join("metrics.mace");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        path
-    } else {
+    let path = {
         let _ = std::fs::create_dir_all(node_paths.data_dir());
         node_paths.metrics_db_dir()
     };
@@ -1527,24 +1519,10 @@ fn cache_meta_tombstone_memory(hash: &str) -> Option<u64> {
     CACHE_META_TOMBSTONES.get(hash).map(|value| *value)
 }
 
-fn cache_meta_tombstone_from_db(storage: &MetricStorage, hash: &str) -> Option<u64> {
-    storage
-        .get_raw(cache_meta_tombstone_key(hash).as_bytes())
-        .as_deref()
-        .and_then(parse_cache_meta_tombstone)
-}
-
-fn cache_meta_tombstone_version_for(storage: &MetricStorage, hash: &str) -> Option<u64> {
-    let memory = cache_meta_tombstone_memory(hash);
-    if !shared_cache_volume_declared() {
-        // Local tombstones are written to memory before durable storage, so
-        // in single-process mode memory is always at least as fresh.
-        return memory;
-    }
-    memory
-        .into_iter()
-        .chain(cache_meta_tombstone_from_db(storage, hash))
-        .max()
+fn cache_meta_tombstone_version_for(_storage: &MetricStorage, hash: &str) -> Option<u64> {
+    // Local tombstones are written to memory before durable storage, so in
+    // single-process mode memory is always at least as fresh.
+    cache_meta_tombstone_memory(hash)
 }
 
 fn cache_meta_version_is_fenced(
@@ -1554,28 +1532,8 @@ fn cache_meta_version_is_fenced(
     tombstone_version.is_some_and(|version| event_version.is_none_or(|event| event <= version))
 }
 
-fn cache_meta_broad_purge_version_from_db(storage: &MetricStorage) -> Option<u64> {
-    storage
-        .get_raw(CACHE_META_BROAD_PURGE_KEY.as_bytes())
-        .as_deref()
-        .and_then(parse_cache_meta_tombstone)
-}
-
-fn newest_cache_meta_broad_purge_version(cached: u64, durable: u64) -> u64 {
-    cached.max(durable)
-}
-
-fn current_cache_meta_broad_purge_version_for(storage: &MetricStorage) -> u64 {
-    let cached = CACHE_META_BROAD_PURGE_VERSION.load(Ordering::Acquire);
-    if !shared_cache_volume_declared() {
-        return cached;
-    }
-    let durable = cache_meta_broad_purge_version_from_db(storage).unwrap_or(0);
-    let newest = newest_cache_meta_broad_purge_version(cached, durable);
-    if durable > cached {
-        observe_cache_meta_broad_purge_version(durable);
-    }
-    newest
+fn current_cache_meta_broad_purge_version_for(_storage: &MetricStorage) -> u64 {
+    CACHE_META_BROAD_PURGE_VERSION.load(Ordering::Acquire)
 }
 
 /// Return the newest durable or in-process broad-purge fence.  The hybrid L1
@@ -1970,14 +1928,6 @@ fn parse_unique_ip_key(key: &str) -> Option<(i64, String, IpAddr)> {
     let server_id = parts.next()?.parse::<i64>().ok()?;
     let ip = parts.next()?.parse::<IpAddr>().ok()?;
     Some((server_id, day, ip))
-}
-
-/// True only when the runtime explicitly declares a shared cache volume
-/// (RKE2 mode). Single-process deployments own the volume exclusively and
-/// every durable fence is written by this process after the in-memory fence
-/// is already updated, so the memory value is always authoritative.
-fn shared_cache_volume_declared() -> bool {
-    crate::runtime_mode::RuntimeConfig::current_is_rke2()
 }
 
 pub fn get_cache_meta_memory(hash: &str) -> Option<Arc<CacheMetaEntry>> {
@@ -2954,13 +2904,6 @@ mod tests {
         remove_cache_meta_tombstone_memory_through(&hash, u64::MAX);
         drop(storage);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn broad_purge_version_never_moves_back_to_an_older_observation() {
-        assert_eq!(newest_cache_meta_broad_purge_version(0, 7), 7);
-        assert_eq!(newest_cache_meta_broad_purge_version(9, 7), 9);
-        assert_eq!(newest_cache_meta_broad_purge_version(9, 12), 12);
     }
 
     #[test]

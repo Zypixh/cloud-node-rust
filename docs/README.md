@@ -16,11 +16,11 @@
 - [mace-kv 0.1.1 静态审计](mace-0.1.1-audit.md)：对照上游 issue #1 修复，说明何时可以拆除适配层串行规避。
 - [接收配置审计](config-receive-audit.md)：对照全局配置、网站配置、实际应用路径和优先级，并列出当前接收缺口。
 - [部署与运维](operations.md)：说明构建、安装、systemd、系统参数、监控、日志和排障建议。
-- [RKE2 部署文档](rke2-deployment.md)：说明 RKE2 多副本部署流程，以及复用/新建 Longhorn 的缓存存储配置。
 - [gRPC API 使用文档](grpc-api.md)：说明节点当前调用的控制面 gRPC 接口、请求、响应和配置应用方式。
 - [Agent 工程背景](agents/project-profile.md)：给 AI agent 的模块地图、依赖信号、仓库特定优先级和检索模式；入口约束见根目录 [AGENTS.md](../AGENTS.md)。
 - [禁止未经审批的功能降级](agents/no-unapproved-degradation.md)：强制工程约束，定义什么算降级、审批必须绑定什么、fail-closed 的例外边界。
 - [提交与 PR 规范](agents/commit-and-pr-conventions.md)：署名禁令、提交信息格式、scope 词表、本地钩子与 CI 门禁及其已知缺口。
+- [警告与 lint 策略](agents/warning-and-lint-policy.md)：警告必须消除根因、禁止屏蔽手段、存量 78 处债务清单、审批例外与豁免范围。
 
 ## 阅读顺序
 

@@ -194,7 +194,6 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "Relay copy buffer",
         "中继复制缓冲区",
     ),
-    ("test.runtime_mode", "Runtime mode", "运行模式"),
     // NTP and zero-copy
     ("ntp.title", "CloudNode NTP", "CloudNode NTP"),
     ("ntp.current_timezone", "current timezone", "当前时区"),
@@ -408,8 +407,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "xdp.reload",
-        "Detach and attach again using configs/runtime.yaml",
-        "使用 configs/runtime.yaml 重新附加",
+        "Detach and attach again using configs/api_node.yaml",
+        "使用 configs/api_node.yaml 重新附加",
     ),
     (
         "xdp.configure",
@@ -546,8 +545,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ("xdp.menu.add_more", "Add more ports?", "添加更多端口？"),
     (
         "xdp.menu.save",
-        "Save configuration to configs/runtime.yaml?",
-        "保存配置到 configs/runtime.yaml？",
+        "Save configuration to configs/api_node.yaml?",
+        "保存配置到 configs/api_node.yaml？",
     ),
     (
         "xdp.menu.saved",
@@ -561,8 +560,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "xdp.menu.disabled_saved",
-        "XDP will be disabled in configs/runtime.yaml.",
-        "将会在 configs/runtime.yaml 中禁用 XDP。",
+        "XDP will be disabled in configs/api_node.yaml.",
+        "将会在 configs/api_node.yaml 中禁用 XDP。",
     ),
     (
         "xdp.menu.invalid_queue",

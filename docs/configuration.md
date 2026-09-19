@@ -43,16 +43,16 @@ cloud-node zerocopy --disable --yes
 
 不要把真实生产密钥提交到公开仓库。
 
-## configs/runtime.yaml
+## XDP/AF_XDP 配置（同在 configs/api_node.yaml）
 
-`configs/runtime.yaml` 是本机运行时开关文件（RKE2 模式、集群缓存等）。XDP/AF_XDP **默认启用**，网卡、队列、端口等全部由代码自动推导；文件只需要在显式关闭（或显式覆盖默认值）时出现：
+`configs/api_node.yaml` 是唯一的本地配置文件——除了 API 连接信息，`xdp` 段也在这里。XDP/AF_XDP **默认启用**，网卡、队列、端口等全部由代码自动推导；只需要在显式关闭（或显式覆盖默认值）时提供 `xdp` 段：
 
 ```yaml
 xdp:
   enabled: false
 ```
 
-开关解析顺序：默认启用 < `CLOUD_NODE_XDP` 环境变量 < 文件中的 `xdp.enabled` 显式值（最终裁决）。文件不存在时不会自动生成。RKE2 模式下 XDP 强制关闭。
+开关解析顺序：默认启用 < `CLOUD_NODE_XDP` 环境变量 < 文件中的 `xdp.enabled` 显式值（最终裁决）。启用的 XDP 固定为**双向数据面**（入向代理 + 出向 AF_XDP 回源）；`xdp.upstream.mode` 不是可选开关，配置 `kernel` 会被忽略并记录警告。
 
 `fallback: pass`（默认）表示 attach、XSK 或 map 同步失败时回退到现有 socket 路径并记录 fallback 原因；`fallback: fail-start` 表示启动条件不满足时返回错误。完整说明见 [XDP/AF_XDP 旁路数据面](xdp-af-xdp.md)。
 
@@ -148,8 +148,7 @@ xdp:
 
 常见目录和文件：
 
-- `configs/api_node.yaml`：API 节点连接配置。
-- `configs/runtime.yaml`：本机运行时配置，例如 RKE2 模式和 `xdp.enabled` 显式开关。
+- `configs/api_node.yaml`：唯一的本地配置文件——API 节点连接信息和 `xdp` 段都在这里。
 - `data/GeoLite2-City.mmdb`：GeoIP 城市库。
 - `data/GeoLite2-ASN.mmdb`：ASN 数据库。
 - `data/GeoLite2-Country.mmdb`：国家数据库。

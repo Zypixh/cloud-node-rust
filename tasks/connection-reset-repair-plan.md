@@ -305,7 +305,7 @@ TOA 未开启时，`src/toa.rs` 的 `connect_with_toa` 会直接走普通 `TcpSt
 - `src/xdp.rs`
 - `src/main.rs`
 - `src/xdp_auto_config.rs`
-- `configs/runtime.yaml`
+- `configs/api_node.yaml`
 
 **Estimated scope:** Medium; Linux-only implementation and verification
 

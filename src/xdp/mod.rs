@@ -329,6 +329,7 @@ fn xsk_status_refresh_due(
 /// Workers gate on this lease, not on the manager Arc they were spawned
 /// with: `manager_is_current` must never stop a polling loop that still
 /// owns live sessions.
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) struct AfXdpDataplaneLease {
     /// Set when this socket generation is truly decommissioned — runtime
     /// stop, `xdp.enabled=false`, or dataplane teardown. A compatible
@@ -346,10 +347,10 @@ pub(crate) struct AfXdpDataplaneLease {
     /// spawn, decremented when the worker loop returns. Retirement
     /// callers that rebind the queues wait for this to drain so a new
     /// socket generation never races a dying worker's still-open fd.
-    #[allow(dead_code)]
     live_workers: AtomicU64,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 impl AfXdpDataplaneLease {
     pub(crate) fn new(owner: std::sync::Arc<XdpManager>) -> Self {
         Self {
@@ -410,6 +411,7 @@ impl AfXdpDataplaneLease {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 impl std::fmt::Debug for AfXdpDataplaneLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Deliberately shallow — `owner` is an Arc<XdpManager> and
@@ -484,6 +486,7 @@ pub(crate) struct XdpManager {
     /// `xdp.stateTables` was configured and the defaults were auto-scaled
     /// to fit this node's kernel-BPF budget. Status reports the real
     /// footprint, not the unsized defaults.
+    #[cfg(any(test, target_os = "linux"))]
     effective_state_tables: parking_lot::RwLock<Option<crate::runtime_mode::XdpStateTables>>,
     state: parking_lot::RwLock<RuleState>,
     fallback_reason: parking_lot::RwLock<String>,
@@ -581,7 +584,6 @@ pub(crate) struct XdpManager {
     /// redirect enable attempt, so queue workers stay alive while the
     /// bridge proves they can actually process before opening redirect.
     /// Socket registration alone is not proof a worker is running.
-    #[allow(dead_code)]
     proxy_workers_starting: AtomicBool,
     /// F1: this generation adopted the predecessor's live AF_XDP
     /// dataplane instead of creating fresh sockets — observability for
@@ -625,6 +627,7 @@ impl XdpManager {
     fn new(config: XdpConfig) -> Self {
         Self {
             config,
+            #[cfg(any(test, target_os = "linux"))]
             effective_state_tables: parking_lot::RwLock::new(None),
             state: parking_lot::RwLock::new(RuleState::default()),
             fallback_reason: parking_lot::RwLock::new(String::new()),
@@ -1925,8 +1928,8 @@ impl XdpManager {
     }
 
     /// EN-14: install the cookie key ring if the pinned map has none.
+    #[cfg(target_os = "linux")]
     fn sync_cookie_key(&self) {
-        #[cfg(target_os = "linux")]
         let result = {
             let mut ebpf = self.ebpf.lock();
             match ebpf.as_mut() {
@@ -1934,8 +1937,6 @@ impl XdpManager {
                 None => return,
             }
         };
-        #[cfg(not(target_os = "linux"))]
-        let result: anyhow::Result<()> = Ok(());
         if let Err(err) = result {
             tracing::warn!("XDP cookie key install unavailable: {err}");
         }
@@ -1962,8 +1963,8 @@ impl XdpManager {
     }
 
     /// Push the EN-09 absolute pending deadline into XDP_PENDING_CAP.
+    #[cfg(target_os = "linux")]
     fn sync_pending_cap(&self) {
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
         let ttl_ns = self
             .config
             .admission
@@ -1971,7 +1972,6 @@ impl XdpManager {
             .map(|a| a.tcp_pending_ms)
             .unwrap_or_else(crate::runtime_mode::default_tcp_pending_ms)
             .saturating_mul(1_000_000);
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
         let flags = self
             .config
             .admission
@@ -1980,14 +1980,12 @@ impl XdpManager {
             .unwrap_or(0);
         // EN-16: the admission cap tracks the configured pending-table size
         // so the eBPF bound and the pinned map never disagree.
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
         let max_pending = self
             .config
             .state_tables
             .as_ref()
             .and_then(|t| t.pending_max_entries)
             .unwrap_or(65_536);
-        #[cfg(target_os = "linux")]
         let result = {
             let mut ebpf = self.ebpf.lock();
             match ebpf.as_mut() {
@@ -1995,8 +1993,6 @@ impl XdpManager {
                 None => return,
             }
         };
-        #[cfg(not(target_os = "linux"))]
-        let result: anyhow::Result<()> = Ok(());
         if let Err(err) = result {
             tracing::warn!("XDP pending-cap map sync unavailable: {err}");
         }
@@ -2815,22 +2811,18 @@ pub(crate) fn af_xdp_dial_registry() -> Option<std::sync::Arc<af_xdp::AfXdpDialR
     manager_from_runtime().dial_registry()
 }
 
-/// T4-6: whether `xdp.upstream.mode=afxdp` is selected in the live
-/// runtime config. Always false off-Linux — every upstream surface then
-/// takes its kernel path unchanged.
+/// T4-6: whether upstream dials ride the AF_XDP reactor. True whenever
+/// the live runtime config has the XDP dataplane enabled — an enabled
+/// dataplane is always bidirectional, there is no kernel-outbound mode
+/// to select. Linux-only — every upstream surface gates its call site
+/// and takes the kernel path unchanged elsewhere.
+#[cfg(target_os = "linux")]
 pub(crate) fn afxdp_upstream_selected() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        RuntimeConfig::current()
-            .map(|runtime| {
-                runtime.xdp.upstream_mode() == crate::runtime_mode::XdpUpstreamMode::Afxdp
-            })
-            .unwrap_or(false)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+    RuntimeConfig::current()
+        .map(|runtime| {
+            runtime.xdp.upstream_mode() == crate::runtime_mode::XdpUpstreamMode::Afxdp
+        })
+        .unwrap_or(false)
 }
 
 /// T5: resolved transport policy for QUIC endpoints that are AF_XDP
@@ -2850,9 +2842,9 @@ pub(crate) fn xdp_quic_cc_factory(
 }
 
 /// T4-6: node-originated TCP connect through the AF_XDP dataplane.
-/// Callers must have explicitly selected `xdp.upstream.mode=afxdp`; a
-/// missing registry is an explicit error, never a silent kernel
-/// fallback.
+/// Reached whenever the XDP dataplane is enabled (bidirectional is
+/// mandatory); a missing registry is an explicit error, never a
+/// silent kernel fallback.
 #[cfg(target_os = "linux")]
 pub(crate) async fn af_xdp_dial_tcp(
     remote: std::net::SocketAddr,
@@ -2861,7 +2853,7 @@ pub(crate) async fn af_xdp_dial_tcp(
     let registry = af_xdp_dial_registry().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotConnected,
-            "xdp.upstream.mode=afxdp but no live AF_XDP dial registry \
+            "XDP enabled but no live AF_XDP dial registry \
              (bridge not started or dial guard install failed — see xdp status dialGuardDetail)",
         )
     })?;
@@ -2878,7 +2870,7 @@ pub(crate) async fn af_xdp_dial_udp(
     let registry = af_xdp_dial_registry().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotConnected,
-            "xdp.upstream.mode=afxdp but no live AF_XDP dial registry \
+            "XDP enabled but no live AF_XDP dial registry \
              (bridge not started or dial guard install failed — see xdp status dialGuardDetail)",
         )
     })?;

@@ -25,13 +25,13 @@
 //!   is an explicit capacity decision (counted via `PROCESS_LOCK_PRIVATE`),
 //!   never a silent loss of coordination.
 //!
-//! The layer is only active when the runtime explicitly declares a shared
-//! volume: `RuntimeConfig::current_is_rke2()` — the same gate the rest of the
-//! cache uses for "another process may mount these roots". In the default
-//! single-process mode the volume is exclusively owned, nothing can share it,
-//! and every acquire returns an empty guard with zero syscalls. This is not
-//! silently assumed — it is the declared default, and enabling RKE2 mode is
-//! the explicit opt-in that activates the locks.
+//! The layer was only active when the runtime explicitly declared a shared
+//! cache volume (RKE2 cluster mode). That deployment mode was removed with
+//! the runtime configuration file — cache roots are now always exclusively
+//! owned by this process and every acquire returns an empty guard with zero
+//! syscalls. The machinery itself remains, exercised by tests via
+//! `FORCE_PROCESS_LOCKS`, so the coordination semantics stay covered should
+//! a shared-volume mode ever return.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -67,15 +67,16 @@ pub(crate) static PROCESS_LOCK_DISABLED: AtomicU64 = AtomicU64::new(0);
 static DISABLED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Cross-process coordination is only needed when a second process can mount
-/// the cache volume, which is exactly what the RKE2 runtime declaration says.
-/// Every other configuration owns its roots exclusively; taking flock()s
-/// there would only pay syscalls to exclude participants that cannot exist.
+/// the cache volume. The RKE2 shared-volume declaration was the only such
+/// configuration; with it gone, every deployment owns its roots exclusively
+/// and taking flock()s would only pay syscalls to exclude participants that
+/// cannot exist.
 fn process_locks_enabled() -> bool {
     #[cfg(test)]
     if FORCE_PROCESS_LOCKS.load(Ordering::Relaxed) {
         return true;
     }
-    crate::runtime_mode::RuntimeConfig::current_is_rke2()
+    false
 }
 
 #[cfg(test)]
@@ -528,7 +529,7 @@ async fn acquire(
         PROCESS_LOCK_DISABLED.fetch_add(1, Ordering::Relaxed);
         if !DISABLED_LOGGED.swap(true, Ordering::Relaxed) {
             tracing::info!(
-                "CACHE_PROCESS_LOCK: disabled — single-process mode (no RKE2/shared-volume declaration); cache roots are exclusively owned"
+                "CACHE_PROCESS_LOCK: disabled — single-process mode; cache roots are exclusively owned"
             );
         }
         return Ok(CacheProcessLockGuard::new());

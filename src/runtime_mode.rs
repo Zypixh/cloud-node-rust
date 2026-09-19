@@ -1,43 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock as OnceCell;
 
 static RUNTIME_CONFIG: OnceCell<parking_lot::RwLock<Option<RuntimeConfig>>> = OnceCell::new();
 #[cfg(test)]
 static RUNTIME_CONFIG_TEST_LOCK: OnceCell<parking_lot::Mutex<()>> = OnceCell::new();
-
-const DEFAULT_INTERNAL_TOKEN_ENV: &str = "CLOUD_NODE_CLUSTER_INTERNAL_TOKEN";
-const DEFAULT_POD_NAME_ENV: &str = "POD_NAME";
-const DEFAULT_POD_IP_ENV: &str = "POD_IP";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[derive(Default)]
-pub enum RuntimeMode {
-    #[default]
-    Standalone,
-    Rke2,
-}
-
-impl RuntimeMode {
-    pub fn from_env_value(value: &str) -> anyhow::Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "" | "standalone" | "single" | "local" => Ok(Self::Standalone),
-            "rke2" | "kubernetes" | "k8s" | "cluster" => Ok(Self::Rke2),
-            other => anyhow::bail!("unsupported CLOUD_NODE_MODE value: {other}"),
-        }
-    }
-
-    pub fn is_rke2(self) -> bool {
-        self == Self::Rke2
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct RuntimeSection {
-    #[serde(default)]
-    pub mode: RuntimeMode,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -628,9 +595,17 @@ pub struct XdpConfig {
 }
 
 impl XdpConfig {
-    /// Resolved upstream dataplane mode (`kernel` when unconfigured).
+    /// Resolved upstream dataplane mode. An enabled XDP dataplane is always
+    /// bidirectional — upstream dials ride the AF_XDP reactor, there is no
+    /// kernel-connect mode to select — so `enabled` short-circuits any
+    /// configured `upstream.mode`. A disabled dataplane reports the
+    /// configured value (default `kernel`), which is inert.
     pub fn upstream_mode(&self) -> XdpUpstreamMode {
-        self.upstream.as_ref().map(|u| u.mode).unwrap_or_default()
+        if self.enabled {
+            XdpUpstreamMode::Afxdp
+        } else {
+            self.upstream.as_ref().map(|u| u.mode).unwrap_or_default()
+        }
     }
 
     /// Resolved reserved source-port span for AF_XDP dials.
@@ -675,132 +650,12 @@ pub struct XdpStateTables {
     pub rate_v4_max_entries: Option<u32>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ClusterConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_cluster_type")]
-    pub r#type: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub namespace: String,
-    #[serde(rename = "serviceName", default)]
-    pub service_name: String,
-    #[serde(rename = "podNameEnv", default = "default_pod_name_env")]
-    pub pod_name_env: String,
-    #[serde(rename = "podIpEnv", default = "default_pod_ip_env")]
-    pub pod_ip_env: String,
-    #[serde(rename = "internalApi", default)]
-    pub internal_api: InternalApiConfig,
-    #[serde(rename = "leaderElection", default)]
-    pub leader_election: LeaderElectionConfig,
-    #[serde(default)]
-    pub cache: ClusterCacheConfig,
-}
-
-impl Default for ClusterConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            r#type: default_cluster_type(),
-            name: String::new(),
-            namespace: String::new(),
-            service_name: String::new(),
-            pod_name_env: default_pod_name_env(),
-            pod_ip_env: default_pod_ip_env(),
-            internal_api: InternalApiConfig::default(),
-            leader_election: LeaderElectionConfig::default(),
-            cache: ClusterCacheConfig::default(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InternalApiConfig {
-    #[serde(default = "default_internal_api_bind")]
-    pub bind: String,
-    #[serde(rename = "tokenEnv", default = "default_internal_token_env")]
-    pub token_env: String,
-}
-
-impl Default for InternalApiConfig {
-    fn default() -> Self {
-        Self {
-            bind: default_internal_api_bind(),
-            token_env: default_internal_token_env(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LeaderElectionConfig {
-    #[serde(rename = "leaseName", default = "default_lease_name")]
-    pub lease_name: String,
-    #[serde(
-        rename = "leaseDurationSeconds",
-        default = "default_lease_duration_seconds"
-    )]
-    pub lease_duration_seconds: u64,
-    #[serde(
-        rename = "renewDeadlineSeconds",
-        default = "default_renew_deadline_seconds"
-    )]
-    pub renew_deadline_seconds: u64,
-    #[serde(
-        rename = "retryPeriodSeconds",
-        default = "default_retry_period_seconds"
-    )]
-    pub retry_period_seconds: u64,
-}
-
-impl Default for LeaderElectionConfig {
-    fn default() -> Self {
-        Self {
-            lease_name: default_lease_name(),
-            lease_duration_seconds: default_lease_duration_seconds(),
-            renew_deadline_seconds: default_renew_deadline_seconds(),
-            retry_period_seconds: default_retry_period_seconds(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ClusterCacheConfig {
-    #[serde(rename = "localMetaDir", default)]
-    pub local_meta_dir: PathBuf,
-    #[serde(rename = "maxFastL1Bytes", default)]
-    pub max_fast_l1_bytes: u64,
-    #[serde(rename = "sharedMaxBytes", default)]
-    pub shared_max_bytes: String,
-    #[serde(rename = "minFreeBytes", default)]
-    pub min_free_bytes: String,
-    #[serde(rename = "ignoreControlPlaneStorageOptions", default)]
-    pub ignore_control_plane_storage_options: bool,
-    #[serde(rename = "shardStrategy", default = "default_shard_strategy")]
-    pub shard_strategy: String,
-    #[serde(default)]
-    pub shards: Vec<ClusterCacheShardConfig>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ClusterCacheShardConfig {
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub path: PathBuf,
-    #[serde(default = "default_shard_weight")]
-    pub weight: u32,
-    #[serde(default = "default_longhorn_replicas")]
-    pub replicas: u32,
-}
-
+/// Node-local runtime configuration. `configs/api_node.yaml` is the only
+/// configuration file: the API-facing keys are parsed by `ApiConfig`, this
+/// struct owns the `xdp` section of the same file. There is no separate
+/// runtime/cluster config — the node always runs standalone.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    #[serde(default)]
-    pub runtime: RuntimeSection,
-    #[serde(default)]
-    pub cluster: ClusterConfig,
     #[serde(default)]
     pub xdp: XdpConfig,
 }
@@ -808,13 +663,16 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     pub fn load_default() -> anyhow::Result<Self> {
         let node_paths = crate::paths::NodePaths::current();
-        let config_path = node_paths.runtime_config_file();
+        let config_path = node_paths
+            .api_config_candidates()
+            .into_iter()
+            .find(|path| path.exists());
         // Read the file twice: once as a raw value to learn whether the
         // operator explicitly set `xdp.enabled` (an absent key must not
         // override the environment), and once into the typed config.
         let mut file_xdp_enabled = None;
-        let mut config = if config_path.exists() {
-            tracing::info!("Loading runtime config from: {}", config_path.display());
+        let mut config = if let Some(config_path) = config_path {
+            tracing::info!("Loading node config from: {}", config_path.display());
             let content = std::fs::read_to_string(&config_path)?;
             file_xdp_enabled = serde_yaml::from_str::<serde_yaml::Value>(&content)
                 .ok()
@@ -828,16 +686,6 @@ impl RuntimeConfig {
             Self::default()
         };
 
-        if let Ok(mode) = std::env::var("CLOUD_NODE_MODE") {
-            config.runtime.mode = RuntimeMode::from_env_value(&mode)?;
-            if config.runtime.mode.is_rke2() {
-                config.cluster.enabled = true;
-                if config.cluster.r#type.is_empty() {
-                    config.cluster.r#type = default_cluster_type();
-                }
-            }
-        }
-
         // XDP is enabled unless told otherwise. Precedence, weakest first:
         // built-in default (on) < CLOUD_NODE_XDP env var < explicit
         // `xdp.enabled` in the config file. Everything else about the
@@ -848,11 +696,6 @@ impl RuntimeConfig {
             None => Self::xdp_enabled_from_env()?,
         };
         config.xdp.enabled = xdp_enabled.unwrap_or(true);
-        if config.is_rke2() {
-            // Cluster mode never runs the XDP dataplane: AF_XDP owns the NIC
-            // queues and would starve Kubernetes networking on the node.
-            config.xdp.enabled = false;
-        }
 
         config.validate()?;
         Ok(config)
@@ -886,90 +729,23 @@ impl RuntimeConfig {
             .and_then(|config| config.read().clone())
     }
 
-    pub fn current_mode() -> RuntimeMode {
-        Self::current()
-            .map(|config| config.mode())
-            .unwrap_or_default()
-    }
-
-    pub fn current_is_rke2() -> bool {
-        Self::current_mode().is_rke2()
-    }
-
-    pub fn mode(&self) -> RuntimeMode {
-        self.runtime.mode
-    }
-
-    pub fn is_rke2(&self) -> bool {
-        self.mode().is_rke2()
-    }
-
     pub fn validate(&self) -> anyhow::Result<()> {
-        self.validate_xdp()?;
-
-        if !self.is_rke2() {
-            return Ok(());
-        }
-
-        self.validate_cluster_cache_paths()?;
-
-        if !self.cluster.enabled {
-            anyhow::bail!("runtime.mode=rke2 requires cluster.enabled=true");
-        }
-        if self.cluster.r#type != "rke2" {
-            anyhow::bail!("runtime.mode=rke2 requires cluster.type=rke2");
-        }
-        if self.cluster.name.trim().is_empty() {
-            anyhow::bail!("runtime.mode=rke2 requires cluster.name");
-        }
-        if self.cluster.namespace.trim().is_empty() {
-            anyhow::bail!("runtime.mode=rke2 requires cluster.namespace");
-        }
-        if self.cluster.service_name.trim().is_empty() {
-            anyhow::bail!("runtime.mode=rke2 requires cluster.serviceName");
-        }
-        if self.cluster.cache.local_meta_dir.as_os_str().is_empty() {
-            anyhow::bail!("runtime.mode=rke2 requires cluster.cache.localMetaDir");
-        }
-        if self.cluster.cache.shards.is_empty() {
-            anyhow::bail!("runtime.mode=rke2 requires at least one cluster.cache.shards entry");
-        }
-        if self.cluster.internal_api.token_env.trim().is_empty() {
-            anyhow::bail!("runtime.mode=rke2 requires cluster.internalApi.tokenEnv");
-        }
-        if std::env::var(&self.cluster.internal_api.token_env)
-            .map(|value| value.trim().is_empty())
-            .unwrap_or(true)
-        {
-            anyhow::bail!(
-                "runtime.mode=rke2 requires non-empty {} environment variable",
-                self.cluster.internal_api.token_env
-            );
-        }
-        require_env(&self.cluster.pod_name_env, "pod name")?;
-        require_env(&self.cluster.pod_ip_env, "pod ip")?;
-
-        for shard in &self.cluster.cache.shards {
-            if shard.id.trim().is_empty() {
-                anyhow::bail!("runtime.mode=rke2 requires every cache shard to have an id");
-            }
-            if shard.path.as_os_str().is_empty() {
-                anyhow::bail!("runtime.mode=rke2 requires every cache shard to have a path");
-            }
-            if shard.weight == 0 {
-                anyhow::bail!("cache shard {} has invalid weight=0", shard.id);
-            }
-            if !(1..=3).contains(&shard.replicas) {
-                anyhow::bail!("cache shard {} replicas must be 1, 2, or 3", shard.id);
-            }
-        }
-
-        Ok(())
+        self.validate_xdp()
     }
 
     fn validate_xdp(&self) -> anyhow::Result<()> {
         if !self.xdp.enabled {
             return Ok(());
+        }
+        if self
+            .xdp
+            .upstream
+            .as_ref()
+            .is_some_and(|u| u.mode == XdpUpstreamMode::Kernel)
+        {
+            tracing::warn!(
+                "xdp.upstream.mode=kernel is ignored: an enabled XDP dataplane is always bidirectional (AF_XDP upstream)"
+            );
         }
         for interface in &self.xdp.interfaces {
             if interface.name.trim().is_empty() {
@@ -1031,40 +807,6 @@ impl RuntimeConfig {
         // time against the kernel value.
         Ok(())
     }
-
-    fn validate_cluster_cache_paths(&self) -> anyhow::Result<()> {
-        let local_meta_dir = &self.cluster.cache.local_meta_dir;
-        if local_meta_dir.as_os_str().is_empty() {
-            return Ok(());
-        }
-
-        for shard in &self.cluster.cache.shards {
-            if shard.path.as_os_str().is_empty() {
-                continue;
-            }
-            if local_meta_dir.starts_with(&shard.path) {
-                anyhow::bail!(
-                    "cluster.cache.localMetaDir must not be inside shared cache shard {} ({})",
-                    shard.id,
-                    shard.path.display()
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-fn require_env(name: &str, label: &str) -> anyhow::Result<()> {
-    if name.trim().is_empty() {
-        anyhow::bail!("runtime.mode=rke2 requires {label} env name");
-    }
-    if std::env::var(name)
-        .map(|value| value.trim().is_empty())
-        .unwrap_or(true)
-    {
-        anyhow::bail!("runtime.mode=rke2 requires non-empty {name} environment variable");
-    }
-    Ok(())
 }
 
 fn default_xdp_frame_size() -> u32 {
@@ -1079,54 +821,6 @@ fn default_xdp_proxy_protocols() -> Vec<XdpProxyProtocol> {
         XdpProxyProtocol::Udp,
         XdpProxyProtocol::H3,
     ]
-}
-
-fn default_cluster_type() -> String {
-    "rke2".to_string()
-}
-
-fn default_pod_name_env() -> String {
-    DEFAULT_POD_NAME_ENV.to_string()
-}
-
-fn default_pod_ip_env() -> String {
-    DEFAULT_POD_IP_ENV.to_string()
-}
-
-fn default_internal_api_bind() -> String {
-    "0.0.0.0:19090".to_string()
-}
-
-fn default_internal_token_env() -> String {
-    DEFAULT_INTERNAL_TOKEN_ENV.to_string()
-}
-
-fn default_lease_name() -> String {
-    "cloud-node-leader".to_string()
-}
-
-fn default_lease_duration_seconds() -> u64 {
-    15
-}
-
-fn default_renew_deadline_seconds() -> u64 {
-    10
-}
-
-fn default_retry_period_seconds() -> u64 {
-    2
-}
-
-fn default_shard_strategy() -> String {
-    "hash_mod".to_string()
-}
-
-fn default_shard_weight() -> u32 {
-    1
-}
-
-fn default_longhorn_replicas() -> u32 {
-    2
 }
 
 #[cfg(test)]
@@ -1165,7 +859,6 @@ mod tests {
                 },
                 ..Default::default()
             },
-            ..Default::default()
         });
 
         let current = RuntimeConfig::current().unwrap();
@@ -1348,7 +1041,7 @@ xdp:
         ));
         if let Some(contents) = contents {
             std::fs::create_dir_all(dir.join("configs")).unwrap();
-            std::fs::write(dir.join("configs").join("runtime.yaml"), contents).unwrap();
+            std::fs::write(dir.join("configs").join("api_node.yaml"), contents).unwrap();
         } else {
             std::fs::create_dir_all(&dir).unwrap();
         }
@@ -1371,83 +1064,81 @@ xdp:
     }
 
     const NO_XDP_ENV: (&str, Option<&str>) = ("CLOUD_NODE_XDP", None);
-    const NO_MODE_ENV: (&str, Option<&str>) = ("CLOUD_NODE_MODE", None);
 
     #[test]
     fn xdp_enabled_precedence_default_env_file() {
         let _guard = runtime_config_test_guard();
-        let clear = &[NO_XDP_ENV, NO_MODE_ENV];
+        let clear = &[NO_XDP_ENV];
 
         // No file, no env: default enabled.
         assert!(load_xdp_enabled(None, clear).unwrap());
         // No file: env toggles.
-        assert!(!load_xdp_enabled(None, &[xdp_var("0"), NO_MODE_ENV]).unwrap());
-        assert!(load_xdp_enabled(None, &[xdp_var("true"), NO_MODE_ENV]).unwrap());
+        assert!(!load_xdp_enabled(None, &[xdp_var("0")]).unwrap());
+        assert!(load_xdp_enabled(None, &[xdp_var("true")]).unwrap());
         // File without xdp.enabled: env still applies.
-        assert!(!load_xdp_enabled(Some("cluster: {}\n"), &[xdp_var("off"), NO_MODE_ENV]).unwrap());
+        assert!(!load_xdp_enabled(Some("nodeId: 1\n"), &[xdp_var("off")]).unwrap());
         assert!(load_xdp_enabled(Some("xdp: {}\n"), clear).unwrap());
         // File is the final authority in both directions.
+        assert!(load_xdp_enabled(Some("xdp:\n  enabled: true\n"), &[xdp_var("0")]).unwrap());
         assert!(
-            load_xdp_enabled(
-                Some("xdp:\n  enabled: true\n"),
-                &[xdp_var("0"), NO_MODE_ENV]
-            )
-            .unwrap()
-        );
-        assert!(
-            !load_xdp_enabled(
-                Some("xdp:\n  enabled: false\n"),
-                &[xdp_var("1"), NO_MODE_ENV]
-            )
-            .unwrap()
+            !load_xdp_enabled(Some("xdp:\n  enabled: false\n"), &[xdp_var("1")]).unwrap()
         );
         assert!(!load_xdp_enabled(Some("xdp:\n  enabled: false\n"), clear).unwrap());
         // Garbage env values are an explicit error, not a silent default.
-        assert!(load_xdp_enabled(None, &[xdp_var("maybe"), NO_MODE_ENV]).is_err());
+        assert!(load_xdp_enabled(None, &[xdp_var("maybe")]).is_err());
     }
 
     #[test]
-    fn xdp_enabled_forced_off_in_rke2_mode() {
-        let _guard = runtime_config_test_guard();
-        let file = r#"
-cluster:
-  enabled: true
-  type: rke2
-  name: prod
-  namespace: cloud-node
-  serviceName: cloud-node
-  cache:
-    localMetaDir: /tmp/meta
-    shards:
-      - id: s0
-        path: /tmp/shard0
-        weight: 1
-        replicas: 1
-"#;
-        let vars = &[
-            xdp_var("1"),
-            ("CLOUD_NODE_MODE", Some("rke2")),
-            ("CLOUD_NODE_CLUSTER_INTERNAL_TOKEN", Some("token")),
-            ("POD_NAME", Some("pod-0")),
-            ("POD_IP", Some("10.0.0.1")),
-        ];
-        assert!(!load_xdp_enabled(Some(file), vars).unwrap());
+    fn xdp_enabled_forces_bidirectional_upstream() {
+        // Mandate: an enabled XDP dataplane is always bidirectional — the
+        // AF_XDP reactor owns upstream dials; `upstream.mode` is not a
+        // selectable escape hatch.
+        for configured in [
+            None,
+            Some(XdpUpstreamMode::Kernel),
+            Some(XdpUpstreamMode::Afxdp),
+        ] {
+            let config = XdpConfig {
+                enabled: true,
+                upstream: configured.map(|mode| XdpUpstreamSettings {
+                    mode,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(config.upstream_mode(), XdpUpstreamMode::Afxdp);
+        }
+        // Disabled reports the configured (inert) mode.
+        let config = XdpConfig {
+            enabled: false,
+            upstream: Some(XdpUpstreamSettings {
+                mode: XdpUpstreamMode::Afxdp,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(config.upstream_mode(), XdpUpstreamMode::Afxdp);
+        assert_eq!(
+            XdpConfig::default().upstream_mode(),
+            XdpUpstreamMode::Kernel
+        );
     }
 
     #[test]
     fn xdp_save_xdp_enabled_preserves_other_keys() {
         let _guard = runtime_config_test_guard();
         let home = xdp_home(Some(
-            "runtime:\n  mode: standalone\ncluster:\n  name: prod\nxdp:\n  enabled: false\n  attachMode: drv\n",
+            "nodeId: 7\nsecret: s3\nxdp:\n  enabled: false\n  attachMode: drv\n",
         ));
-        let path = home.join("configs").join("runtime.yaml");
+        let path = home.join("configs").join("api_node.yaml");
         crate::xdp_config_wizard::save_xdp_enabled(&path, true).unwrap();
 
         let body = std::fs::read_to_string(&path).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
         assert_eq!(value["xdp"]["enabled"].as_bool(), Some(true));
         assert!(value["xdp"]["attachMode"].is_null());
-        assert_eq!(value["cluster"]["name"].as_str(), Some("prod"));
+        assert_eq!(value["nodeId"].as_i64(), Some(7));
+        assert_eq!(value["secret"].as_str(), Some("s3"));
         std::fs::remove_dir_all(&home).ok();
     }
 }

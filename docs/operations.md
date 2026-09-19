@@ -68,7 +68,7 @@ cloud-node xdp doctor
 cloud-node xdp status
 ```
 
-如需关闭，设置 `CLOUD_NODE_XDP=0` 或在 `configs/runtime.yaml` 中写 `xdp.enabled: false`（文件为最终裁决）。如果生产环境要求 XDP 不可用时拒绝启动，把 `xdp.fallback` 设置为 `fail-start`；默认 `pass` 会回退到原监听器并记录原因。
+如需关闭，设置 `CLOUD_NODE_XDP=0` 或在 `configs/api_node.yaml` 中写 `xdp.enabled: false`（文件为最终裁决）。如果生产环境要求 XDP 不可用时拒绝启动，把 `xdp.fallback` 设置为 `fail-start`；默认 `pass` 会回退到原监听器并记录原因。
 
 ## 内置 NTP 命令
 

@@ -415,7 +415,7 @@ enum XdpCommands {
     /// Dump XDP shadow maps known to this process
     #[command(name = "dump-maps")]
     DumpMaps,
-    /// Detach and attach again using configs/runtime.yaml
+    /// Detach and attach again using configs/api_node.yaml
     Reload,
     /// Attach and poll raw AF_XDP frames for a short Linux dataplane smoke test
     #[command(name = "raw-smoke")]
@@ -941,7 +941,7 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             let effective_xdp = if file_config_is_authoritative {
                 // The file's explicit interface list is authoritative: apply
                 // CLI overrides on top without consulting the live node config
-                // (attach must work with a fully-declared runtime.yaml).
+                // (attach must work with a fully-declared api_node.yaml).
                 let mut xdp = runtime_config.xdp.clone();
                 if let Some(mode) = mode {
                     let mode = XdpRuntimeMode::from(mode);
@@ -1003,7 +1003,7 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
+            let runtime_path = cloud_node_rust::paths::NodePaths::current().api_config_file();
             if file_config_is_authoritative {
                 cloud_node_rust::xdp_config_wizard::merge_xdp_enabled(&runtime_path, true)?;
             } else {
@@ -1032,7 +1032,7 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
                 .build()?;
             rt.block_on(cloud_node_rust::xdp::detach(purge_state))?;
             runtime_config.xdp.enabled = false;
-            let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
+            let runtime_path = cloud_node_rust::paths::NodePaths::current().api_config_file();
             save_xdp_enabled(&runtime_path, false)?;
             RuntimeConfig::set_current(runtime_config);
             print_xdp_status();
@@ -3143,7 +3143,6 @@ WantedBy=multi-user.target\n",
                 t("test.relay_copy_buffer"),
                 cloud_node_rust::memory_governor::MEMORY_GOVERNOR.relay_copy_buffer_bytes()
             );
-            println!("{}: {:?}", t("test.runtime_mode"), runtime_config.mode());
             println!(
                 "XDP: enabled={} attachMode={} fallback={} interfaces={}",
                 yes_no(runtime_config.xdp.enabled),
@@ -3363,15 +3362,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         Duration::from_millis(access_log_pipeline.warning_interval_ms),
     );
     let mut runtime_config =
-        RuntimeConfig::load_default().expect("Failed to load configs/runtime.yaml");
-    if runtime_config.is_rke2() {
-        info!(
-            "RKE2 runtime mode enabled for cluster {} in namespace {}.",
-            runtime_config.cluster.name, runtime_config.cluster.namespace
-        );
-    } else {
-        info!("Standalone runtime mode enabled.");
-    }
+        RuntimeConfig::load_default().expect("Failed to load configs/api_node.yaml");
     RuntimeConfig::set_current(runtime_config.clone());
     repair_missing_xdp_ebpf_object_for_current_runtime(&node_paths);
     if runtime_config.xdp.enabled && runtime_config.xdp.interfaces.is_empty() {
@@ -3444,12 +3435,6 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     }
     spawn_xdp_port_sync_task(&rt, runtime_config.xdp.enabled);
     spawn_xdp_diag_log_task(&rt, runtime_config.xdp.enabled);
-    if runtime_config.is_rke2() {
-        cloud_node_rust::cache_manager::CACHE
-            .storage
-            .apply_cluster_cache_config(&runtime_config.cluster.cache)?;
-    }
-    cloud_node_rust::cluster::runtime::start(&runtime_config);
     let api_config_arc = Arc::new(api_config.clone());
     cloud_node_rust::client_agent::load_client_agent_ip_index();
     cloud_node_rust::client_agent::start_client_agent_queue(api_config_arc.clone());

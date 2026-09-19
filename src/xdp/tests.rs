@@ -190,10 +190,7 @@ fn xdp_reload_manager_replacement_preserves_active_rules() {
         }],
         ..XdpConfig::default()
     };
-    RuntimeConfig::set_current(RuntimeConfig {
-        xdp: first_config,
-        ..RuntimeConfig::default()
-    });
+    RuntimeConfig::set_current(RuntimeConfig { xdp: first_config });
 
     let old_manager = replace_manager_from_runtime();
     let now = crate::utils::time::now_timestamp();
@@ -222,7 +219,6 @@ fn xdp_reload_manager_replacement_preserves_active_rules() {
             }],
             ..XdpConfig::default()
         },
-        ..RuntimeConfig::default()
     });
 
     let new_manager = replace_manager_from_runtime();
@@ -246,17 +242,11 @@ fn xdp_reload_manager_replacement_preserves_active_rules() {
 #[test]
 fn xdp_manager_current_identity_changes_after_replacement() {
     let _guard = crate::runtime_mode::runtime_config_test_guard();
-    RuntimeConfig::set_current(RuntimeConfig {
-        xdp: test_proxy_config("eth-old"),
-        ..RuntimeConfig::default()
-    });
+    RuntimeConfig::set_current(RuntimeConfig { xdp: test_proxy_config("eth-old") });
     let old_manager = replace_manager_from_runtime();
     assert!(manager_is_current(&old_manager));
 
-    RuntimeConfig::set_current(RuntimeConfig {
-        xdp: test_proxy_config("eth-new"),
-        ..RuntimeConfig::default()
-    });
+    RuntimeConfig::set_current(RuntimeConfig { xdp: test_proxy_config("eth-new") });
     let new_manager = replace_manager_from_runtime();
 
     assert!(!manager_is_current(&old_manager));
@@ -267,20 +257,14 @@ fn xdp_manager_current_identity_changes_after_replacement() {
 fn xdp_runtime_disabled_replaces_stale_attached_manager() {
     let _guard = crate::runtime_mode::runtime_config_test_guard();
     let enabled_config = test_proxy_config("eth-stale");
-    RuntimeConfig::set_current(RuntimeConfig {
-        xdp: enabled_config.clone(),
-        ..RuntimeConfig::default()
-    });
+    RuntimeConfig::set_current(RuntimeConfig { xdp: enabled_config.clone() });
     let old_manager = replace_manager_from_runtime();
     mark_test_proxy_bridge_ready(&old_manager);
     assert!(old_manager.status().attached);
 
     let mut disabled_config = enabled_config;
     disabled_config.enabled = false;
-    RuntimeConfig::set_current(RuntimeConfig {
-        xdp: disabled_config,
-        ..RuntimeConfig::default()
-    });
+    RuntimeConfig::set_current(RuntimeConfig { xdp: disabled_config });
 
     let disabled_manager = manager_from_runtime();
     let status = disabled_manager.status();
@@ -298,10 +282,7 @@ fn xdp_proxy_bridge_lifecycle_survives_reload_and_stops_on_retire() {
     // lease that still owns sessions. The lease only yields to a real
     // teardown (retire) or a redirect shutdown on the *current* owner.
     let _guard = crate::runtime_mode::runtime_config_test_guard();
-    RuntimeConfig::set_current(RuntimeConfig {
-        xdp: test_proxy_config("eth-old"),
-        ..RuntimeConfig::default()
-    });
+    RuntimeConfig::set_current(RuntimeConfig { xdp: test_proxy_config("eth-old") });
     let old_manager = replace_manager_from_runtime();
     mark_test_proxy_bridge_ready(&old_manager);
     let lease = test_dataplane_lease(&old_manager);
@@ -309,10 +290,7 @@ fn xdp_proxy_bridge_lifecycle_survives_reload_and_stops_on_retire() {
 
     // Manager publish alone must not stop the dataplane — this was the
     // F1 freeze: workers exited at publish and orphaned live sessions.
-    RuntimeConfig::set_current(RuntimeConfig {
-        xdp: test_proxy_config("eth-new"),
-        ..RuntimeConfig::default()
-    });
+    RuntimeConfig::set_current(RuntimeConfig { xdp: test_proxy_config("eth-new") });
     let new_manager = replace_manager_from_runtime();
     mark_test_proxy_bridge_ready(&new_manager);
     assert!(af_xdp::proxy_bridge_should_continue(&lease));
@@ -435,10 +413,7 @@ fn apply_rule_diff_adds_removes_only_deltas() {
 #[test]
 fn xdp_proxy_bridge_lifecycle_continues_only_when_ready() {
     let _guard = crate::runtime_mode::runtime_config_test_guard();
-    RuntimeConfig::set_current(RuntimeConfig {
-        xdp: test_proxy_config("eth-new"),
-        ..RuntimeConfig::default()
-    });
+    RuntimeConfig::set_current(RuntimeConfig { xdp: test_proxy_config("eth-new") });
     let new_manager = replace_manager_from_runtime();
     mark_test_proxy_bridge_ready(&new_manager);
     let lease = test_dataplane_lease(&new_manager);
@@ -4303,10 +4278,7 @@ fn kernel_bpf_budget_is_bounded_by_state_budget() {
 #[test]
 fn xdp_proxy_bridge_worker_lease_covers_startup_without_redirect() {
     let _guard = crate::runtime_mode::runtime_config_test_guard();
-    RuntimeConfig::set_current(RuntimeConfig {
-        xdp: test_proxy_config("eth-new"),
-        ..RuntimeConfig::default()
-    });
+    RuntimeConfig::set_current(RuntimeConfig { xdp: test_proxy_config("eth-new") });
     let manager = replace_manager_from_runtime();
     mark_test_proxy_bridge_ready(&manager);
     let lease = test_dataplane_lease(&manager);

@@ -72,10 +72,7 @@ def teardown_netns():
 
 
 def write_node_config(path):
-    body = f"""runtime:
-  mode: standalone
-
-xdp:
+    body = f"""xdp:
   enabled: true
   attachMode: skb
   fallback: fail-start
@@ -98,8 +95,10 @@ xdp:
 
 
 def write_api_config(path):
+    # Appends the API stub to api_node.yaml — write_node_config already
+    # wrote the xdp: section of the same file.
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "a") as f:
         f.write('nodeId: "0"\nsecret: "en16-probe"\n'
                 '"rpc.endpoints":\n  - "http://127.0.0.1:9/"\n'
                 '"rpc.disableUpdate": true\n'
@@ -108,7 +107,7 @@ def write_api_config(path):
 
 def prepare_home(cwd):
     home = os.path.join(cwd, "home")
-    write_node_config(os.path.join(home, "configs", "runtime.yaml"))
+    write_node_config(os.path.join(home, "configs", "api_node.yaml"))
     write_api_config(os.path.join(home, "configs", "api_node.yaml"))
     return home
 

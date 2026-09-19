@@ -2,8 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="$ROOT_DIR/configs/runtime.yaml"
-BACKUP_FILE=""
+# The node resolves configs/api_node.yaml under CLOUD_NODE_HOME — point it
+# at a throwaway home so smoke configs never touch the real
+# configs/api_node.yaml (which carries API credentials).
+SMOKE_HOME="$(mktemp -d)"
+export CLOUD_NODE_HOME="$SMOKE_HOME"
+CONFIG_FILE="$SMOKE_HOME/configs/api_node.yaml"
 NS_NAME="${XDP_SMOKE_NS:-cn-xdp-smoke}"
 HOST_IF="${XDP_SMOKE_HOST_IF:-cnxdp0}"
 PEER_IF="${XDP_SMOKE_PEER_IF:-cnxdp1}"
@@ -46,10 +50,7 @@ cleanup() {
     ip link set "$HOST_IF" down >/dev/null 2>&1
     ip link delete "$HOST_IF" >/dev/null 2>&1
     ip netns delete "$NS_NAME" >/dev/null 2>&1
-    if [[ -n "$BACKUP_FILE" && -f "$BACKUP_FILE" ]]; then
-        cp "$BACKUP_FILE" "$CONFIG_FILE"
-        rm -f "$BACKUP_FILE"
-    fi
+    rm -rf "$SMOKE_HOME"
 }
 trap cleanup EXIT
 
@@ -442,12 +443,8 @@ PY
 
 cd "$ROOT_DIR"
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    mkdir -p "$(dirname "$CONFIG_FILE")"
-    printf 'runtime:\n  mode: standalone\n' > "$CONFIG_FILE"
-fi
-BACKUP_FILE="$(mktemp)"
-cp "$CONFIG_FILE" "$BACKUP_FILE"
+mkdir -p "$(dirname "$CONFIG_FILE")"
+printf 'xdp:\n  enabled: false\n' > "$CONFIG_FILE"
 
 if [[ "${XDP_SMOKE_SKIP_BUILD:-0}" != "1" ]]; then
     log "building eBPF object"
@@ -482,9 +479,6 @@ ip netns exec "$NS_NAME" ip link set "$PEER_IF" up
 ip netns exec "$NS_NAME" ip link set lo up
 
 cat > "$CONFIG_FILE" <<YAML
-runtime:
-  mode: standalone
-
 xdp:
   enabled: true
   attachMode: skb
@@ -528,9 +522,6 @@ supported_count="$(grep -o '"dataplaneSupported": true' <<<"$maps_output" | wc -
 [[ "$supported_count" -eq 5 ]] || die "expected all five proxy protocols to be dataplane supported, got $supported_count"
 
 cat > "$CONFIG_FILE" <<YAML
-runtime:
-  mode: standalone
-
 xdp:
   enabled: true
   attachMode: skb
@@ -572,9 +563,6 @@ sleep 5
 run_proxy_smoke "HTTP HTTPS TCP UDP SNI QUIC H3 application proxy dataplane" "$HOST_IP"
 
 cat > "$CONFIG_FILE" <<YAML
-runtime:
-  mode: standalone
-
 xdp:
   enabled: true
   attachMode: skb

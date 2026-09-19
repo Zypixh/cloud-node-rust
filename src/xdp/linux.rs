@@ -2295,6 +2295,32 @@ fn resolve_neighbor_mac(next_hop: &str) -> anyhow::Result<[u8; 6]> {
     anyhow::bail!("no usable neighbor entry for {next_hop}")
 }
 
+/// T4: neighbor warm-up budget — a single egress probe makes the kernel
+/// run ARP/ND; usable entries normally appear within a few hundred ms.
+const NEIGHBOR_WARM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(900);
+const NEIGHBOR_WARM_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// T4: nudge the kernel into resolving a next hop. Any egress datagram to
+/// `next_hop` starts ARP/ND — the payload and the inevitable
+/// port-unreachable ICMP reply are both irrelevant. Best-effort by
+/// design: the caller still polls `resolve_neighbor_mac` and fails closed
+/// when the entry never materializes.
+fn warm_neighbor(next_hop: &str) {
+    let Ok(ip) = next_hop.parse::<IpAddr>() else {
+        return;
+    };
+    let bind: SocketAddr = if ip.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    if let Ok(socket) = std::net::UdpSocket::bind(bind)
+        && socket.connect(SocketAddr::new(ip, 9)).is_ok()
+    {
+        let _ = socket.send(&[0u8]);
+    }
+}
+
 /// T4: fully resolved outbound route for a node-dialed flow.
 pub(crate) struct XdpOutboundRoute {
     /// Egress interface name from the routing table — must match an
@@ -2333,8 +2359,30 @@ pub(crate) fn resolve_outbound_route(target: IpAddr) -> anyhow::Result<XdpOutbou
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| target.to_string());
-    let destination_mac = resolve_neighbor_mac(&next_hop)
-        .map_err(|err| anyhow::anyhow!("{err} (route to {target})"))?;
+    let destination_mac = match resolve_neighbor_mac(&next_hop) {
+        Ok(mac) => mac,
+        Err(first_err) => {
+            // Cold neighbor table: a kernel connect() resolves ARP/ND
+            // implicitly, but this path needs the entry up-front. Emit a
+            // probe datagram so the kernel starts resolving, then poll
+            // briefly — still failing closed when no usable entry lands.
+            warm_neighbor(&next_hop);
+            let deadline =
+                std::time::Instant::now() + NEIGHBOR_WARM_TIMEOUT;
+            loop {
+                std::thread::sleep(NEIGHBOR_WARM_POLL);
+                match resolve_neighbor_mac(&next_hop) {
+                    Ok(mac) => break mac,
+                    Err(_) if std::time::Instant::now() < deadline => continue,
+                    Err(err) => {
+                        return Err(anyhow::anyhow!(
+                            "{err} (route to {target}; neighbor {next_hop} still unresolved after warm-up: {first_err})"
+                        ));
+                    }
+                }
+            }
+        }
+    };
     let links = run_ip_json(&["link", "show", "dev", &interface])?;
     let source_mac = links
         .first()

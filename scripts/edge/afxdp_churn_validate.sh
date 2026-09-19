@@ -21,10 +21,7 @@ NODE_ERR=/tmp/churn-node.err
 [[ -x "$BIN" ]] || { echo "missing node binary: $BIN" >&2; exit 1; }
 
 mkdir -p "$ROOT/configs"
-cat > "$ROOT/configs/runtime.yaml" <<YAML
-runtime:
-  mode: standalone
-
+cat > "$ROOT/configs/api_node.yaml" <<YAML
 xdp:
   enabled: true
   attachMode: skb

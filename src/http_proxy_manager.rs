@@ -12,6 +12,7 @@ use crate::ssl::DynamicCertSelector;
 use anyhow::Context;
 use dashmap::DashMap;
 use pingora_core::apps::HttpServerApp;
+#[cfg(any(test, target_os = "linux"))]
 use pingora_core::listeners::tls::Acceptor as PingoraTlsAcceptor;
 use pingora_core::protocols::http::server::Session as ServerSession;
 use pingora_core::protocols::l4::stream::Stream as L4Stream;
@@ -21,15 +22,21 @@ use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::http_proxy;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+#[cfg(any(test, target_os = "linux"))]
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(any(test, target_os = "linux"))]
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(any(test, target_os = "linux"))]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(any(test, target_os = "linux"))]
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::AsyncReadExt;
+#[cfg(any(test, target_os = "linux"))]
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant as TokioInstant};
@@ -182,7 +189,7 @@ struct ListenerConfig {
     enable_proxy_protocol: bool,
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AfXdpHttpPortKind {
     Http,
@@ -195,18 +202,19 @@ struct PassthroughBackendTarget {
     proxy_protocol: ProxyProtocolConfig,
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(test, target_os = "linux"))]
 trait SniPassthroughStream: AsyncRead + AsyncWrite + Unpin {}
 
+#[cfg(any(test, target_os = "linux"))]
 impl<T> SniPassthroughStream for T where T: AsyncRead + AsyncWrite + Unpin {}
 
 enum SniPassthroughClient {
     Tcp(TcpStream),
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(any(test, target_os = "linux"))]
     Stream(Box<dyn SniPassthroughStream + Send>),
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(test, target_os = "linux"))]
 fn af_xdp_virtual_stream<S>(stream: S, client_addr: SocketAddr) -> L4Stream
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -214,13 +222,13 @@ where
     crate::xdp::af_xdp::virtual_l4_stream(stream, client_addr)
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(test, target_os = "linux"))]
 struct PrefixedStream<S> {
     prefix: io::Cursor<Vec<u8>>,
     inner: S,
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(test, target_os = "linux"))]
 impl<S> PrefixedStream<S> {
     fn new(prefix: Vec<u8>, inner: S) -> Self {
         Self {
@@ -230,6 +238,7 @@ impl<S> PrefixedStream<S> {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -249,6 +258,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -332,8 +342,11 @@ pub struct HttpProxyManager {
     proxy_logic: EdgeProxy,
     server_conf: Arc<ServerConf>,
     handled_ports: DashMap<SocketAddr, ListenerHandle>,
+    #[cfg(any(test, target_os = "linux"))]
     plain_proxy: OnceLock<Arc<pingora_proxy::HttpProxy<EdgeProxy>>>,
+    #[cfg(any(test, target_os = "linux"))]
     tls_proxy: OnceLock<Arc<pingora_proxy::HttpProxy<EdgeProxy>>>,
+    #[cfg(any(test, target_os = "linux"))]
     tls_acceptor: parking_lot::RwLock<Option<Arc<PingoraTlsAcceptor>>>,
 }
 
@@ -350,8 +363,11 @@ impl HttpProxyManager {
             proxy_logic,
             server_conf,
             handled_ports: DashMap::new(),
+            #[cfg(any(test, target_os = "linux"))]
             plain_proxy: OnceLock::new(),
+            #[cfg(any(test, target_os = "linux"))]
             tls_proxy: OnceLock::new(),
+            #[cfg(any(test, target_os = "linux"))]
             tls_acceptor: parking_lot::RwLock::new(None),
         })
     }
@@ -1154,6 +1170,7 @@ impl HttpProxyManager {
         )
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     fn proxy_for_tls(&self, is_tls: bool) -> Arc<pingora_proxy::HttpProxy<EdgeProxy>> {
         let cell = if is_tls {
             &self.tls_proxy
@@ -1168,6 +1185,7 @@ impl HttpProxyManager {
         .clone()
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     fn shared_tls_acceptor(&self) -> anyhow::Result<Arc<PingoraTlsAcceptor>> {
         if let Some(acceptor) = self.tls_acceptor.read().clone() {
             return Ok(acceptor);
@@ -1187,7 +1205,7 @@ impl HttpProxyManager {
         Ok(acceptor)
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn af_xdp_http_port_kind_sync(&self, port: u16) -> Option<AfXdpHttpPortKind> {
         let servers = self.config_store.get_all_servers_sync();
         let mut matched = None;
@@ -1216,12 +1234,12 @@ impl HttpProxyManager {
         matched
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn af_xdp_is_l4_blocked(&self, ip: IpAddr) -> bool {
         crate::l4_defense::is_l4_blocked(&self.config_store, &self.proxy_logic.waf_state, ip)
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn record_af_xdp_l4_event_with_pressure(
         &self,
         ip: IpAddr,
@@ -1468,7 +1486,7 @@ impl HttpProxyManager {
         }
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(any(test, target_os = "linux"))]
     /// Whether any server bound to `port` requires an inbound PROXY
     /// protocol v1/v2 header. Mirrors the socket listener's
     /// `enable_proxy_protocol` flag so AF_XDP-steered streams honor the
@@ -1497,6 +1515,7 @@ impl HttpProxyManager {
             })
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) async fn handle_af_xdp_http_stream<S>(
         self: Arc<Self>,
         client_stream: S,
@@ -1534,6 +1553,7 @@ impl HttpProxyManager {
             .await
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     async fn handle_af_xdp_http_stream_inner<S>(
         self: Arc<Self>,
         client_stream: S,
@@ -1645,6 +1665,7 @@ impl HttpProxyManager {
         }
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     async fn handle_af_xdp_l7_http_stream<S>(
         self: Arc<Self>,
         client_stream: S,
@@ -1848,7 +1869,8 @@ impl HttpProxyManager {
         .await
     }
 
-        async fn handle_sni_passthrough_stream<S>(
+    #[cfg(any(test, target_os = "linux"))]
+    async fn handle_sni_passthrough_stream<S>(
         &self,
         client_stream: S,
         client_addr: SocketAddr,
@@ -2152,6 +2174,7 @@ impl HttpProxyManager {
                 )
                 .await
             }
+            #[cfg(any(test, target_os = "linux"))]
             SniPassthroughClient::Stream(client_stream) => {
                 crate::tcp_proxy::stream_sni_passthrough_bidirectional_with_metrics_cancelable_stream(
                     server_id,
@@ -2867,6 +2890,7 @@ async fn peek_client_hello_sni(
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 async fn sniff_client_hello_sni<S>(
     mut client_stream: S,
     timeouts: crate::l4_defense::ClientHelloTimeouts,

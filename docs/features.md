@@ -48,7 +48,7 @@ gRPC 和 WebSocket 属于长连接协议，运行时会优先识别协议特征�
 
 四层代理不执行 HTTP header、WAF 规则和页面能力，但会参与节点级统计和连接状态记录。普通 L4 和 `@quic` 不生成访问日志；SNI 透传访问日志由对应 L7 服务配置控制。
 
-Linux 环境可通过本地 `configs/runtime.yaml` 显式启用 XDP/AF_XDP proxy。命中配置端口的 HTTP、HTTPS、TCP、UDP、SNI、QUIC 和 H3 流量可以从 XDP redirect 到用户态 AF_XDP 数据面，再复用现有协议路由和防护逻辑；未命中、未就绪或降级时继续走原 socket 监听器。
+Linux 环境默认启用 XDP/AF_XDP proxy（`configs/api_node.yaml` 的 `xdp` 段可显式开关）。命中配置端口的 HTTP、HTTPS、TCP、UDP、SNI、QUIC 和 H3 流量可以从 XDP redirect 到用户态 AF_XDP 数据面，再复用现有协议路由和防护逻辑；未命中、未就绪或降级时继续走原 socket 监听器。
 
 ## SNI 透传
 

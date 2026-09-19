@@ -2250,6 +2250,7 @@ pub(crate) async fn stream_sni_passthrough_bidirectional_with_metrics_cancelable
     .await
 }
 
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) async fn stream_sni_passthrough_bidirectional_with_metrics_cancelable_stream<C, B>(
     server_id: i64,
     client: C,

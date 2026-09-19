@@ -58,7 +58,6 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 - [XDP/AF_XDP 旁路数据面](docs/xdp-af-xdp.md)
 - [RocksDB 到 Mace 元数据迁移](docs/mace-migration.md)
 - [部署与运维](docs/operations.md)
-- [RKE2 部署文档](docs/rke2-deployment.md)
 - [gRPC API 使用文档](docs/grpc-api.md)
 
 发布说明：

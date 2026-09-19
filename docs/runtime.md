@@ -13,7 +13,7 @@ CloudNode Rust 的运行时由一个主进程和多个异步后台任务组成�
 5. 初始化 `ConfigStore`、WAF 状态、证书选择器、健康检查管理器。
 6. 启动控制面同步任务。
 7. 启动 HTTP、HTTPS、HTTP/3、TCP、UDP 等监听器。
-8. 如 `configs/runtime.yaml` 显式启用 XDP，则初始化 XDP/AF_XDP manager、maps、XSK queues 和 fallback 状态。
+8. 如 `configs/api_node.yaml` 的 `xdp` 段启用 XDP（默认启用），则初始化 XDP/AF_XDP manager、maps、XSK queues 和 fallback 状态。
 9. 启动缓存、统计、日志上传和证书同步后台任务。
 10. 如指定 `--monitor-port`，启动本地性能监控页面。
 
@@ -59,7 +59,7 @@ cloud-node --monitor-port 8888 --monitor-clear
 - `firewall gc`：清理 RocksDB 中已过期的本地运行时封禁记录。
 - `xdp status`：查看当前或上次持久化的 XDP/AF_XDP attach、XSK、map 和 counter 状态。
 - `xdp doctor`：校验本地 runtime XDP 配置、eBPF 对象、权限和 proxy 能力。
-- `xdp attach` / `xdp detach` / `xdp reload`：按 `configs/runtime.yaml` 管理当前进程的 XDP attachment。
+- `xdp attach` / `xdp detach` / `xdp reload`：按 `configs/api_node.yaml` 管理当前进程的 XDP attachment。
 - `xdp dump-maps`：输出当前进程维护的 XDP shadow maps 和 proxy 端口状态。
 - `test`：验证 `configs/api_node.yaml` 是否可解析。
 

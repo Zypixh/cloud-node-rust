@@ -38,7 +38,7 @@ impl XdpConfigWizard {
         wizard.validate()?;
 
         if prompt_yes_no(t("xdp.menu.save"), true)? {
-            let path = crate::paths::NodePaths::current().runtime_config_file();
+            let path = crate::paths::NodePaths::current().api_config_file();
             wizard.save_to_file(&path)?;
             println!("\n{} {}", t("common.success"), t("xdp.menu.saved"));
             Ok(Some(wizard))
@@ -51,7 +51,6 @@ impl XdpConfigWizard {
     fn validate(&self) -> Result<()> {
         RuntimeConfig {
             xdp: self.xdp.clone(),
-            ..Default::default()
         }
         .validate()
     }
@@ -272,10 +271,10 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("runtime.yaml");
+        let path = dir.join("api_node.yaml");
         std::fs::write(
             &path,
-            "runtime:\n  mode: standalone\nxdp:\n  enabled: false\n  attachMode: skb\n  interfaces:\n    - name: eth0\n      mode: proxy\n",
+            "nodeId: 3\nxdp:\n  enabled: false\n  attachMode: skb\n  interfaces:\n    - name: eth0\n      mode: proxy\n",
         )
         .unwrap();
         super::merge_xdp_enabled(&path, true).unwrap();
@@ -334,11 +333,6 @@ mod tests {
 
         let yaml = serde_yaml::to_string(&xdp).unwrap();
         let parsed: XdpConfig = serde_yaml::from_str(&yaml).unwrap();
-        RuntimeConfig {
-            xdp: parsed,
-            ..Default::default()
-        }
-        .validate()
-        .unwrap();
+        RuntimeConfig { xdp: parsed }.validate().unwrap();
     }
 }

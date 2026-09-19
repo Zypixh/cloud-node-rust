@@ -546,24 +546,6 @@ pub async fn sync_cache_tasks(
                         .storage
                         .purge_by_tag_at_version(key_task.key.trim(), Some(purge_version))
                         .await;
-                    if purge_ok && crate::runtime_mode::RuntimeConfig::current_is_rke2() {
-                        let purge_id = format!("{}:{}", key_task.id, uuid::Uuid::new_v4());
-                        if let Err(err) = crate::cluster::purge::fanout(
-                            crate::cluster::purge::PurgeFanoutRequest {
-                                purge_id,
-                                task_id: key_task.id,
-                                key: key_task.key.trim().to_string(),
-                                key_type: key_task.key_type.clone(),
-                                prefix: String::new(),
-                                leader_epoch: crate::cluster::leader::ROLE_STATE.epoch(),
-                                version: purge_version,
-                            },
-                        )
-                        .await
-                        {
-                            warn!("Tag purge fanout failed for {}: {}", key_task.key, err);
-                        }
-                    }
                     if !purge_ok {
                         error = "Tag purge failed".to_string();
                     }
@@ -589,11 +571,9 @@ pub async fn sync_cache_tasks(
                         }
                     };
                     let mut purge_ok = !targets.is_empty();
-                    let mut purge_versions = Vec::with_capacity(targets.len());
                     for target in &targets {
                         let purge_version =
                             crate::metrics::storage::next_cache_meta_event_version();
-                        purge_versions.push(purge_version);
                         let target_ok = match target {
                             PurgeTarget::Key(key) => {
                                 crate::cache_manager::CACHE
@@ -609,34 +589,6 @@ pub async fn sync_cache_tasks(
                             }
                         };
                         purge_ok &= target_ok;
-                    }
-                    if purge_ok && crate::runtime_mode::RuntimeConfig::current_is_rke2() {
-                        for (target, version) in targets.iter().zip(purge_versions) {
-                            let purge_id = format!("{}:{}", key_task.id, uuid::Uuid::new_v4());
-                            let (key, key_type, prefix) = match target {
-                                PurgeTarget::Key(key) => {
-                                    (key.clone(), "key".to_string(), String::new())
-                                }
-                                PurgeTarget::Prefix(prefix) => {
-                                    (String::new(), "prefix".to_string(), prefix.clone())
-                                }
-                            };
-                            if let Err(err) = crate::cluster::purge::fanout(
-                                crate::cluster::purge::PurgeFanoutRequest {
-                                    purge_id,
-                                    task_id: key_task.id,
-                                    key,
-                                    key_type,
-                                    prefix,
-                                    leader_epoch: crate::cluster::leader::ROLE_STATE.epoch(),
-                                    version,
-                                },
-                            )
-                            .await
-                            {
-                                warn!("Purge fanout failed for {}: {}", key_task.key, err);
-                            }
-                        }
                     }
                     if !purge_ok && error.is_empty() {
                         error = "Purge failed".to_string();

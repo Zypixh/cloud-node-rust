@@ -132,11 +132,6 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
     const MAX_BACKOFF: Duration = Duration::from_secs(15);
 
     loop {
-        if !crate::cluster::leader::require_leader("node_stream") {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            continue;
-        }
-
         let client =
             match RpcClient::new_stream_with_endpoints(&api_config, &last_endpoints, false).await {
                 Ok(client) => client,

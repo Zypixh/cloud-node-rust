@@ -89,18 +89,14 @@ pub async fn sync_node_tasks(
                     }
                     "planChanged" => sync_active_plans(api_config, config_store).await,
                     "purgeServerCache" | "purgePathCache" | "preheatCache" => {
-                        if crate::cluster::leader::require_leader("cache_tasks") {
-                            sync_cache_tasks(
-                                client.channel(),
-                                api_config,
-                                config_store,
-                                task.id,
-                                task.server_id,
-                            )
-                            .await
-                        } else {
-                            break;
-                        }
+                        sync_cache_tasks(
+                            client.channel(),
+                            api_config,
+                            config_store,
+                            task.id,
+                            task.server_id,
+                        )
+                        .await
                     }
                     "ipItemChanged" => sync_ip_items_incremental(api_config, ip_list_manager).await,
                     "updatingServers" => {

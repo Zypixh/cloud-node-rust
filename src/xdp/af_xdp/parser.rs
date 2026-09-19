@@ -230,6 +230,7 @@ pub(crate) fn encode_reply_eth_header(link: &AfXdpLinkMeta, ethertype: u16, out:
 /// destination (the upstream peer); `mtu` carries the reported
 /// next-hop/PTB MTU where the error type provides one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "linux"))]
 pub struct AfXdpIcmpError {
     pub flow: AfXdpTcpFlowKey,
     pub proto: u8,

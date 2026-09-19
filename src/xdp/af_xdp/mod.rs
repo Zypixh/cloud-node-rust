@@ -52,7 +52,9 @@ const ETHERTYPE_QINQ_9300: u16 = 0x9300;
 const IP_PROTO_TCP: u8 = cloud_node_xdp_common::XDP_PROTO_TCP;
 const IP_PROTO_UDP: u8 = cloud_node_xdp_common::XDP_PROTO_UDP;
 /// T4-7: ICMPv4/ICMPv6 next-header values for the PMTU error parser.
+#[cfg(any(test, target_os = "linux"))]
 const IP_PROTO_ICMP: u8 = 1;
+#[cfg(any(test, target_os = "linux"))]
 const IP_PROTO_ICMPV6: u8 = 58;
 const IP_PROTO_HOP_BY_HOP: u8 = 0;
 const IP_PROTO_ROUTING: u8 = 43;
@@ -130,7 +132,7 @@ pub(crate) const AF_XDP_TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(4);
 /// `ip_local_reserved_ports` so no kernel socket can claim a tuple that
 /// XDP_OUT_CT steers into AF_XDP; configurable via
 /// `xdp.upstream.dialPortRange`.
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub(crate) const AF_XDP_DIAL_PORT_BASE: u16 = 40_000;
 
 #[cfg(target_os = "linux")]

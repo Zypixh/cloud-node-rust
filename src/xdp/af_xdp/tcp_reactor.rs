@@ -51,6 +51,7 @@ impl AfXdpTcpChargedBytes {
         self.bytes.is_empty()
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn clear(&mut self) {
         self.bytes = Bytes::new();
         self._permit = None;
@@ -943,6 +944,7 @@ impl AfXdpTcpReactor {
     /// `poll` emits RST frames on the wire. Callers must flush the egress
     /// to TX before dropping the queue — a retired dataplane terminates
     /// peers visibly instead of leaving silently hung sockets.
+    #[cfg(target_os = "linux")]
     pub(crate) fn abort_all_sessions(&mut self) -> usize {
         let mut aborted = 0usize;
         for session in self.sessions.values_mut() {
@@ -1105,6 +1107,7 @@ impl AfXdpTcpReactor {
 
     /// T1: bridge labels the reactor "iface:queue" so per-session snapshots
     /// in the shared map are unambiguous across workers.
+    #[cfg(target_os = "linux")]
     pub(crate) fn set_label(&mut self, label: String) {
         self.label = label;
     }
@@ -1197,6 +1200,7 @@ impl AfXdpTcpReactor {
     /// Shared notify the stream tasks signal when they queue egress —
     /// the bridge waits on it so a writer's bytes are pumped immediately
     /// rather than at the next poll round.
+    #[cfg(target_os = "linux")]
     pub(crate) fn wake_notify(&self) -> Arc<tokio::sync::Notify> {
         self.wake_notify.clone()
     }
@@ -1205,6 +1209,7 @@ impl AfXdpTcpReactor {
     /// delayed ACK, time-wait expiry). `poll_delay` returns a relative
     /// duration. None when no timer is armed — the only remaining wake
     /// sources are RX frames and channel items.
+    #[cfg(target_os = "linux")]
     pub(crate) fn next_timer_delay(&mut self) -> Option<Duration> {
         let now = SmoltcpInstant::from_micros(self.clock.now_micros());
         self.iface
@@ -1440,7 +1445,7 @@ impl AfXdpTcpReactor {
                 !session.proxy_started
                     && !session.dialed
                     && !session.closing
-                    && only_peer.map_or(true, |ip| flow.peer_addr.ip() == ip)
+                    && only_peer.is_none_or(|ip| flow.peer_addr.ip() == ip)
             })
             .min_by_key(|(_, session)| session.created_at)
             .map(|(flow, _)| *flow);
@@ -2714,6 +2719,7 @@ impl AfXdpTcpStream {
     /// Attach the reactor's wake notify — `signal_wake` then also
     /// interrupts the reactor's event-driven idle wait instead of only
     /// being noticed at the next poll round.
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn set_wake_notify(&mut self, notify: Arc<tokio::sync::Notify>) {
         self.wake_notify = Some(notify);
     }

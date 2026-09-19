@@ -101,10 +101,7 @@ def teardown_netns():
 
 
 def write_node_config(path, mode):
-    body = f"""runtime:
-  mode: standalone
-
-xdp:
+    body = f"""xdp:
   enabled: true
   attachMode: skb
   fallback: fail-start
@@ -238,7 +235,7 @@ def main() -> int:
     ap.add_argument("--node-bin", default=os.path.join(
         ROOT, "target", "debug", "cloud-node-rust"))
     ap.add_argument("--config", default=os.path.join(
-        ROOT, "configs", "en2-runtime.yaml"))
+        ROOT, "configs", "en2-api-node.yaml"))
     ap.add_argument("--ebpf-object", default=os.path.join(
         ROOT, "data", "cloud-node-xdp-ebpf.o"))
     ap.add_argument("--mode", default="protect",
@@ -299,29 +296,23 @@ def main() -> int:
             teardown_netns()  # remove leftovers of a previous crashed run
             mac = setup_netns()
             write_node_config(args.config, args.mode)
-            # point the node at our dedicated config via its config search:
-            # the node reads configs/runtime.yaml relative to cwd, so run
-            # with a temp working dir containing our config.
-            os.makedirs(os.path.join(cwd, "configs"), exist_ok=True)
-            runtime_cfg = os.path.join(cwd, "configs", "runtime.yaml")
-            backup = runtime_cfg + ".en2-bak"
-            if os.path.exists(runtime_cfg):
-                os.replace(runtime_cfg, backup)
-            with open(runtime_cfg, "w") as f, open(args.config) as src:
+            # point the node at our dedicated config via CLOUD_NODE_HOME:
+            # the node reads configs/api_node.yaml under it, so a throwaway
+            # home dir means the real configs/api_node.yaml (which carries
+            # API credentials) is never swapped.
+            node_home = tempfile.mkdtemp(prefix="en2-node-home-")
+            os.environ["CLOUD_NODE_HOME"] = node_home
+            os.makedirs(os.path.join(node_home, "configs"), exist_ok=True)
+            api_cfg = os.path.join(node_home, "configs", "api_node.yaml")
+            with open(api_cfg, "w") as f, open(args.config) as src:
                 f.write(src.read())
-            try:
-                attach = subprocess.run(
-                    [args.node_bin, "xdp", "attach"],
-                    capture_output=True, text=True, cwd=cwd)
-                if attach.returncode != 0:
-                    print(attach.stdout + attach.stderr, file=sys.stderr)
-                    return 3
-                attached = True
-            finally:
-                if os.path.exists(backup):
-                    os.replace(backup, runtime_cfg)
-                else:
-                    os.unlink(runtime_cfg)
+            attach = subprocess.run(
+                [args.node_bin, "xdp", "attach"],
+                capture_output=True, text=True, cwd=cwd)
+            if attach.returncode != 0:
+                print(attach.stdout + attach.stderr, file=sys.stderr)
+                return 3
+            attached = True
             send_iface = PEER_IF
         else:
             if not send_iface:

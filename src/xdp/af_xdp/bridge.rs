@@ -2099,11 +2099,6 @@ async fn wait_xsk_readable<'a>(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-async fn wait_xsk_readable(_: &Option<()>) -> Option<()> {
-    std::future::pending().await
-}
-
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) fn udp_route_cache_sweep_due(
     now_ms: u64,

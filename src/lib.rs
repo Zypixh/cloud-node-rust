@@ -11,7 +11,6 @@ pub mod cache_hybrid;
 pub mod cache_manager;
 pub mod client_agent;
 pub mod client_ip;
-pub mod cluster;
 pub mod compiled;
 pub mod config;
 pub mod config_apply;

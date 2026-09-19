@@ -44,7 +44,7 @@
 - 请求：`UpdateNodeStatusRequest { node_id, status_json }`
 - 响应：`RPCSuccess {}` 空消息
 - `status_json` 由运行时代码构造，字段包括：`buildVersion`、`buildVersionCode`、`configVersion`、`os`、`arch`、`hostname`、`hostIP`、`exePath`、`cpuUsage`、`cpuLogicalCount`、`cpuPhysicalCount`、`memoryUsage`、`memoryTotal`、`diskUsage`、`diskTotal`、`diskMaxUsage`、`diskMaxUsagePartition`、`load1m`、`load5m`、`load15m`、`trafficInBytes`、`trafficOutBytes`、`connectionCount`、`apiSuccessPercent`、`apiAvgCostSeconds`、`cacheTotalDiskSize`、`updatedAt`、`timestamp`、`isActive`、`isHealthy`
-- RKE2 语义：只有 Leader 负责关键状态上报，多副本统计会先在集群内部聚合。
+- 节点始终为单进程部署，直接上报本节点统计。
 
 ### NodeService.FindNodeLevelInfo
 
@@ -148,7 +148,7 @@
 - 响应 proto：`httpCacheTaskKeys[]`
 - 实测：返回空数组
 - 非空 item 字段：`id`、`taskId`、`key`、`type`、`keyType`、`isDone`、`isDoing`、`errorsJSON`、`nodeClusterId`
-- 运行时处理：`type=purge` 执行 key/prefix/tag purge；`type=preheat` 发本地预热请求；RKE2 Leader 会 fanout 到其他 pod。
+- 运行时处理：`type=purge` 执行 key/prefix/tag purge；`type=preheat` 发本地预热请求。
 
 ### HTTPCacheTaskKeyService.UpdateHTTPCacheTaskKeysStatus
 
@@ -365,17 +365,7 @@
 
 `ServerEventService.CreateServerEvent` 旧文档中曾列为运行时上报接口；当前代码只构造了 client helper，没有实际调用。
 
-## 8. 运行时内部 API（RKE2 pod 间，不是控制面 gRPC）
-
-RKE2 模式启用 pod 内部 HTTP API，默认监听 `0.0.0.0:19090`，通过 `CLOUD_NODE_CLUSTER_INTERNAL_TOKEN` 鉴权，Headless Service 暴露给同 namespace 内其他 cloud-node pod。
-
-- `GET /internal/v1/health`：健康检查，Kubernetes probe 使用。
-- `POST /internal/v1/purge`：Leader 将 cache purge fanout 到其他 pod。
-- `POST /internal/v1/metadata/events`：同步 cache metadata 事件。
-- `POST /internal/v1/stats/snapshot`：上报 pod 本地统计快照给 Leader 聚合。
-- `GET /internal/v1/cache/stat`：查询 pod 本地缓存对象数量和大小。
-
-## 9. 真实采样与复核
+## 8. 真实采样与复核
 
 复跑文档采样：
 

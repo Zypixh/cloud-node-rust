@@ -106,10 +106,7 @@ def peer_mac():
 
 
 def write_node_config(path, next_hop):
-    body = f"""runtime:
-  mode: standalone
-
-xdp:
+    body = f"""xdp:
   enabled: true
   attachMode: skb
   fallback: fail-start
@@ -146,8 +143,10 @@ xdp:
 
 
 def write_api_config(path):
+    # Appends the API stub to api_node.yaml — write_node_config already
+    # wrote the xdp: section of the same file.
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "a") as f:
         f.write('nodeId: "0"\nsecret: "en10-probe"\n'
                 '"rpc.endpoints":\n  - "http://127.0.0.1:9/"\n'
                 '"rpc.disableUpdate": true\n'
@@ -253,8 +252,8 @@ def send(script, mode, dst_mac, a):
 
 def start_node(node_bin, home, cwd):
     nh = peer_mac()
-    write_node_config(os.path.join(cwd, "configs", "runtime.yaml"), nh)
-    write_node_config(os.path.join(home, "configs", "runtime.yaml"), nh)
+    write_node_config(os.path.join(cwd, "configs", "api_node.yaml"), nh)
+    write_node_config(os.path.join(home, "configs", "api_node.yaml"), nh)
     write_api_config(os.path.join(home, "configs", "api_node.yaml"))
     obj_src = os.path.normpath(os.path.join(
         os.path.dirname(os.path.abspath(node_bin)),

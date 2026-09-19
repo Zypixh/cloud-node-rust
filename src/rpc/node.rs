@@ -184,9 +184,6 @@ fn parse_i64_keyed_map<T>(
 }
 
 async fn report_connected_api_nodes(api_config: &ApiConfig) {
-    if !crate::cluster::leader::require_leader("connected_api_nodes_report") {
-        return;
-    }
     let api_node_ids: Vec<_> = CONNECTED_API_NODE_IDS.read().iter().copied().collect();
 
     if api_node_ids.is_empty() {
@@ -1297,42 +1294,22 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
 
     loop {
         interval.tick().await;
-        if !crate::cluster::leader::require_leader("metrics_reporter") {
-            continue;
-        }
         let node_id = config_store.get_node_id().await;
         if node_id == 0 {
             continue;
         }
 
         sys.refresh_all(); // Refresh everything
-        let (mut traffic_out, mut traffic_in, mut connections) =
+        let (traffic_out, traffic_in, connections) =
             crate::metrics::METRICS.get_node_totals();
         let rpc_snap = crate::metrics::METRICS.rpc.snapshot();
-        let mut rpc_total_requests = rpc_snap.total_requests;
-        let mut rpc_total_errors = rpc_snap.total_errors;
-        let mut rpc_total_cost_ms = rpc_snap.total_cost_ms;
+        let rpc_total_requests = rpc_snap.total_requests;
+        let rpc_total_errors = rpc_snap.total_errors;
+        let rpc_total_cost_ms = rpc_snap.total_cost_ms;
 
-        // Local memory + cpu first; the cluster aggregator (if any) replaces these
-        // atomically below from a single snapshot so the report stays internally
-        // consistent.
-        let (mut total_memory, mut used_memory) = crate::memory_governor::reported_memory_totals();
+        let (total_memory, used_memory) = crate::memory_governor::reported_memory_totals();
 
-        let mut cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
-        if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
-            let aggregated = crate::cluster::stats::aggregate();
-            if aggregated.replica_count > 0 {
-                traffic_out = aggregated.traffic_out;
-                traffic_in = aggregated.traffic_in;
-                connections = aggregated.active_connections;
-                rpc_total_requests = aggregated.rpc_total_requests;
-                rpc_total_errors = aggregated.rpc_total_errors;
-                rpc_total_cost_ms = aggregated.rpc_total_cost_ms;
-                cpu_usage = aggregated.cpu_usage_avg;
-                total_memory = aggregated.memory_total;
-                used_memory = aggregated.memory_used;
-            }
-        }
+        let cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
         let api_success_percent = if rpc_total_requests > 0 {
             (rpc_total_requests - rpc_total_errors) as f64 / rpc_total_requests as f64
         } else {
@@ -1607,23 +1584,12 @@ pub async fn report_node_online_once(
 
     let mut sys = sysinfo::System::new_all();
     sys.refresh_all();
-    let (mut traffic_out, mut traffic_in, mut connections) =
+    let (traffic_out, traffic_in, connections) =
         crate::metrics::METRICS.get_node_totals();
     let rpc_snap = crate::metrics::METRICS.rpc.snapshot();
-    let mut rpc_total_requests = rpc_snap.total_requests;
-    let mut rpc_total_errors = rpc_snap.total_errors;
-    let mut rpc_total_cost_ms = rpc_snap.total_cost_ms;
-    if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
-        let aggregated = crate::cluster::stats::aggregate();
-        if aggregated.replica_count > 0 {
-            traffic_out = aggregated.traffic_out;
-            traffic_in = aggregated.traffic_in;
-            connections = aggregated.active_connections;
-            rpc_total_requests = aggregated.rpc_total_requests;
-            rpc_total_errors = aggregated.rpc_total_errors;
-            rpc_total_cost_ms = aggregated.rpc_total_cost_ms;
-        }
-    }
+    let rpc_total_requests = rpc_snap.total_requests;
+    let rpc_total_errors = rpc_snap.total_errors;
+    let rpc_total_cost_ms = rpc_snap.total_cost_ms;
     let api_success_percent = if rpc_total_requests > 0 {
         (rpc_total_requests - rpc_total_errors) as f64 / rpc_total_requests as f64
     } else {
@@ -1635,16 +1601,8 @@ pub async fn report_node_online_once(
         0.0
     };
     let load = sysinfo::System::load_average();
-    let (mut total_memory, mut used_memory) = crate::memory_governor::reported_memory_totals();
-    let mut cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
-    if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
-        let aggregated = crate::cluster::stats::aggregate();
-        if aggregated.replica_count > 0 {
-            cpu_usage = aggregated.cpu_usage_avg;
-            total_memory = aggregated.memory_total;
-            used_memory = aggregated.memory_used;
-        }
-    }
+    let (total_memory, used_memory) = crate::memory_governor::reported_memory_totals();
+    let cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
     let memory_usage = if total_memory > 0 {
         used_memory as f64 / total_memory as f64
     } else {
@@ -1732,9 +1690,6 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
 
     loop {
         interval.tick().await;
-        if !crate::cluster::leader::require_leader("node_value_reporter") {
-            continue;
-        }
         let node_id = config_store.get_node_id().await;
         if node_id == 0 {
             continue;
@@ -1743,11 +1698,11 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
         sys.refresh_all();
         // ... (rest of the logic)
 
-        let (mut traffic_out, mut traffic_in, mut connections) =
+        let (traffic_out, traffic_in, connections) =
             crate::metrics::METRICS.get_node_totals();
         let load = sysinfo::System::load_average();
 
-        let (mut total_memory, mut used_memory) = crate::memory_governor::reported_memory_totals();
+        let (total_memory, used_memory) = crate::memory_governor::reported_memory_totals();
 
         let mut disk_total = 0u64;
         let mut disk_used = 0u64;
@@ -1775,23 +1730,10 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
         };
         let cache_stats = crate::cache_manager::CACHE.storage.runtime_stats().await;
 
-        let mut cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
+        let cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
         let snapshots = crate::metrics::METRICS.take_snapshots();
-        let mut requests: u64 = snapshots.iter().map(|s| s.1.total_requests).sum();
-        let mut attack_requests: u64 = snapshots.iter().map(|s| s.1.count_attack_requests).sum();
-        if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
-            let aggregated = crate::cluster::stats::aggregate();
-            if aggregated.replica_count > 0 {
-                traffic_out = aggregated.traffic_out;
-                traffic_in = aggregated.traffic_in;
-                connections = aggregated.active_connections;
-                requests = aggregated.app_total_requests;
-                attack_requests = aggregated.app_attack_requests;
-                cpu_usage = aggregated.cpu_usage_avg;
-                total_memory = aggregated.memory_total;
-                used_memory = aggregated.memory_used;
-            }
-        }
+        let requests: u64 = snapshots.iter().map(|s| s.1.total_requests).sum();
+        let attack_requests: u64 = snapshots.iter().map(|s| s.1.count_attack_requests).sum();
         let elapsed = last_tick.elapsed().as_secs().max(1);
         let traffic_in_delta = traffic_in.saturating_sub(last_traffic_in);
         let traffic_out_delta = traffic_out.saturating_sub(last_traffic_out);

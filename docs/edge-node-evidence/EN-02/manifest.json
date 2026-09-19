@@ -27,7 +27,7 @@
     "xdp.rs: XDP_COUNTERS now pinned so verdict counters are observable cross-process"
   ],
   "compatibility_and_migrations": "dump-maps output is additive (new field). XDP_COUNTERS pin persists after detach; layout guarded by existing spec table. No dataplane verdict semantics changed.",
-  "resource_bounds_and_full_behavior": "Runner resources are isolated: netns en2-ns, veth en2-a/en2-b, config configs/en2-runtime.yaml with runtime.yaml backup/restore; cleanup only removes resources it created.",
+  "resource_bounds_and_full_behavior": "Runner resources are isolated: netns en2-ns, veth en2-a/en2-b, config configs/en2-api-node.yaml with api_node.yaml backup/restore; cleanup only removes resources it created.",
   "failure_and_rollback_behavior": "Exit codes: 0 pass, 1 assertion failure, 3 environment/prereq failure. Per-case errors recorded into results, never swallowed.",
   "invariants_covered": ["I10", "I14", "I15"],
   "tests_covered": [

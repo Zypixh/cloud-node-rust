@@ -34,15 +34,10 @@ ASSUME_YES=0
 DRY_RUN=0
 # XDP dataplane is enabled by default (bidirectional: inbound proxy +
 # outbound AF_XDP upstream). --no-xdp / ENABLE_XDP=no opts out explicitly.
+# When XDP is enabled the dataplane is always bidirectional — there is no
+# kernel-outbound mode to select.
 ENABLE_XDP="${ENABLE_XDP:-yes}"
 XDP_IFACE="${XDP_IFACE:-}"
-# Outbound dataplane mode written into configs/runtime.yaml. afxdp is the
-# default — it requires the nftables dial guard; when nft is unavailable
-# and cannot be installed the installer FAILS CLOSED with remediation
-# steps — kernel outbound is only ever an explicit operator choice
-# (--xdp-upstream kernel / XDP_UPSTREAM_MODE=kernel), never a silent
-# fallback.
-XDP_UPSTREAM_MODE="${XDP_UPSTREAM_MODE:-afxdp}"
 
 # Backwards-compatible environment mappings from the previous installer.
 case "${START_MODE:-}" in
@@ -108,13 +103,6 @@ Options / 选项:
   --xdp-iface NAME       Bind XDP to interface NAME. Default: auto-detect the
                          default-route interface.
                          XDP 绑定的网卡名；默认自动探测默认路由网卡。
-  --xdp-upstream MODE    Outbound upstream mode: afxdp (default; needs the
-                         nftables dial guard) or kernel. When nftables is
-                         missing and cannot be installed, afxdp aborts the
-                         install — pick kernel explicitly to opt out.
-                         出向回源模式：afxdp（默认，需要 nftables 守护规则）或
-                         kernel。nftables 缺失且无法安装时 afxdp 会中止安装——
-                         需要 kernel 出向请显式选择。
   --no-start             Do not start/restart the service after install.
                          安装后不启动/重启服务。
   --dry-run              Print actions without changing files.
@@ -127,7 +115,7 @@ Options / 选项:
 Environment variables with the same names are also supported:
   REPO, VERSION, SERVICE_NAME, INSTALL_DIR, INSTALL_BINARY, BACKUP_ROOT,
   AUTO_START, GEOIP_DIR, GEOIP_BASE_URL, RESTORE_BACKUP, API_ENDPOINTS,
-  NODE_ID, NODE_SECRET, TIMEZONE, ENABLE_XDP, XDP_IFACE, XDP_UPSTREAM_MODE.
+  NODE_ID, NODE_SECRET, TIMEZONE, ENABLE_XDP, XDP_IFACE.
 USAGE
 }
 
@@ -475,8 +463,8 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         --xdp-upstream)
-            XDP_UPSTREAM_MODE="${2:?missing upstream mode (afxdp|kernel)}"
-            shift 2
+            die "--xdp-upstream was removed: enabled XDP is always bidirectional (AF_XDP upstream); disable XDP entirely with --no-xdp" \
+                "--xdp-upstream 已移除：启用的 XDP 固定为双向（AF_XDP 出向）；如需关闭请使用 --no-xdp"
             ;;
         --no-start)
             AUTO_START="no"
@@ -1316,29 +1304,45 @@ existing_api_config_path() {
     fi
 }
 
-# The runtime reads dataplane config from configs/runtime.yaml — a
-# separate file from api_node.yaml (API credentials only).
-existing_runtime_config_path() {
-    [ -n "$EXISTING_API_CONFIG_DIR" ] || return 1
-    if [ -e "$EXISTING_API_CONFIG_DIR/configs/runtime.yaml" ]; then
-        printf '%s\n' "$EXISTING_API_CONFIG_DIR/configs/runtime.yaml"
-    elif [ -e "$EXISTING_API_CONFIG_DIR/runtime.yaml" ]; then
-        printf '%s\n' "$EXISTING_API_CONFIG_DIR/runtime.yaml"
-    else
-        return 1
-    fi
+# configs/api_node.yaml is the ONLY node config file — it carries both API
+# credentials and the xdp: dataplane section. Older installs may still have
+# configs/runtime.yaml / runtime.yml (and top-level variants); the runtime
+# no longer reads them, so they are migrated (xdp: block only) and deleted.
+
+# Prints every legacy runtime config file still on disk, one per line.
+legacy_runtime_config_files() {
+    local dir=""
+    local seen=" "
+    for dir in \
+        "$INSTALL_DIR" \
+        "$EXISTING_API_CONFIG_DIR" \
+        "$EXISTING_RUNTIME_DIR" \
+        "$EXISTING_BINARY_WORKDIR"; do
+        [ -n "$dir" ] || continue
+        case "$seen" in *" $dir "*) continue ;; esac
+        seen="$seen$dir "
+        for f in "$dir/configs/runtime.yaml" "$dir/configs/runtime.yml" \
+                 "$dir/runtime.yaml" "$dir/runtime.yml"; do
+            [ -e "$f" ] && printf '%s\n' "$f"
+        done
+    done
 }
 
-# Any config that already defines xdp: stays authoritative — including a
-# dead block an older installer wrote into api_node.yaml, which is moved
-# verbatim into runtime.yaml by migrate_dead_xdp_block.
+# Any config that already defines xdp: stays authoritative — api_node.yaml
+# first, then any legacy runtime.yaml/yml whose xdp: block will be moved
+# into api_node.yaml by migrate_legacy_runtime_xdp.
 existing_config_has_xdp() {
     local cfg=""
-    for cfg in "$(existing_runtime_config_path || true)" "$(existing_api_config_path || true)"; do
-        if [ -n "$cfg" ] && grep -q '^xdp:' "$cfg" 2>/dev/null; then
+    cfg="$(existing_api_config_path || true)"
+    if [ -n "$cfg" ] && grep -q '^xdp:' "$cfg" 2>/dev/null; then
+        return 0
+    fi
+    while IFS= read -r cfg; do
+        [ -n "$cfg" ] || continue
+        if grep -q '^xdp:' "$cfg" 2>/dev/null; then
             return 0
         fi
-    done
+    done < <(legacy_runtime_config_files)
     return 1
 }
 
@@ -1736,10 +1740,12 @@ migrate_runtime_layout() {
     done
 }
 
-# Emits the xdp: YAML block. Enabled (default) means the bidirectional
-# dataplane: inbound XDP/AF_XDP proxy plus node-originated upstream TCP via
-# the AF_XDP dial path (upstream.mode=afxdp). Disabled writes an explicit
-# enabled: false so the runtime default-on is overridden observably.
+# Emits the xdp: YAML block into api_node.yaml. Enabled (default) means the
+# bidirectional dataplane: inbound XDP/AF_XDP proxy plus node-originated
+# upstream TCP via the AF_XDP dial path — the runtime forces that whenever
+# xdp.enabled=true, so no upstream.mode key is written (it would be dead
+# config). Disabled writes an explicit enabled: false so the runtime
+# default-on is overridden observably.
 write_xdp_config_block() {
     local iface="$XDP_IFACE"
     if [ "$ENABLE_XDP" != "yes" ]; then
@@ -1767,8 +1773,6 @@ write_xdp_config_block() {
         # full dataplane (interface, mode=proxy, queues) at startup.
         printf '  interfaces: []\n'
     fi
-    printf '  upstream:\n'
-    printf '    mode: %s\n' "$XDP_UPSTREAM_MODE"
 }
 
 write_api_node_config() {
@@ -1819,27 +1823,20 @@ write_api_node_config() {
     fi
 }
 
-# AF_XDP upstream (upstream.mode=afxdp) requires the nftables dial guard —
-# the reserved source-port DROP rule lives in an inet table managed via
-# the nft binary. Without it every outbound dial would RST during XDP
-# detach windows (reload/upgrade/rollback), so the runtime fails closed.
-# The installer does the same: it tries to install nftables, and when that
-# is impossible it ABORTS with remediation — kernel outbound is only ever
-# an explicit operator choice (--xdp-upstream kernel), never a silent or
-# automatic fallback.
+# Enabled XDP is always bidirectional — the AF_XDP upstream dial path
+# requires the nftables dial guard (the reserved source-port DROP rule
+# lives in an inet table managed via the nft binary). Without it every
+# outbound dial would RST during XDP detach windows (reload/upgrade/
+# rollback), so the runtime fails closed. The installer does the same: it
+# tries to install nftables, and when that is impossible it ABORTS with
+# remediation — the only alternative is disabling XDP entirely.
 ensure_upstream_prereqs() {
     [ "$ENABLE_XDP" = "yes" ] || return 0
-    case "$XDP_UPSTREAM_MODE" in
-        afxdp) ;;
-        kernel) return 0 ;;
-        *) die "invalid upstream mode '$XDP_UPSTREAM_MODE' (expected afxdp|kernel)" \
-               "无效的出向模式 '$XDP_UPSTREAM_MODE'（应为 afxdp|kernel）" ;;
-    esac
     if command -v nft >/dev/null 2>&1; then
         return 0
     fi
-    log "nftables not found; upstream.mode=afxdp needs the nft dial guard — attempting install" \
-        "未检测到 nftables；upstream.mode=afxdp 需要 nft 守护规则——尝试安装"
+    log "nftables not found; the bidirectional XDP dial path needs the nft dial guard — attempting install" \
+        "未检测到 nftables；双向 XDP 拨号路径需要 nft 守护规则——尝试安装"
     if [ "$DRY_RUN" -eq 0 ]; then
         if command -v apt-get >/dev/null 2>&1; then
             apt-get update -qq >/dev/null 2>&1 || true
@@ -1862,52 +1859,67 @@ ensure_upstream_prereqs() {
     fi
     # Fail closed — bidirectional XDP was requested but its prerequisite
     # cannot be met. Tell the operator both ways forward: install
-    # nftables, or explicitly opt into kernel-only outbound.
-    die "nftables is required for upstream.mode=afxdp and could not be installed. Install nftables (e.g. 'apt-get install nftables') and re-run, or opt into kernel outbound explicitly with --xdp-upstream kernel / XDP_UPSTREAM_MODE=kernel" \
-        "upstream.mode=afxdp 需要 nftables 且自动安装失败。请手动安装 nftables（如 'apt-get install nftables'）后重跑，或用 --xdp-upstream kernel / XDP_UPSTREAM_MODE=kernel 显式选择内核出向"
+    # nftables, or explicitly disable XDP.
+    die "nftables is required for the AF_XDP upstream dial path and could not be installed. Install nftables (e.g. 'apt-get install nftables') and re-run, or disable XDP entirely with --no-xdp / ENABLE_XDP=no" \
+        "AF_XDP 出向拨号路径需要 nftables 且自动安装失败。请手动安装 nftables（如 'apt-get install nftables'）后重跑，或用 --no-xdp / ENABLE_XDP=no 完全禁用 XDP"
 }
 
-# Older installers wrote the xdp: block into api_node.yaml, which the
-# runtime never reads — dataplane config lives in runtime.yaml. Move the
-# block verbatim so an existing explicit choice (enabled: false, tuned
-# interfaces, kernel upstream) is preserved, then leave api_node.yaml for
-# API credentials only.
-migrate_dead_xdp_block() {
-    local api_cfg=""
-    if [ -e "$INSTALL_DIR/configs/api_node.yaml" ]; then
-        api_cfg="$INSTALL_DIR/configs/api_node.yaml"
-    else
-        api_cfg="$(existing_api_config_path || true)"
-    fi
-    [ -n "$api_cfg" ] && [ -e "$api_cfg" ] || return 0
-    grep -q '^xdp:' "$api_cfg" 2>/dev/null || return 0
-    local rt="$INSTALL_DIR/configs/runtime.yaml"
-    if grep -q '^xdp:' "$rt" 2>/dev/null; then
-        return 0
-    fi
-    if [ "$DRY_RUN" -eq 0 ]; then
-        run mkdir -p "$INSTALL_DIR/configs"
-        [ -e "$rt" ] && run cp -a "$rt" "$BACKUP_DIR/runtime.yaml.pre-xdp-move"
-        run cp -a "$api_cfg" "$BACKUP_DIR/api_node.yaml.pre-xdp-move"
-        # Extract the top-level xdp: block (the key line plus its indented
-        # children, stopping at the next top-level key).
-        awk '
-            /^xdp:[[:space:]]*$/ { inblk=1; print; next }
-            inblk && /^[[:alnum:]_.]/ { inblk=0 }
-            inblk { print }
-        ' "$api_cfg" >> "$rt"
-        # Strip it from api_node.yaml.
-        awk '
-            /^xdp:[[:space:]]*$/ { inblk=1; next }
-            inblk && /^[[:alnum:]_.]/ { inblk=0 }
-            !inblk { print }
-        ' "$api_cfg" > "$api_cfg.xdp-moved" && mv "$api_cfg.xdp-moved" "$api_cfg"
-        chmod 0600 "$rt" 2>/dev/null || true
-    else
-        log "+ move xdp block $api_cfg -> $rt"
-    fi
-    warn "moved xdp: block from api_node.yaml to runtime.yaml — the runtime only reads dataplane config from runtime.yaml; the api_node.yaml copy never took effect" \
-        "已将 xdp: 配置块从 api_node.yaml 移至 runtime.yaml——运行时仅从 runtime.yaml 读取数据面配置，api_node.yaml 中的副本从未生效"
+# Legacy deployments keep dataplane config in configs/runtime.yaml /
+# runtime.yml. Those files are obsolete — the runtime only reads
+# configs/api_node.yaml now. For each legacy file: if it carries an xdp:
+# block and api_node.yaml does not, move the block over verbatim (explicit
+# enabled: false and tuned interfaces survive). All other keys
+# (runtime.mode, cluster.*, ...) are dropped by design — the runtime no
+# longer parses them.
+migrate_legacy_runtime_xdp() {
+    local rt=""
+    local api_cfg="$INSTALL_DIR/configs/api_node.yaml"
+    while IFS= read -r rt; do
+        [ -n "$rt" ] || continue
+        grep -q '^xdp:' "$rt" 2>/dev/null || continue
+        if [ ! -e "$api_cfg" ]; then
+            warn "$rt has an xdp: block but $api_cfg does not exist — skipping the move; a fresh xdp block will be written" \
+                "$rt 含 xdp: 配置块但 $api_cfg 不存在——跳过迁移，将写入新的 xdp 配置"
+            continue
+        fi
+        if grep -q '^xdp:' "$api_cfg" 2>/dev/null; then
+            warn "$rt has an xdp: block but $api_cfg already defines one — api_node.yaml stays authoritative, the legacy block is discarded" \
+                "$rt 含 xdp: 配置块，但 $api_cfg 已有 xdp 配置——以 api_node.yaml 为准，丢弃旧配置块"
+            continue
+        fi
+        if [ "$DRY_RUN" -eq 0 ]; then
+            run mkdir -p "$INSTALL_DIR/configs"
+            run cp -a "$api_cfg" "$BACKUP_DIR/api_node.yaml.pre-runtime-xdp-move"
+            awk '
+                /^xdp:[[:space:]]*$/ { inblk=1; print; next }
+                inblk && /^[[:alnum:]_.]/ { inblk=0 }
+                inblk { print }
+            ' "$rt" >> "$api_cfg"
+            chmod 0600 "$api_cfg" 2>/dev/null || true
+        else
+            log "+ move xdp block $rt -> $api_cfg"
+        fi
+        warn "moved xdp: block from $rt into api_node.yaml — runtime.yaml is obsolete; api_node.yaml now carries both API credentials and the XDP dataplane config" \
+            "已将 xdp: 配置块从 $rt 移入 api_node.yaml——runtime.yaml 已废弃；api_node.yaml 现同时保存 API 连接信息与 XDP 数据面配置"
+    done < <(legacy_runtime_config_files)
+}
+
+# Deletes every obsolete runtime.yaml/runtime.yml found on disk (each is
+# backed up first). Non-xdp content (runtime.mode, cluster.*) is dropped
+# intentionally — the runtime no longer parses it.
+remove_legacy_runtime_configs() {
+    local rt=""
+    while IFS= read -r rt; do
+        [ -n "$rt" ] || continue
+        if [ "$DRY_RUN" -eq 0 ]; then
+            run cp -a "$rt" "$BACKUP_DIR/$(sanitize_path "$rt").removed"
+            run rm -f "$rt"
+            warn "removed obsolete runtime config $rt (backup in $BACKUP_DIR)" \
+                "已移除废弃的运行时配置 ${rt}（备份于 ${BACKUP_DIR}）"
+        else
+            log "+ rm -f $rt (backup first)"
+        fi
+    done < <(legacy_runtime_config_files)
 }
 
 # "[0,1,...]" queue list for an interface, counted from sysfs rx-*
@@ -1923,10 +1935,10 @@ iface_queues_spec() {
     printf '%s]\n' "$out"
 }
 
-# Existing runtime.yaml interface entries written by the intermediate
-# installer may lack `mode:` (defaults to observe — no AF_XDP) and
-# `queues:` (crashed strict binaries). Inject mode: proxy + sysfs-derived
-# queues only where the keys are absent; explicit values stay untouched.
+# Existing xdp interface entries written by older installers may lack
+# `mode:` (defaults to observe — no AF_XDP) and `queues:` (crashed strict
+# binaries). Inject mode: proxy + sysfs-derived queues only where the keys
+# are absent; explicit values stay untouched.
 repair_xdp_interface_entries() {
     local rt="$1"
     [ -e "$rt" ] || return 0
@@ -1975,31 +1987,27 @@ repair_xdp_interface_entries() {
     ' "$rt" > "$rt.iface-repaired" && mv "$rt.iface-repaired" "$rt"
 }
 
-# Writes the xdp: block into configs/runtime.yaml — the file
-# RuntimeConfig::load_default actually parses. api_node.yaml stays API
-# credentials only. A runtime.yaml that already has an xdp: key is
-# authoritative — only its interface entries are repaired for missing
+# Writes the xdp: block into configs/api_node.yaml — the single config
+# file the runtime parses. An api_node.yaml that already has an xdp: key
+# is authoritative — only its interface entries are repaired for missing
 # mode/queues keys.
-write_runtime_config() {
-    local config_path="$INSTALL_DIR/configs/runtime.yaml"
+write_xdp_config() {
+    local config_path="$INSTALL_DIR/configs/api_node.yaml"
     if grep -q '^xdp:' "$config_path" 2>/dev/null; then
         repair_xdp_interface_entries "$config_path"
         return 0
     fi
     run mkdir -p "$INSTALL_DIR/configs"
-    if [ -e "$config_path" ]; then
-        run cp -a "$config_path" "$BACKUP_DIR/runtime.yaml.pre-xdp"
-    fi
     if [ "$DRY_RUN" -eq 0 ]; then
         write_xdp_config_block >> "$config_path"
         chmod 0600 "$config_path" 2>/dev/null || true
     else
-        log "+ write xdp block to $config_path"
+        log "+ append xdp block to $config_path"
         write_xdp_config_block | sed 's/^/  /'
     fi
     if [ "$ENABLE_XDP" = "yes" ]; then
-        ok "wrote xdp.enabled=true + upstream.mode=$XDP_UPSTREAM_MODE to $config_path" \
-            "已在 $config_path 写入 xdp.enabled=true + upstream.mode=$XDP_UPSTREAM_MODE（双向 XDP）"
+        ok "wrote xdp.enabled=true (bidirectional) to $config_path" \
+            "已在 $config_path 写入 xdp.enabled=true（双向 XDP）"
     else
         ok "wrote xdp.enabled=false to $config_path" "已在 $config_path 写入 xdp.enabled=false"
     fi
@@ -2424,8 +2432,13 @@ else
 fi
 
 write_api_node_config
-migrate_dead_xdp_block
-write_runtime_config
+# Carry the xdp: block out of any legacy runtime.yaml/yml into
+# api_node.yaml, write a fresh xdp block when none exists, then delete the
+# obsolete runtime config files (backed up first). Order matters: migrate
+# before write so an existing explicit xdp choice stays authoritative.
+migrate_legacy_runtime_xdp
+write_xdp_config
+remove_legacy_runtime_configs
 
 if [ "$DRY_RUN" -eq 0 ]; then
     (cd "$INSTALL_DIR" && "$INSTALL_BINARY" install)
