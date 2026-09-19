@@ -1,28 +1,16 @@
 name: Release
 
+# Tags only: pushing v* is the release decision; main/PR coverage lives in
+# ci.yml. No paths filter — a tag push always means "build this release",
+# regardless of which files the tagged diff touches.
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
-    paths:
-      - '.github/workflows/**'
-      - '.cargo/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'release-notes/**'
-      - 'src/**'
-      - 'crates/**'
-      - 'xtask/**'
-      - 'pingora-main/**'
-      - 'toa-main/**'
-      - 'toa-sender/**'
-      - 'vendor/**'
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -150,22 +138,35 @@ jobs:
             sleep 10
           done
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+      # mbx shared build cache. `backend: local` only installs mbx; cache
+      # transport is the actions/cache step below. The action's `github`
+      # backend would be restore-only here — it saves solely on
+      # default-branch pushes, and this workflow is tag-only by design, so
+      # tag builds must own their save policy or the store stays cold
+      # forever. Each matrix leg keeps its own store (RUSTFLAGS differ per
+      # leg, so compilation fingerprints do too); a respin restores the
+      # previous run's entry via the restore-key prefix.
+      - name: Install mbx
+        uses: jdx/mr-boxington-action@v1
+        with:
+          backend: local
+          version: "1.14.0"
+
+      - name: mbx store cache
+        uses: actions/cache@v4
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           CXXFLAGS: ${{ matrix.cxxflags }}
           CFLAGS: ${{ matrix.cxxflags }}
         with:
-          key: release-${{ matrix.name }}-${{ matrix.target }}-${{ matrix.cpu }}
-          shared-key: release-${{ matrix.name }}-${{ matrix.target }}-${{ matrix.cpu }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          env-vars: "RUSTFLAGS CXXFLAGS CFLAGS"
-          cache-targets: false
-
-      - name: Clean target before build
-        shell: bash
-        run: cargo clean --target ${{ matrix.target }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/.global-cache
+            ~/.cache/mbx
+          key: release-mbx-v1-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: |
+            release-mbx-v1-${{ matrix.name }}-
 
       # The eBPF toolchain and object MUST be ready before the node build:
       # build.rs embeds the object designated by CLOUD_NODE_XDP_EBPF_SOURCE,
@@ -197,6 +198,9 @@ jobs:
           SYSROOT="$(rustup run "$EBPF_NIGHTLY" rustc --print sysroot)"
           ln -sf "$(find "$SYSROOT/lib" -name 'libLLVM.so.*' -print -quit)" "$SYSROOT/lib/libLLVM.so"
           export LLVM_PREFIX="$SYSROOT"
+          # Plain cargo, not mbx: `+toolchain` is rustup-shim syntax that
+          # mbx does not forward, and this one-off host tool gains nothing
+          # from the compilation cache.
           cargo +"$EBPF_NIGHTLY" install bpf-linker --version "$BPF_LINKER_VERSION" --locked
           bpf-linker --version
 
@@ -207,7 +211,7 @@ jobs:
           # Never let a stale object survive into the package: remove any
           # checked-in or cached artifact before rebuilding from source.
           rm -f data/cloud-node-xdp-ebpf.o
-          cargo xtask build-ebpf
+          mbx xtask build-ebpf
           test -s data/cloud-node-xdp-ebpf.o
           sha256sum data/cloud-node-xdp-ebpf.o
           sha256sum data/cloud-node-xdp-ebpf.o | awk '{print $1}' > ebpf-sha256.txt
@@ -239,7 +243,7 @@ jobs:
             export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
           fi
 
-          cargo build --release --target ${{ matrix.target }}
+          mbx build --release --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
@@ -272,12 +276,14 @@ jobs:
           name: ${{ matrix.name }}
           path: cloud-node-rust-${{ matrix.name }}.tar.gz
 
-      - name: Clean build artifacts
+      # Bound the mbx store before actions/cache saves it — GitHub caps a
+      # repo's cache at ~10 GB across all entries, and each matrix leg
+      # saves its own entry. A missing object is rebuilt on demand, so
+      # pruning only costs hits, never correctness.
+      - name: Prune mbx store
         if: always()
         shell: bash
-        run: |
-          cargo clean --target ${{ matrix.target }} || true
-          cargo clean --manifest-path crates/cloud-node-xdp-ebpf/Cargo.toml --target bpfel-unknown-none || true
+        run: mbx gc --max-size 1500MB || true
 
   release:
     name: Create Release
