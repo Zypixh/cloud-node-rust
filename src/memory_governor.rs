@@ -429,19 +429,22 @@ const DEFAULT_RELAY_COPY_BUFFER_BYTES: usize = 64 * 1024;
 const HIGH_RELAY_COPY_BUFFER_BYTES: usize = 128 * 1024;
 const MAX_RELAY_COPY_BUFFER_BYTES: usize = 256 * 1024;
 
-const MIN_HTTP_CONNECTION_LIMIT: usize = 16_384;
-const MIN_TCP_CONNECTION_LIMIT: usize = 16_384;
-const MIN_H3_CONNECTION_LIMIT: usize = 4_096;
-const MIN_UDP_SESSION_LIMIT: usize = 4_096;
+// Floors keep a squeezed node minimally operable — they are NOT sizing
+// targets. At ~512 MiB these still fit (512×32KiB ≈ 16 MiB); larger
+// machines are driven by the derived caps, never by these constants.
+const MIN_HTTP_CONNECTION_LIMIT: usize = 512;
+const MIN_TCP_CONNECTION_LIMIT: usize = 512;
+const MIN_H3_CONNECTION_LIMIT: usize = 256;
+const MIN_UDP_SESSION_LIMIT: usize = 256;
 const MIN_UDP_SESSION_QUEUE_SIZE: usize = 64;
 const MIN_H3_DATAGRAM_QUEUE_SIZE: usize = 1_024;
 const MIN_H3_DATAGRAM_QUEUE_SIZE_HIGH: usize = 256;
 const MIN_H3_DATAGRAM_QUEUE_SIZE_CRITICAL: usize = 64;
-const MIN_H2_STREAM_GLOBAL_LIMIT: usize = 4_096;
+const MIN_H2_STREAM_GLOBAL_LIMIT: usize = 1_024;
 const MIN_H2_STREAM_LIMIT_PER_CONNECTION: usize = 256;
-const MIN_H3_REQUEST_GLOBAL_LIMIT: usize = 4_096;
+const MIN_H3_REQUEST_GLOBAL_LIMIT: usize = 1_024;
 const MIN_H3_REQUEST_LIMIT_PER_CONNECTION: usize = 256;
-const MIN_ORIGIN_CONNECT_LIMIT: usize = 16_384;
+const MIN_ORIGIN_CONNECT_LIMIT: usize = 512;
 const MIN_BACKGROUND_WORK_LIMIT: usize = 256;
 const MIN_REQUEST_BODY_WAF_LIMIT: usize = 128;
 const MIN_RESPONSE_BODY_WAF_LIMIT: usize = 256;
@@ -3777,11 +3780,22 @@ fn runtime_limit(
         | AdmissionClass::RpcStreamCommand => return min_limit,
     };
     let memory_target = connection_limit(memory_budget, estimated_bytes, 1, max_limit);
-    let cpu_floor = snapshot
+    let cpu_cap = snapshot
         .cpu_parallelism
         .max(1)
         .saturating_mul(cpu_floor_per_core);
-    let mut target = memory_target.max(cpu_floor).clamp(min_limit, max_limit);
+    // The tightest resource wins when memory availability is real — the
+    // per-core figure is a capacity bound, not a floor: on a 512 MiB box
+    // `max()` here would admit ~16k connections × ~32 KiB ≈ the entire
+    // RAM, i.e. guaranteed OOM under fill. Only when availability is
+    // unknown (derived memory cap untrustworthy, ~0) does the cpu-sized
+    // figure act as the fallback limit.
+    let mut target = if matches!(snapshot.availability, MemoryAvailability::Unknown) {
+        memory_target.max(cpu_cap)
+    } else {
+        memory_target.min(cpu_cap)
+    }
+    .clamp(min_limit, max_limit);
     if let Some(fd_pct) = fd_pct {
         let fd_target = fd_budget(snapshot, fd_pct) as usize;
         if fd_target > 0 {
@@ -3829,11 +3843,18 @@ fn multiplexed_per_connection_limit(
     let memory_target = connection_limit(
         snapshot.connection_budget_bytes / 64,
         estimated_unit_bytes,
-        min_limit,
+        1,
         max_limit,
     );
-    let cpu_target = snapshot.cpu_parallelism.max(1).saturating_mul(256);
-    memory_target.max(cpu_target).clamp(min_limit, max_limit)
+    let cpu_cap = snapshot.cpu_parallelism.max(1).saturating_mul(256);
+    // Same bound semantics as runtime_limit: known memory → tightest cap;
+    // unknown memory → the per-core figure is the fallback.
+    if matches!(snapshot.availability, MemoryAvailability::Unknown) {
+        memory_target.max(cpu_cap)
+    } else {
+        memory_target.min(cpu_cap)
+    }
+    .clamp(min_limit, max_limit)
 }
 
 fn connection_limit(
@@ -4118,6 +4139,9 @@ mod tests {
                 MIN_BLOOM_BUDGET_BYTES,
                 MAX_BLOOM_BUDGET_BYTES,
             ),
+            // Synthetic profiles model real machines — availability is
+            // known so the tightest-resource bound applies.
+            availability: MemoryAvailability::Known,
             ..Default::default()
         }
     }
@@ -4440,7 +4464,13 @@ mod tests {
             MAX_HTTP_CONNECTION_LIMIT,
         );
 
-        assert!(small_http >= 16_000);
+        // The tightest resource wins on a small box: 2 GiB total / 1 GiB
+        // available yields a ~460 MiB connection budget — ~14.4k×32 KiB —
+        // so the memory cap binds below the 16k/core cpu cap. Admitting
+        // 16k anyway would be the old overcommit the min() bound removed.
+        let small_memory_cap =
+            small.connection_budget_bytes / HTTP_CONN_ESTIMATED_BYTES;
+        assert_eq!(small_http as u64, small_memory_cap);
         assert!(medium_http > small_http);
         assert!(large_http > medium_http);
         assert!(large_http > 65_535);
@@ -4458,7 +4488,9 @@ mod tests {
             MAX_H2_STREAM_LIMIT_PER_CONNECTION,
         );
         assert!(large_h2_global > MAX_H2_STREAM_LIMIT_PER_CONNECTION);
-        assert_eq!(large_h2_per_conn, MAX_H2_STREAM_LIMIT_PER_CONNECTION);
+        // 128 cores × 256 streams/conn is the tightest bound here — the
+        // ~345k memory-derived figure exceeds it, so the cpu cap binds.
+        assert_eq!(large_h2_per_conn, 128 * 256);
     }
 
     #[test]
@@ -4527,6 +4559,87 @@ mod tests {
             MAX_H3_REQUEST_LIMIT_PER_CONNECTION,
         );
         assert!(h3_per_conn >= MIN_H3_REQUEST_LIMIT_PER_CONNECTION);
+    }
+
+    #[test]
+    fn admission_profile_fits_512mib_floor_and_scales_256gib_ceiling() {
+        // ~512 MiB total / ~400 MiB free / 1 core — the smallest target
+        // shape. The derived memory cap must bind below the 16k/core cpu
+        // figure: 16k HTTP conns × 32 KiB ≈ the entire RAM.
+        let tiny = BudgetedMemorySnapshot {
+            total_bytes: 512 * 1024 * 1024,
+            used_bytes: 100 * 1024 * 1024,
+            available_bytes: 400 * 1024 * 1024,
+            availability: MemoryAvailability::Known,
+            fd_soft_limit: 65_535,
+            cpu_parallelism: 1,
+            connection_budget_bytes: budget_from_available(
+                512 * 1024 * 1024,
+                400 * 1024 * 1024,
+                CONNECTION_BUDGET_PCT,
+            ),
+            ..Default::default()
+        };
+        let http = runtime_limit(
+            &tiny,
+            AdmissionClass::HttpConnection,
+            MIN_HTTP_CONNECTION_LIMIT,
+            MAX_HTTP_CONNECTION_LIMIT,
+        );
+        let tcp = runtime_limit(
+            &tiny,
+            AdmissionClass::TcpConnection,
+            MIN_TCP_CONNECTION_LIMIT,
+            MAX_TCP_CONNECTION_LIMIT,
+        );
+        let memory_cap = tiny.connection_budget_bytes / HTTP_CONN_ESTIMATED_BYTES;
+        assert_eq!(http as u64, memory_cap);
+        assert!(http < 16_384, "512MiB box must not admit 16k connections");
+        assert!(http >= MIN_HTTP_CONNECTION_LIMIT);
+        assert!(tcp >= MIN_TCP_CONNECTION_LIMIT);
+
+        // 256 GiB total / 220 GiB free / 64 cores — the large target
+        // shape. The cap must not stay pinned at small-machine defaults:
+        // ~99 GiB connection budget admits ~3.1M×32 KiB, bounded by the
+        // 64×16384 cpu cap to ~1M.
+        let big = BudgetedMemorySnapshot {
+            total_bytes: 256 * 1024 * 1024 * 1024,
+            used_bytes: 36 * 1024 * 1024 * 1024,
+            available_bytes: 220 * 1024 * 1024 * 1024,
+            availability: MemoryAvailability::Known,
+            fd_soft_limit: 16_777_216,
+            cpu_parallelism: 64,
+            connection_budget_bytes: budget_from_available(
+                256 * 1024 * 1024 * 1024,
+                220 * 1024 * 1024 * 1024,
+                CONNECTION_BUDGET_PCT,
+            ),
+            ..Default::default()
+        };
+        let big_http = runtime_limit(
+            &big,
+            AdmissionClass::HttpConnection,
+            MIN_HTTP_CONNECTION_LIMIT,
+            MAX_HTTP_CONNECTION_LIMIT,
+        );
+        assert!(big_http > 500_000, "256GiB box must scale beyond small defaults");
+        assert!(big_http <= 64 * 16_384);
+
+        // Unknown availability keeps the per-core fallback: derived
+        // memory caps are untrustworthy (~0) so the floor still applies.
+        let unknown = BudgetedMemorySnapshot {
+            total_bytes: 512 * 1024 * 1024,
+            availability: MemoryAvailability::Unknown,
+            cpu_parallelism: 1,
+            ..Default::default()
+        };
+        let unknown_http = runtime_limit(
+            &unknown,
+            AdmissionClass::HttpConnection,
+            MIN_HTTP_CONNECTION_LIMIT,
+            MAX_HTTP_CONNECTION_LIMIT,
+        );
+        assert_eq!(unknown_http, 16_384);
     }
 
     #[test]
