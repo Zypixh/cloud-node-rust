@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+#
+# git commit-msg 钩子：拒绝带第三方署名（AI 工具、bot）的提交信息。
+# 规则与 CI 共用 scripts/git-hooks/check-attribution.sh。
+#
+# 启用方式见 scripts/git-hooks/README.md。
+#
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+exec "$repo_root/scripts/git-hooks/check-attribution.sh" --message-file "$1"

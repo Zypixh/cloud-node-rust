@@ -1,0 +1,12 @@
+# .mailmap —— 把同一个人的多个身份归并到规范身份，便于 git shortlog / log 统计。
+#
+# 刻意不把工具身份（cursoragent@cursor.com、*+cursor[bot]@users.noreply.github.com）
+# 映射到 Zypixh：那会把真实发生过的第三方署名问题洗白成"本人提交"，
+# 掩盖历史。这些身份应当在统计里保持可见。
+# 背景见 docs/agents/commit-and-pr-conventions.md。
+#
+# 规范身份
+Zypixh <moying8259@gmail.com> <79520628+Zypixh@users.noreply.github.com>
+Zypixh <moying8259@gmail.com> <zypixh@users.noreply.github.com>
+Zypixh <moying8259@gmail.com> <Zypixh@users.noreply.github.com>
+Zypixh <moying8259@gmail.com> 末影（moying） <moying8259@gmail.com>
