@@ -975,12 +975,9 @@ impl RuntimeConfig {
             if interface.name.trim().is_empty() {
                 anyhow::bail!("xdp.interfaces entries require name");
             }
-            if interface.queues.is_empty() {
-                anyhow::bail!(
-                    "xdp interface {} requires at least one queue",
-                    interface.name
-                );
-            }
+            // Empty `queues` means "auto": fill_missing_xdp_interface_queues
+            // resolves the NIC's real RX queues from sysfs at attach time,
+            // and an unresolvable interface fails explicitly at XSK bind.
             if interface.frame_size < 1024 || interface.frame_size > 4096 {
                 anyhow::bail!(
                     "xdp interface {} frameSize must be between 1024 and 4096",

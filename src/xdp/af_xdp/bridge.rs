@@ -821,6 +821,7 @@ pub(crate) async fn spawn_queue_reactors(
             for (_, _, join) in joins {
                 let _ = join.join();
             }
+            manager.set_proxy_workers_starting(false);
             return;
         }
         Err(_) => {
@@ -830,6 +831,7 @@ pub(crate) async fn spawn_queue_reactors(
             for (_, _, join) in joins {
                 let _ = join.join();
             }
+            manager.set_proxy_workers_starting(false);
             return;
         }
     }

@@ -136,6 +136,24 @@ pub fn refresh_xdp_interface_queues(config: &mut XdpConfig) {
     }
 }
 
+/// Fill only interfaces whose queue list is empty ("auto") — an
+/// operator-pinned queue set stays authoritative. Attach calls this so a
+/// `name`/`mode`-only interface entry is valid config.
+pub fn fill_missing_xdp_interface_queues(config: &mut XdpConfig) {
+    #[cfg(target_os = "linux")]
+    {
+        for interface in &mut config.interfaces {
+            if interface.queues.is_empty() {
+                interface.queues = rx_queues_for_interface(&interface.name);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config;
+    }
+}
+
 fn derive_xdp_config_with_ports(
     runtime: &RuntimeConfig,
     ports: Vec<XdpProxyPortConfig>,

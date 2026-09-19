@@ -122,6 +122,11 @@ pub struct XdpStatusSnapshot {
     pub proxy_ready: bool,
     #[serde(default)]
     pub proxy_redirect_enabled: bool,
+    /// Proxy bridge/AF_XDP workers are mid-spawn — attach or reload is in
+    /// progress and "redirect not enabled yet" is a transient state, not a
+    /// fault. Health checks must not count failures while this is set.
+    #[serde(default)]
+    pub warming: bool,
     pub proxy_fallback_reason: String,
     pub tcp_dataplane_ready: bool,
     pub tcp_dataplane_detail: String,
@@ -1419,6 +1424,7 @@ impl XdpManager {
             proxy_unsupported_ports,
             proxy_ready,
             proxy_redirect_enabled: self.proxy_redirect_enabled.load(Ordering::Relaxed),
+            warming: self.proxy_workers_starting.load(Ordering::Relaxed),
             proxy_fallback_reason,
             tcp_dataplane_ready: xdp_proxy_has_tcp_like_ports(&self.config)
                 && xdp_tcp_dataplane_supported()

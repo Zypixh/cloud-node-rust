@@ -3159,6 +3159,12 @@ WantedBy=multi-user.target\n",
 
 fn spawn_xdp_health_fallback_task(rt: &tokio::runtime::Runtime, waf_state: Arc<WafStateManager>) {
     spawn_staggered(rt, Duration::from_secs(10), async move {
+        // Boot grace: the first proxy-port sync (~30s in) triggers an
+        // attach→XSK→bridge sequence whose "not ready yet" window can
+        // exceed the failure budget on slow/small nodes. Transient by
+        // design, so do not count failures during warmup.
+        const XDP_HEALTH_BOOT_GRACE: Duration = Duration::from_secs(120);
+        let booted_at = std::time::Instant::now();
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut consecutive_failures = 0u8;
@@ -3171,6 +3177,10 @@ fn spawn_xdp_health_fallback_task(rt: &tokio::runtime::Runtime, waf_state: Arc<W
             }
 
             let status = cloud_node_rust::xdp::status_snapshot();
+            if status.warming || booted_at.elapsed() < XDP_HEALTH_BOOT_GRACE {
+                consecutive_failures = 0;
+                continue;
+            }
             let Some(reason) = xdp_health_fallback_reason(&status) else {
                 consecutive_failures = 0;
                 continue;
@@ -3396,6 +3406,17 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
                     &mut runtime_config.xdp,
                 );
                 runtime_config.validate()?;
+                if !runtime_config.xdp.interfaces.is_empty()
+                    && runtime_config
+                        .xdp
+                        .interfaces
+                        .iter()
+                        .all(|interface| interface.mode != XdpRuntimeMode::Proxy)
+                {
+                    warn!(
+                        "xdp.enabled=true but no interface has mode: proxy — AF_XDP dataplane inactive; set mode: proxy or leave interfaces empty for auto-config"
+                    );
+                }
                 RuntimeConfig::set_current(runtime_config.clone());
                 if before_interfaces != runtime_config.xdp.interfaces {
                     info!("XDP interface queues refreshed after netdev tuning");

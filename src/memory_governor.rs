@@ -3287,7 +3287,10 @@ fn state_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
         snapshot.total_bytes,
         snapshot.available_bytes,
         STATE_BUDGET_PCT,
-        32 * 1024 * 1024,
+        // 64MiB floor: the floored (1024-entry) eBPF state tables need
+        // ~47MiB pinned; a smaller floor made ~1GiB nodes unable to attach
+        // at all even though the minimum viable dataplane fits in ~5% RAM.
+        64 * 1024 * 1024,
         64 * 1024 * 1024 * 1024,
     );
     if memory_pressure_high(snapshot) {

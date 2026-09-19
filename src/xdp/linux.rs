@@ -863,8 +863,12 @@ pub async fn attach(
         .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
         .kernel_bpf_budget_bytes;
     let mut effective_config = config.clone();
+    // `queues: []` on an interface entry means "auto" — resolve the NIC's
+    // RX queues from sysfs here (single choke point covering daemon, CLI
+    // and smoke attach paths). A miss yields [0] and bind fails loudly.
+    crate::xdp_auto_config::fill_missing_xdp_interface_queues(&mut effective_config);
     if effective_config.state_tables.is_none() {
-        effective_config.state_tables = auto_scale_state_tables(config, bpf_budget)?;
+        effective_config.state_tables = auto_scale_state_tables(&effective_config, bpf_budget)?;
     }
     let config = &effective_config;
     ensure_bpf_map_budget(config, bpf_budget)?;

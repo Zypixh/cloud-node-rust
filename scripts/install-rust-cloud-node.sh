@@ -1753,13 +1753,15 @@ write_xdp_config_block() {
     printf '  attachMode: auto\n'
     if [ -n "$iface" ]; then
         # mode: proxy is required — the default interface mode is
-        # observe (XDP statistics only, no AF_XDP sockets). Queues and
-        # proxy ports are filled at runtime: refresh_xdp_interface_queues
-        # reads the NIC's real RX queue count and the 30s port-sync task
-        # derives proxy.ports from the live node config.
+        # observe (XDP statistics only, no AF_XDP sockets). Queues are
+        # written explicitly from sysfs so strict older binaries (which
+        # reject empty queue lists) also accept this file; newer builds
+        # re-derive from sysfs at startup anyway. Proxy ports are filled
+        # at runtime by the 30s port-sync task.
         printf '  interfaces:\n'
         printf '    - name: %s\n' "$(yaml_quote "$iface")"
         printf '      mode: proxy\n'
+        printf '      queues: %s\n' "$(iface_queues_spec "$iface")"
     else
         # Empty interfaces lets ensure_current_xdp_auto_config derive the
         # full dataplane (interface, mode=proxy, queues) at startup.
@@ -1908,13 +1910,80 @@ migrate_dead_xdp_block() {
         "已将 xdp: 配置块从 api_node.yaml 移至 runtime.yaml——运行时仅从 runtime.yaml 读取数据面配置，api_node.yaml 中的副本从未生效"
 }
 
+# "[0,1,...]" queue list for an interface, counted from sysfs rx-*
+# entries. Falls back to [0] — every netdev has at least one RX queue.
+iface_queues_spec() {
+    local name="$1" n i out="[" sep=""
+    n=$(ls "/sys/class/net/$name/queues" 2>/dev/null | grep -c '^rx-' || true)
+    [ "${n:-0}" -ge 1 ] 2>/dev/null || n=1
+    for ((i = 0; i < n; i++)); do
+        out+="$sep$i"
+        sep=","
+    done
+    printf '%s]\n' "$out"
+}
+
+# Existing runtime.yaml interface entries written by the intermediate
+# installer may lack `mode:` (defaults to observe — no AF_XDP) and
+# `queues:` (crashed strict binaries). Inject mode: proxy + sysfs-derived
+# queues only where the keys are absent; explicit values stay untouched.
+repair_xdp_interface_entries() {
+    local rt="$1"
+    [ -e "$rt" ] || return 0
+    grep -q '^  interfaces:' "$rt" 2>/dev/null || return 0
+    if [ "$DRY_RUN" -ne 0 ]; then
+        log "+ repair xdp.interfaces entries missing mode/queues in $rt"
+        return 0
+    fi
+    run cp -a "$rt" "$BACKUP_DIR/$(basename "$rt").pre-iface-repair"
+    awk '
+        function rxq(name,   cmd, n, out, i) {
+            cmd = "ls /sys/class/net/" name "/queues 2>/dev/null | grep -c ^rx-"
+            cmd | getline n; close(cmd)
+            if (n + 0 < 1) n = 1
+            out = "["
+            for (i = 0; i < n; i++) out = out (i ? "," : "") i
+            return out "]"
+        }
+        /^[[:alnum:]_.]/ {
+            if (seen && !hasmode) printf "      mode: proxy\n"
+            if (seen && !hasq) printf "      queues: %s\n", rxq(pname)
+            inblk = 0; iniface = 0; seen = 0
+        }
+        /^xdp:[[:space:]]*$/ { inblk = 1 }
+        inblk && /^  interfaces:[[:space:]]*$/ { iniface = 1 }
+        iniface && /^    - name:/ {
+            if (seen && !hasmode) printf "      mode: proxy\n"
+            if (seen && !hasq) printf "      queues: %s\n", rxq(pname)
+            seen = 1; hasmode = 0; hasq = 0
+            pname = $0
+            sub(/^.*name:[[:space:]]*/, "", pname)
+            gsub(/["'"'"'[:space:]]/, "", pname)
+        }
+        iniface && seen && /^  [^ -]/ {
+            if (!hasmode) printf "      mode: proxy\n"
+            if (!hasq) printf "      queues: %s\n", rxq(pname)
+            iniface = 0; seen = 0
+        }
+        iniface && seen && /^      mode:/ { hasmode = 1 }
+        iniface && seen && /^      queues:/ { hasq = 1 }
+        { print }
+        END {
+            if (seen && !hasmode) printf "      mode: proxy\n"
+            if (seen && !hasq) printf "      queues: %s\n", rxq(pname)
+        }
+    ' "$rt" > "$rt.iface-repaired" && mv "$rt.iface-repaired" "$rt"
+}
+
 # Writes the xdp: block into configs/runtime.yaml — the file
 # RuntimeConfig::load_default actually parses. api_node.yaml stays API
 # credentials only. A runtime.yaml that already has an xdp: key is
-# authoritative and never touched.
+# authoritative — only its interface entries are repaired for missing
+# mode/queues keys.
 write_runtime_config() {
     local config_path="$INSTALL_DIR/configs/runtime.yaml"
     if grep -q '^xdp:' "$config_path" 2>/dev/null; then
+        repair_xdp_interface_entries "$config_path"
         return 0
     fi
     run mkdir -p "$INSTALL_DIR/configs"
