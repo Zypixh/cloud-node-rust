@@ -996,6 +996,16 @@ pub struct SharedPermit<'a> {
 
 pub type StaticSharedPermit = SharedPermit<'static>;
 
+impl std::fmt::Debug for SharedPermit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedPermit")
+            .field("purpose", &self.purpose)
+            .field("bytes", &self.bytes)
+            .field("committed", &self.committed)
+            .finish()
+    }
+}
+
 impl SharedPermit<'_> {
     pub fn bytes(&self) -> u64 {
         self.bytes

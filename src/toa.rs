@@ -678,8 +678,11 @@ pub fn toa_syn_option_bytes(client: SocketAddr) -> Vec<u8> {
 /// owned by the AF_XDP dial registry and released on session reap.
 pub enum UpstreamL4Stream {
     Kernel(TcpStream),
+    // Boxed: the smoltcp-edge stream carries its queue-byte credential
+    // and channel ends — several hundred bytes versus a 16-byte kernel
+    // fd. Constructed once per upstream dial, not per packet.
     #[cfg(target_os = "linux")]
-    AfXdp(crate::xdp::af_xdp::AfXdpTcpStream),
+    AfXdp(Box<crate::xdp::af_xdp::AfXdpTcpStream>),
 }
 
 impl UpstreamL4Stream {
@@ -736,7 +739,7 @@ impl UpstreamL4Stream {
             }
             #[cfg(target_os = "linux")]
             Self::AfXdp(stream) => {
-                crate::xdp::af_xdp::virtual_l4_stream(stream, peer_addr)
+                crate::xdp::af_xdp::virtual_l4_stream(*stream, peer_addr)
             }
         }
     }
@@ -850,7 +853,7 @@ async fn connect_upstream_afxdp(
         let mut attempts = String::new();
         for backend in &backends {
             match crate::xdp::af_xdp_dial_tcp(*backend, syn_extra_options.clone()).await {
-                Ok(stream) => return Ok(UpstreamL4Stream::AfXdp(stream)),
+                Ok(stream) => return Ok(UpstreamL4Stream::AfXdp(Box::new(stream))),
                 Err(err) => {
                     use std::fmt::Write as _;
                     let _ = writeln!(attempts, "  {backend}: {err:#}");

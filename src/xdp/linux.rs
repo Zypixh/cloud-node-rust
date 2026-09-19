@@ -293,6 +293,16 @@ pub struct AfXdpRuntimeHandle {
     umem_permit: Option<crate::memory_governor::StaticSharedPermit>,
 }
 
+impl AfXdpRuntimeHandle {
+    /// Bytes this runtime's UMEM + rings hold against the shared account.
+    pub(crate) fn umem_committed_bytes(&self) -> u64 {
+        self.umem_permit
+            .as_ref()
+            .map(|permit| permit.bytes())
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AfXdpPollStats {
     pub packets: usize,

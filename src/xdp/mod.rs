@@ -496,6 +496,12 @@ pub(crate) struct XdpManager {
     attached: parking_lot::RwLock<BTreeSet<String>>,
     #[cfg(target_os = "linux")]
     ebpf: parking_lot::Mutex<Option<aya::Ebpf>>,
+    /// Shared-account credential covering this generation's new pinned
+    /// map bytes — held for the dataplane's lifetime, released on
+    /// teardown/manager drop. Kept beside `ebpf` so ownership tracks the
+    /// same lifecycle.
+    #[cfg(target_os = "linux")]
+    attach_permit: parking_lot::Mutex<Option<crate::memory_governor::StaticSharedPermit>>,
     #[cfg(target_os = "linux")]
     af_xdp: parking_lot::Mutex<Option<linux::AfXdpRuntimeHandle>>,
     /// T4: outbound dial registry for the current bridge generation —
@@ -637,6 +643,8 @@ impl XdpManager {
             attached: parking_lot::RwLock::new(BTreeSet::new()),
             #[cfg(target_os = "linux")]
             ebpf: parking_lot::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            attach_permit: parking_lot::Mutex::new(None),
             #[cfg(target_os = "linux")]
             af_xdp: parking_lot::Mutex::new(None),
             #[cfg(target_os = "linux")]
@@ -844,6 +852,10 @@ impl XdpManager {
                         .store(attached_program.imported_flows, Ordering::Relaxed);
                     *self.effective_state_tables.write() =
                         attached_program.effective_state_tables;
+                    // The committed map-memory credential lives as long as
+                    // this generation's dataplane — dropping it here would
+                    // free ledger bytes the kernel still pins.
+                    *self.attach_permit.lock() = attached_program.resource_permit;
                     *self.ebpf.lock() = Some(attached_program.ebpf);
                     let attached = attached_program.interfaces;
                     *self.attached.write() = attached;
@@ -922,6 +934,7 @@ impl XdpManager {
             self.release_dial_guard().await;
             *self.af_xdp.lock() = None;
             *self.ebpf.lock() = None;
+            *self.attach_permit.lock() = None;
             if !self.config.interfaces.is_empty()
                 && let Err(err) = linux::detach(&self.config).await
             {
@@ -2299,6 +2312,7 @@ impl XdpManager {
             self.set_fallback_reason(reason);
         }
         *self.ebpf.lock() = None;
+        *self.attach_permit.lock() = None;
         *self.af_xdp.lock() = None;
         self.attached.write().clear();
         self.xsk_status.write().clear();
@@ -2484,6 +2498,9 @@ impl XdpManager {
             "kernelBpfBudget": {
                 "projectedBytes": self.bpf_map_projected_bytes(),
                 "pinnedBytes": self.bpf_map_pinned_bytes(),
+                // Bytes committed to the shared account by this
+                // generation's attach transaction (new pinned maps).
+                "accountCommittedBytes": self.attach_committed_bytes(),
                 "budgetBytes": crate::memory_governor::MEMORY_GOVERNOR
                     .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
                     .kernel_bpf_budget_bytes,
@@ -2491,6 +2508,8 @@ impl XdpManager {
             "tcpDataplane": {
                 "ready": xdp_tcp_dataplane_supported(),
                 "detail": self.tcp_dataplane_detail(),
+                // UMEM + ring bytes committed to the shared account.
+                "umemAccountBytes": self.af_xdp_umem_committed_bytes(),
             },
             "flowFeedback": self.flow_feedback_json(),
             "xskQueues": queue_statuses,
@@ -2501,6 +2520,40 @@ impl XdpManager {
             "blockedRanges": state.blocked_ranges.iter().filter(|(_, expiry)| **expiry > now).map(|(range, expiry)| serde_json::json!({"from": range_bound_to_ip(range.from, range.v6).to_string(), "to": range_bound_to_ip(range.to, range.v6).to_string(), "expiresAt": expiry})).collect::<Vec<_>>(),
             "allowedRanges": state.allowed_ranges.iter().filter(|(_, expiry)| **expiry > now).map(|(range, expiry)| serde_json::json!({"from": range_bound_to_ip(range.from, range.v6).to_string(), "to": range_bound_to_ip(range.to, range.v6).to_string(), "expiresAt": expiry})).collect::<Vec<_>>(),
         })
+    }
+
+    /// Committed shared-account bytes held by this generation's attach
+    /// (0 when unattached or off-Linux).
+    fn attach_committed_bytes(&self) -> u64 {
+        #[cfg(target_os = "linux")]
+        {
+            self.attach_permit
+                .lock()
+                .as_ref()
+                .map(|permit| permit.bytes())
+                .unwrap_or(0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            0
+        }
+    }
+
+    /// Committed shared-account bytes held by the AF_XDP runtime's UMEM
+    /// and rings (0 without a runtime).
+    fn af_xdp_umem_committed_bytes(&self) -> u64 {
+        #[cfg(target_os = "linux")]
+        {
+            self.af_xdp
+                .lock()
+                .as_ref()
+                .map(|handle| handle.umem_committed_bytes())
+                .unwrap_or(0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            0
+        }
     }
 
     /// EN-10 feedback/takeover state. `ownerEpoch` is read from the pinned
@@ -2571,6 +2624,7 @@ impl XdpManager {
             self.release_dial_guard_blocking();
             *self.af_xdp.lock() = None;
             *self.ebpf.lock() = None;
+            *self.attach_permit.lock() = None;
         }
         self.attached.write().clear();
         self.xsk_status.write().clear();
@@ -2675,7 +2729,11 @@ impl XdpManager {
         self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         {
+            // Adoption/teardown releases this generation's map credential:
+            // pinned bytes adopted by the successor are already inside
+            // observed `used` — no double charge.
             *self.ebpf.lock() = None;
+            *self.attach_permit.lock() = None;
         }
         self.attached.write().clear();
         self.xsk_status.write().clear();
@@ -2707,6 +2765,7 @@ impl XdpManager {
             *self.af_xdp.lock() = None;
             linux::detach(&self.config).await?;
             *self.ebpf.lock() = None;
+            *self.attach_permit.lock() = None;
         }
         self.attached.write().clear();
         self.xsk_status.write().clear();
@@ -3413,6 +3472,7 @@ pub async fn reload_from_runtime() -> anyhow::Result<()> {
                 #[cfg(target_os = "linux")]
                 {
                     old_manager.ebpf.lock().take();
+                    old_manager.attach_permit.lock().take();
                     // F1: an unrestored commit failure already mutated the
                     // live dataplane. Retire the lease so workers abort
                     // sessions explicitly (wire RST), then wait for the
