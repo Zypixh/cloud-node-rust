@@ -26,15 +26,18 @@
 //!
 //! # Float and refund policy
 //!
-//! - Refill draws `need + TICKET_FLOAT_BYTES` so a stream of small charges
+//! - Refill draws `need + float` where `float` is the governor's
+//!   pressure-scaled slack (256KiB at Normal/Elevated, shrinking under
+//!   High and zero under Critical) so a stream of small charges
 //!   (H2 streams, small WAF buffers) amortizes to one global op per
-//!   ~`FLOAT/charge` spends. If the float top-up cannot be afforded the
+//!   ~`float/charge` spends. If the float top-up cannot be afforded the
 //!   refill retries with the bare need, then fails closed.
-//! - `release` returns bytes to the bucket; once the balance exceeds
-//!   `TICKET_FLOAT_CAP_BYTES` the excess is refunded to the global ledger,
-//!   so a connection that ran a 16MiB transform does not idle-hold the
-//!   whole charge. Idle-held budget is capped at the float (≤1.25MiB) per
-//!   working connection — and zero for connections that never spend.
+//! - `release` returns bytes to the bucket; once the balance exceeds the
+//!   governor's pressure-scaled float cap (1MiB at Normal, 256KiB at
+//!   High, 0 at Critical) the excess is refunded to the global ledger —
+//!   idle workspace is reclaimable capacity, not a per-connection
+//!   reservation, and pressure pulls it back without evicting in-flight
+//!   work.
 //! - Dropping the bucket (connection close) refunds everything still held.
 
 use std::sync::Arc;
@@ -43,15 +46,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::memory_governor::{
     AdmissionClass, MEMORY_GOVERNOR, MemoryGovernor, StaticAdmissionPermit,
 };
-
-/// Over-fetch margin added to each bucket refill: small charges (H2 streams
-/// are 16KiB) amortize to one global ledger op per ~16 spends.
-const TICKET_FLOAT_BYTES: u64 = 256 * 1024;
-
-/// Maximum balance a bucket may hold between requests. Larger releases
-/// refund the excess to the global workspace ledger, bounding idle-held
-/// budget at `CAP + in-flight` per connection.
-const TICKET_FLOAT_CAP_BYTES: u64 = 1024 * 1024;
 
 /// Per-connection pool of pre-admitted workspace bytes.
 pub struct TicketBucket {
@@ -95,7 +89,7 @@ impl TicketBucket {
     /// Pull `need` bytes (plus float margin when affordable) from the global
     /// workspace ledger into the local pool.
     fn refill(&self, need: u64) -> bool {
-        let want = need.saturating_add(TICKET_FLOAT_BYTES);
+        let want = need.saturating_add(self.governor.ticket_float_bytes());
         if self.governor.try_admit_workspace(want) {
             self.held.fetch_add(want, Ordering::AcqRel);
             self.balance.fetch_add(want, Ordering::AcqRel);
@@ -135,13 +129,15 @@ impl TicketBucket {
         None
     }
 
-    /// Return `bytes` to the pool; refund the excess over the float cap to
-    /// the global ledger so big one-off charges (a 16MiB transform) are not
-    /// idle-held for the connection's remaining lifetime.
+    /// Return `bytes` to the pool; refund the excess over the current
+    /// pressure-scaled float cap to the global ledger so big one-off
+    /// charges (a 16MiB transform) are not idle-held for the connection's
+    /// remaining lifetime, and idle slack returns under pressure.
     fn release(&self, bytes: u64) {
+        let cap = self.governor.ticket_float_cap_bytes();
         let mut cur = self.balance.fetch_add(bytes, Ordering::AcqRel) + bytes;
-        while cur > TICKET_FLOAT_CAP_BYTES {
-            let excess = cur - TICKET_FLOAT_CAP_BYTES;
+        while cur > cap {
+            let excess = cur - cap;
             match self.balance.compare_exchange_weak(
                 cur,
                 cur - excess,
@@ -253,14 +249,14 @@ mod tests {
     fn release_refunds_excess_over_cap() {
         let g = leaked_governor(256 * 1024 * 1024);
         let bucket = Arc::new(TicketBucket::new(g));
-        let big = 8 * 1024 * 1024; // > TICKET_FLOAT_CAP_BYTES
+        let big = 8 * 1024 * 1024; // > Normal-level float cap
         let p = bucket
             .spend(AdmissionClass::ResponseTransform, big)
             .expect("big spend refills");
         let held_in_flight = bucket.held_bytes();
         drop(p);
-        // After release, idle balance is capped at the float cap.
-        assert!(bucket.held_bytes() <= TICKET_FLOAT_CAP_BYTES);
+        // After release, idle balance is capped at the (Normal) float cap.
+        assert!(bucket.held_bytes() <= g.ticket_float_cap_bytes());
         assert!(bucket.held_bytes() < held_in_flight);
     }
 

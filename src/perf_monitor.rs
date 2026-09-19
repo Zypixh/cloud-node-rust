@@ -91,6 +91,20 @@ struct PerfSample {
     disk_ledger_reserved_bytes: u64,
     disk_ledger_committed_bytes: u64,
     disk_ledger_rejects: u64,
+    /// Shared memory account: bottleneck headroom (None → serialized as
+    /// null), grantable capacity, unfulfilled/committed-but-unobserved
+    /// commitments, managed stock under promise, and grant/reject totals.
+    account_headroom_bytes: Option<u64>,
+    account_grantable_bytes: u64,
+    account_pending_bytes: u64,
+    account_committed_unconfirmed_bytes: u64,
+    account_committed_live_bytes: u64,
+    account_grants_total: u64,
+    account_rejects_total: u64,
+    /// Leaf cgroup reclaimable estimate (reclaim target, not headroom)
+    /// and the age of the observation this sample was built from.
+    cgroup_reclaimable_bytes: u64,
+    observation_age_ms: u64,
     top_servers: Vec<TopServer>,
     advice: Vec<Advice>,
 }
@@ -275,6 +289,16 @@ async fn sample_loop(store: SharedStore) {
             disk_ledger_reserved_bytes: governor_snapshot.disk_reserved_bytes,
             disk_ledger_committed_bytes: governor_snapshot.disk_committed_bytes,
             disk_ledger_rejects: governor_snapshot.disk_rejects,
+            account_headroom_bytes: governor_snapshot.account_headroom_bytes,
+            account_grantable_bytes: governor_snapshot.account_grantable_bytes,
+            account_pending_bytes: governor_snapshot.account_pending_bytes,
+            account_committed_unconfirmed_bytes: governor_snapshot
+                .account_committed_unconfirmed_bytes,
+            account_committed_live_bytes: governor_snapshot.account_committed_live_bytes,
+            account_grants_total: governor_snapshot.account_grants_total,
+            account_rejects_total: governor_snapshot.account_rejects_total,
+            cgroup_reclaimable_bytes: governor_snapshot.cgroup_reclaimable_bytes,
+            observation_age_ms: governor_snapshot.observation_age_ms,
             top_servers,
             advice: build_advice(
                 cpu_usage,

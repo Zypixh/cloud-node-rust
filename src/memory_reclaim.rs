@@ -81,6 +81,31 @@ pub fn last_reclaim_stats() -> Option<ReclaimStats> {
 static PENDING_RECLAIM_LEVEL: AtomicU8 = AtomicU8::new(MemoryPressureLevel::Normal as u8);
 static RECLAIM_MONITOR_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
 
+/// Coordinator-wide activity counters: passes run, estimated bytes freed,
+/// last pass wall time, and panicked passes (kept alive by catch_unwind).
+/// Feeds the "reclaim target vs actual result" state fields.
+static RECLAIM_RUNS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_BYTES_FREED_EST: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_LAST_DURATION_MS: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReclaimActivitySnapshot {
+    pub runs_total: u64,
+    pub bytes_freed_estimate: u64,
+    pub last_duration_ms: u64,
+    pub panics_total: u64,
+}
+
+pub fn reclaim_activity() -> ReclaimActivitySnapshot {
+    ReclaimActivitySnapshot {
+        runs_total: RECLAIM_RUNS_TOTAL.load(Ordering::Relaxed),
+        bytes_freed_estimate: RECLAIM_BYTES_FREED_EST.load(Ordering::Relaxed),
+        last_duration_ms: RECLAIM_LAST_DURATION_MS.load(Ordering::Relaxed),
+        panics_total: RECLAIM_PANICS_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
 thread_local! {
     // Reclaiming cache state can update resident-memory accounting, which in
     // turn observes pressure again. Keep recursive notifications from
@@ -386,19 +411,28 @@ pub fn request_reclaim(level: MemoryPressureLevel) -> Option<ReclaimStats> {
     // monitor thread keeps driving future reclaims. The panic is still
     // reported by the default panic hook; we additionally log it as an error
     // so it cannot be mistaken for a normal cooldown skip.
+    let reclaim_started = Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         reclaim_for_level(level)
     }));
+    RECLAIM_RUNS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    RECLAIM_LAST_DURATION_MS.store(
+        reclaim_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
     // Cooldown is measured from reclaim completion, not start — a slow pass
     // must not leave the window already expired when it finishes. `.max(1)`
     // keeps 0 reserved for "never reclaimed".
     LAST_RECLAIM_AT_MS.store(monotonic_elapsed_ms().max(1), Ordering::Release);
     match outcome {
         Ok(stats) => {
+            RECLAIM_BYTES_FREED_EST
+                .fetch_add(stats.freed_bytes_estimate(), Ordering::Relaxed);
             drop(_reset);
             Some(stats)
         }
         Err(payload) => {
+            RECLAIM_PANICS_TOTAL.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
                 target: "memory_reclaim",
                 level = level.as_str(),
@@ -594,10 +628,12 @@ pub fn start_reclaim_monitor() {
         .spawn(|| {
             let _ = RECLAIM_MONITOR_THREAD.set(std::thread::current());
             loop {
-                // Wake on an async pressure notification or every 5 seconds so
-                // sustained pressure still re-escalates through the
-                // coordinator's sample hysteresis and retry backoff.
-                std::thread::park_timeout(Duration::from_secs(5));
+                // Normal observation cadence is 250ms: each wake re-reads
+                // the published snapshot (which refreshes /proc and cgroup
+                // state when stale) so pressure classification and the
+                // shared account never run on stale data. Async pressure
+                // notifications and PSI/cgroup event wakes unpark early.
+                std::thread::park_timeout(Duration::from_millis(250));
                 let pending = drain_pending_pressure();
                 // In unwind builds a panic anywhere in this iteration
                 // (reclaim, collect, reconcile, a poisoned lock) must not

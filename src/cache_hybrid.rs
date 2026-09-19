@@ -3003,21 +3003,6 @@ impl TinyUfoL1 {
         self.set_max_bytes(0);
     }
 
-    fn rebuild_empty(&self, resolved: u64) {
-        self.max_bytes.store(resolved, Ordering::Relaxed);
-        let new_cache = Arc::new(Self::build_cache(resolved));
-        self.current_weight.store(0, Ordering::Relaxed);
-        {
-            let mut guard = self.inner.write().expect("TinyUfoL1 lock poisoned");
-            *guard = new_cache.clone();
-        }
-        // Keys inserted between the swap and this retain resolve against the
-        // new (empty) cache and are kept only if their entry is actually
-        // live there — a clear() would drop index entries for fresh puts.
-        self.keys
-            .retain(|key| new_cache.get_stale(key).0.is_some());
-    }
-
     fn force_rebuild_with_limit(&self, bytes: u64) {
         let resolved = bytes.max(1024);
         let target_weight = Self::weight_limit_for_bytes(resolved);
@@ -3078,10 +3063,93 @@ impl TinyUfoL1 {
         self.refresh_stats(&new_cache);
     }
 
+    /// Bounded eviction for the pressure-reclaim path: at most
+    /// `BATCH_ITEMS` keys or `BATCH_BUDGET` per pass, re-evaluating the
+    /// byte gap between passes. Reuses `remove()` — no whole-index clone,
+    /// no global sort, no cache rebuild, so reclaim's own temporary
+    /// allocation is O(batch), not O(cache). Oldest-within-batch eviction
+    /// approximates LRU without touching the vendored TinyUFO internals.
+    /// `shrink_to_bytes` of `None` means evict everything (Critical).
+    fn reclaim_batched(&self, shrink_to_bytes: Option<u64>) -> (usize, u64) {
+        const BATCH_ITEMS: usize = 256;
+        const BATCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
+        let (count_before, bytes_before) = self.stats();
+        let target_bytes = shrink_to_bytes.unwrap_or(0);
+        let mut removed = 0usize;
+        let mut freed_estimate = 0u64;
+        // Convergence guard: a round that found nothing removable means
+        // the index holds only live entries already inside the target —
+        // evicting more would just churn the working set.
+        let mut idle_rounds = 0u32;
+        loop {
+            let (_, current_bytes) = self.stats();
+            let deficit = current_bytes.saturating_sub(target_bytes);
+            if deficit == 0 {
+                break;
+            }
+            let started = std::time::Instant::now();
+            // Bounded candidate harvest: clone at most BATCH_ITEMS keys.
+            // Removed entries leave the set, so the next pass's iterator
+            // front advances past what this pass already drained.
+            let mut batch: Vec<(String, i64, u64)> = Vec::with_capacity(BATCH_ITEMS);
+            let mut candidates: Vec<String> = Vec::with_capacity(BATCH_ITEMS);
+            for key_ref in self.keys.iter() {
+                if candidates.len() >= BATCH_ITEMS || started.elapsed() >= BATCH_BUDGET {
+                    break;
+                }
+                candidates.push(key_ref.clone());
+            }
+            for key in candidates {
+                if started.elapsed() >= BATCH_BUDGET {
+                    break;
+                }
+                match self.get_stale(&key) {
+                    Some((entry, _)) => batch.push((
+                        key.clone(),
+                        entry.created_at,
+                        Self::entry_weight_units(&key, &entry) as u64 * 1024,
+                    )),
+                    None => {
+                        // Index row for a dead entry — free hygiene.
+                        self.keys.remove(&key);
+                    }
+                }
+            }
+            batch.sort_unstable_by_key(|(_, created_at, _)| *created_at);
+            let mut batch_freed = 0u64;
+            for (key, _, est_bytes) in batch {
+                if started.elapsed() >= BATCH_BUDGET {
+                    break;
+                }
+                if shrink_to_bytes.is_some() && batch_freed >= deficit {
+                    break;
+                }
+                self.remove(&key);
+                removed += 1;
+                freed_estimate = freed_estimate.saturating_add(est_bytes);
+                batch_freed += est_bytes;
+            }
+            if batch_freed == 0 {
+                idle_rounds += 1;
+                if idle_rounds >= 2 {
+                    break;
+                }
+            } else {
+                idle_rounds = 0;
+            }
+        }
+        let (count_after, bytes_after) = self.stats();
+        (
+            count_before.saturating_sub(count_after).min(removed),
+            bytes_before.saturating_sub(bytes_after).max(freed_estimate),
+        )
+    }
+
+    #[cfg(test)]
     fn force_clear(&self) {
-        // Critical reclaim means "drop everything" — no salvage.
-        let limit = self.max_bytes.load(Ordering::Relaxed).max(1024);
-        self.rebuild_empty(limit);
+        // Clear-all via the same bounded eviction path the reclaim
+        // coordinator uses.
+        let _ = self.reclaim_batched(None);
     }
 
     fn stats(&self) -> (usize, u64) {
@@ -3598,17 +3666,12 @@ pub struct CacheReclaimStats {
     pub surrogate_index_tags_removed: usize,
 }
 
+/// Pressure-path L1 reclaim goes through bounded batch eviction: the
+/// coordinator (the only caller chain) frees ≤256 entries per ~2ms pass
+/// and re-evaluates the gap between passes — no whole-index clone, no
+/// global sort, no rebuild on the reclaim path.
 fn reclaim_l1_from_storage(storage: &HybridStorage, shrink_to_bytes: Option<u64>) -> (usize, u64) {
-    let (count_before, bytes_before) = storage.l1.stats();
-    match shrink_to_bytes {
-        Some(bytes) => storage.l1.force_rebuild_with_limit(bytes),
-        None => storage.l1.force_clear(),
-    }
-    let (count_after, bytes_after) = storage.l1.stats();
-    (
-        count_before.saturating_sub(count_after),
-        bytes_before.saturating_sub(bytes_after),
-    )
+    storage.l1.reclaim_batched(shrink_to_bytes)
 }
 
 pub fn reclaim_caches_elevated() -> CacheReclaimStats {

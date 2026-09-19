@@ -271,6 +271,10 @@ pub struct AttachedProgram {
     /// callers record it so status reports and later reloads see the real
     /// map sizes rather than the unsized defaults.
     pub effective_state_tables: Option<XdpStateTables>,
+    /// Shared-account credential for this generation's new pinned map
+    /// bytes — committed at attach, released on teardown. `None` only
+    /// when the account was bypassed (never in normal attach).
+    pub resource_permit: Option<crate::memory_governor::StaticSharedPermit>,
 }
 
 #[derive(Debug)]
@@ -284,6 +288,9 @@ pub struct AfXdpRuntimeHandle {
     /// dataplane-compatible — the sockets, UMEMs and worker threads are
     /// never dropped across such a reload.
     pub(crate) lease: Option<std::sync::Arc<AfXdpDataplaneLease>>,
+    /// Committed shared-account credential covering the UMEM frames and
+    /// ring descriptors — released when the runtime handle drops.
+    umem_permit: Option<crate::memory_governor::StaticSharedPermit>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -567,13 +574,23 @@ pub fn prepare_af_xdp_sockets(config: &XdpConfig) -> anyhow::Result<AfXdpRuntime
                 .ok_or_else(|| anyhow::anyhow!("AF_XDP total byte count overflow"))?;
         }
     }
-    let headroom = crate::memory_governor::MEMORY_GOVERNOR
-        .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
-        .af_xdp_budget_bytes;
-    anyhow::ensure!(
-        projected_bytes <= headroom,
-        "AF_XDP projected memory {projected_bytes} exceeds pinned-allocation headroom {headroom}"
-    );
+    // UMEM frames + rings are pinned userspace memory for the dataplane's
+    // whole lifetime — a committed shared-account grant, taken on a fresh
+    // observation (not the possibly-stale published snapshot).
+    let mut umem_permit = crate::memory_governor::MEMORY_GOVERNOR
+        .try_grant_shared_fresh(
+            crate::memory_governor::SharedGrantPurpose::AfXdpUmem,
+            projected_bytes,
+        )
+        .ok_or_else(|| {
+            let view = crate::memory_governor::MEMORY_GOVERNOR.account_view();
+            anyhow::anyhow!(
+                "AF_XDP projected memory {projected_bytes}B exceeds shared account capacity \
+                 (grantable {}B)",
+                view.grantable_bytes
+            )
+        })?;
+    umem_permit.commit();
     let mut queues = Vec::with_capacity(socket_count);
     let mut statuses = Vec::with_capacity(socket_count);
     for interface in config
@@ -604,6 +621,7 @@ pub fn prepare_af_xdp_sockets(config: &XdpConfig) -> anyhow::Result<AfXdpRuntime
         statuses,
         last_status_refresh_at: None,
         lease: None,
+        umem_permit: Some(umem_permit),
     })
 }
 
@@ -862,18 +880,49 @@ pub async fn attach(
     // RX queues from sysfs here (single choke point covering daemon, CLI
     // and smoke attach paths). A miss yields [0] and bind fails loudly.
     crate::xdp_auto_config::fill_missing_xdp_interface_queues(&mut effective_config);
-    let sizing = |config: &mut XdpConfig| -> anyhow::Result<()> {
-        let headroom = crate::memory_governor::MEMORY_GOVERNOR
-            .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
-            .kernel_bpf_budget_bytes;
+    // One shared-account transaction covers the whole attach: new pinned
+    // map bytes + load/JIT transient + the old↔new coexistence peak —
+    // no separate checks against the same headroom. The grant stays
+    // pending through load/link attach; commit lands only when the
+    // dataplane is fully attached, and every early return drops the
+    // pending credential for a full refund.
+    let mut attach_permit: Option<(
+        crate::memory_governor::StaticSharedPermit,
+        u64, // transient overhead share, refunded at commit
+    )> = None;
+    let mut sizing = |config: &mut XdpConfig| -> anyhow::Result<()> {
+        // Large non-reclaimable commitments observe fresh state, not the
+        // published snapshot which may be up to a cadence old.
+        let grantable = crate::memory_governor::MEMORY_GOVERNOR
+            .account_view_fresh()
+            .grantable_bytes;
         // One pin survey per attempt: sizing and enforcement must judge
         // the same pin set — separate reads race a pin appearing or
         // disappearing mid-attach.
         let survey = pinned_map_survey(config);
         if config.state_tables.is_none() {
-            config.state_tables = auto_scale_state_tables(config, headroom, &survey)?;
+            config.state_tables = auto_scale_state_tables(config, grantable, &survey)?;
         }
-        ensure_bpf_map_budget_with_survey(config, headroom, &survey)
+        ensure_bpf_map_budget_with_survey(config, grantable, &survey)?;
+        let new_bytes = projected_bpf_map_bytes(config)
+            .saturating_sub(pinned_spec_bytes_from_survey(config, &survey));
+        let overhead = attach_transient_overhead_bytes(new_bytes);
+        let permit = crate::memory_governor::MEMORY_GOVERNOR
+            .try_grant_shared(
+                crate::memory_governor::SharedGrantPurpose::KernelBpf,
+                new_bytes.saturating_add(overhead),
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "shared account cannot cover eBPF attach: {new_bytes}B new pinned \
+                     + {overhead}B load/coexistence overhead (grantable {}B)",
+                    crate::memory_governor::MEMORY_GOVERNOR
+                        .account_view()
+                        .grantable_bytes
+                )
+            })?;
+        attach_permit = Some((permit, overhead));
+        Ok(())
     };
     if let Err(first) = sizing(&mut effective_config) {
         // Reclaimable pools (caches, regex, connector caches) yield before a
@@ -1238,13 +1287,32 @@ pub async fn attach(
             attached.insert(interface.name.clone());
         }
     }
+    // Commit point: the generation is fully attached. The transient
+    // load/coexistence share is refunded first — only the new pinned map
+    // bytes stay committed for the dataplane's lifetime (they release
+    // when this AttachedProgram is dropped).
+    let mut resource_permit = None;
+    if let Some((mut permit, overhead)) = attach_permit {
+        permit.shrink(overhead);
+        permit.commit();
+        resource_permit = Some(permit);
+    }
     Ok(AttachedProgram {
         interfaces: attached,
         ebpf,
         owner_epoch,
         imported_flows,
         effective_state_tables: effective_config.state_tables,
+        resource_permit,
     })
+}
+
+/// Transient share of the attach transaction beyond new pinned map
+/// bytes: ELF parse, verifier work, JIT output, and the brief window
+/// where old and new generations coexist during atomic reattach. Scaled
+/// by the new-map footprint with a floor covering a minimal object.
+fn attach_transient_overhead_bytes(new_map_bytes: u64) -> u64 {
+    (new_map_bytes / 8).saturating_add(32 * 1024 * 1024)
 }
 
 /// F1 atomic handover: point the running dataplane at the new

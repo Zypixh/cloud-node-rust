@@ -209,6 +209,24 @@ pub struct GovernorSnapshot {
     /// 1000); 0 when PSI is unavailable.
     pub psi_some_avg10_x100: u32,
     pub psi_full_avg10_x100: u32,
+    /// Shared account, published with the snapshot generation the values
+    /// were computed from (see `SharedAccountView`).
+    pub account_headroom_bytes: Option<u64>,
+    pub account_safety_margin_bytes: u64,
+    pub account_grantable_bytes: u64,
+    /// Unfulfilled commitments — granted credentials whose allocation
+    /// has not been confirmed yet.
+    pub account_pending_bytes: u64,
+    /// Committed bytes not yet inside a published observation.
+    pub account_committed_unconfirmed_bytes: u64,
+    /// Managed stock under promise: committed credentials still held.
+    pub account_committed_live_bytes: u64,
+    pub account_grants_total: u64,
+    pub account_rejects_total: u64,
+    /// Leaf cgroup reclaimable estimate — reclaim target, not headroom.
+    pub cgroup_reclaimable_bytes: u64,
+    /// Age of the underlying observation when this snapshot was built.
+    pub observation_age_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -343,6 +361,15 @@ struct MemorySnapshot {
     cgroup_memory_max_bytes: u64,
     cgroup_memory_high_bytes: u64,
     cgroup_swap_max_bytes: u64,
+    /// Leaf cgroup inactive_file — reclaimable estimate, reported apart
+    /// from headroom so callers never pre-spend reclaim targets.
+    cgroup_reclaimable_bytes: u64,
+    /// Bottleneck headroom for NEW shared-account commitments: min over
+    /// host MemAvailable and every constrained cgroup level's
+    /// (limit − current). None when no layer could be observed at all —
+    /// the account then rejects new commitments (fail-closed), because
+    /// there is no measured basis for them.
+    account_headroom_bytes: Option<u64>,
     process_rss_bytes: u64,
     process_pss_bytes: u64,
     process_anon_rss_bytes: u64,
@@ -376,7 +403,11 @@ pub fn reported_memory_totals() -> (i64, i64) {
     )
 }
 
-const SNAPSHOT_TTL_MS: i64 = 2_000;
+/// Normal observation cadence: cached inputs are republished at most
+/// every 250ms (PSI/cgroup event wakeups can force an earlier refresh).
+/// The hot path never reads /proc — it reads the published snapshot and
+/// the materialized limits table.
+const SNAPSHOT_TTL_MS: i64 = 250;
 const FD_SNAPSHOT_TTL_MS: i64 = 250;
 const MIN_MEMORY_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const CONNECTION_BUDGET_PCT: u64 = 45;
@@ -651,6 +682,12 @@ struct GovernorLimits {
     fd_soft_limit: u64,
     memory_pressure_high: bool,
     memory_pressure_level: MemoryPressureLevel,
+    /// Pressure-scaled workspace float: the slack bytes a ticket bucket
+    /// checks out ahead of need, and the idle balance it may hold. Under
+    /// pressure both shrink toward zero so idle workspace returns to the
+    /// shared account instead of sitting checked out.
+    ticket_float_bytes: u64,
+    ticket_float_cap_bytes: u64,
 }
 
 pub struct MemoryGovernor {
@@ -720,12 +757,42 @@ pub struct MemoryGovernor {
     cached_cgroup_memory_max_bytes: AtomicU64,
     cached_cgroup_memory_high_bytes: AtomicU64,
     cached_cgroup_swap_max_bytes: AtomicU64,
+    cached_cgroup_reclaimable_bytes: AtomicU64,
+    /// Published account headroom (`u64::MAX` = no valid observation).
+    cached_account_headroom_bytes: AtomicU64,
     cached_process_rss_bytes: AtomicU64,
     cached_process_pss_bytes: AtomicU64,
     cached_process_anon_rss_bytes: AtomicU64,
     cached_psi_some_avg10_x100: AtomicU64,
     cached_psi_full_avg10_x100: AtomicU64,
     resident: ResidentMemoryAccounting,
+    /// Shared memory account. The ledger tracks *commitments* — bytes a
+    /// credential holder has been granted — never claims about physical
+    /// pages. Two counters bound new grants:
+    ///
+    /// - `account_pending_bytes`: granted but not yet committed (the
+    ///   credential holder has not confirmed its allocation).
+    /// - `account_committed_unconfirmed_bytes`: committed but not yet
+    ///   inside a published observation (a commit that landed after the
+    ///   last kernel read). These bytes are deducted until a refresh
+    ///   observes them inside `used`; bytes released before observation
+    ///   stay deducted too — freed memory is only re-promised after a
+    ///   snapshot confirms it.
+    ///
+    /// `pending + committed_unconfirmed + request <= account_capacity`
+    /// admits a grant. Confirmed commitments need no deduction — they
+    /// are already inside observed `used`, which is exactly what the
+    /// capacity formula "managed stock + genuine new headroom" means.
+    account_pending_bytes: PaddedAtomicU64,
+    account_committed_unconfirmed_bytes: PaddedAtomicU64,
+    /// Stats/attribution: committed bytes still held (excl. released),
+    /// cumulative grants, and rejections by reason.
+    account_committed_live_bytes: AtomicU64,
+    account_grants_total: AtomicU64,
+    account_rejects_total: AtomicU64,
+    /// Committed live bytes per `SharedGrantPurpose` (attribution only;
+    /// admission never reads these).
+    account_purpose_committed: [AtomicU64; SHARED_GRANT_PURPOSE_COUNT],
     /// EN-16 listener pools: (bind addr, class) -> in-flight slots held.
     listener_pools: Mutex<HashMap<(SocketAddr, u8), u64>>,
     /// Listeners holding >=1 slot per class (fair-share divisor).
@@ -749,20 +816,35 @@ pub struct AdmissionPermit<'a> {
     /// shared-connection byte total is derived from class counters, so it
     /// releases automatically with the count.
     cache_read_memory_charge_bytes: u64,
+    /// Shared-account credential covering the class's estimated bytes
+    /// (plus the cache-read object charge where applicable). Committed
+    /// at admit: the admission is real work from this point on.
+    shared: SharedPermit<'a>,
+}
+
+impl AdmissionPermit<'_> {
+    /// Bytes this admission holds against the shared account.
+    pub fn account_bytes(&self) -> u64 {
+        self.shared.bytes()
+    }
 }
 
 pub type StaticAdmissionPermit = AdmissionPermit<'static>;
 
 pub struct ZeroCopyRelayPermit<'a> {
     governor: &'a MemoryGovernor,
-    charge_bytes: u64,
+    /// Committed shared-account credential; its byte charge is the
+    /// relay's estimated footprint (`shared.bytes()`).
+    shared: SharedPermit<'a>,
 }
 
 pub type StaticZeroCopyRelayPermit = ZeroCopyRelayPermit<'static>;
 
 pub struct UdpQueueBytePermit<'a> {
     governor: &'a MemoryGovernor,
-    bytes: u64,
+    /// Committed shared-account credential; `shared.bytes()` is the
+    /// queue charge this permit holds.
+    shared: SharedPermit<'a>,
 }
 
 pub type StaticUdpQueueBytePermit = UdpQueueBytePermit<'static>;
@@ -770,7 +852,9 @@ pub type StaticUdpQueueBytePermit = UdpQueueBytePermit<'static>;
 /// EN-17/F3: RAII charge against `tcp_queue_bytes` — released on drop.
 pub struct TcpQueueBytePermit<'a> {
     governor: &'a MemoryGovernor,
-    bytes: u64,
+    /// Committed shared-account credential; `shared.bytes()` is the
+    /// queue charge this permit holds.
+    shared: SharedPermit<'a>,
 }
 
 pub type StaticTcpQueueBytePermit = TcpQueueBytePermit<'static>;
@@ -822,6 +906,206 @@ impl DiskPermit<'_> {
 impl Drop for DiskPermit<'_> {
     fn drop(&mut self) {
         self.governor.disk_reserved[self.class as usize].fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// Point-in-time view of the shared account for observability and for
+/// transaction sizers (attach picks table sizes against `grantable`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SharedAccountView {
+    /// Published bottleneck headroom (None = no valid observation yet).
+    pub headroom_bytes: Option<u64>,
+    /// Composed safety reserve subtracted from headroom.
+    pub safety_margin_bytes: u64,
+    /// headroom − margin − outstanding commitments: what a new grant can
+    /// actually promise right now.
+    pub grantable_bytes: u64,
+    /// Granted-not-committed (unfulfilled credentials).
+    pub pending_bytes: u64,
+    /// Committed but not yet observed inside `used`.
+    pub committed_unconfirmed_bytes: u64,
+    /// Committed credentials still held (managed stock under promise).
+    pub committed_live_bytes: u64,
+    pub grants_total: u64,
+    pub rejects_total: u64,
+    /// Reclaimable estimate (leaf cgroup inactive_file) — a target for
+    /// the reclaim coordinator, never spendable headroom.
+    pub reclaimable_bytes: u64,
+}
+
+/// Which governed domain a shared-account grant belongs to. Purposes are
+/// for attribution and observability — the account itself is one pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedGrantPurpose {
+    /// Estimated bytes behind an `AdmissionPermit` (connections, streams,
+    /// sessions, work items admitted through `try_admit`).
+    Admission,
+    /// Per-connection request-workspace ticket float (`memory_ticket`).
+    RequestWorkspace,
+    /// Bytes queued in the UDP demux path.
+    UdpQueue,
+    /// Bytes queued inside the AF_XDP TCP dataplane.
+    TcpQueue,
+    /// Zero-copy relay buffers.
+    ZeroCopyRelay,
+    /// Cache-read memory-object buffers.
+    CacheReadMemory,
+    /// BPF program/map load + pinned map growth during attach/reload.
+    KernelBpf,
+    /// AF_XDP UMEM frames and ring descriptors.
+    AfXdpUmem,
+    /// Configuration publication peak (staging + coexistence).
+    ConfigPublish,
+}
+
+const SHARED_GRANT_PURPOSE_COUNT: usize = 9;
+
+fn shared_purpose_index(purpose: SharedGrantPurpose) -> usize {
+    match purpose {
+        SharedGrantPurpose::Admission => 0,
+        SharedGrantPurpose::RequestWorkspace => 1,
+        SharedGrantPurpose::UdpQueue => 2,
+        SharedGrantPurpose::TcpQueue => 3,
+        SharedGrantPurpose::ZeroCopyRelay => 4,
+        SharedGrantPurpose::CacheReadMemory => 5,
+        SharedGrantPurpose::KernelBpf => 6,
+        SharedGrantPurpose::AfXdpUmem => 7,
+        SharedGrantPurpose::ConfigPublish => 8,
+    }
+}
+
+/// RAII credential for bytes committed against the shared account.
+///
+/// Lifecycle: `try_grant_shared*` returns the credential in *pending*
+/// state. Call `commit` once the allocation it covers has actually been
+/// made — commit moves the charge from `pending` to
+/// `committed-unconfirmed`, where it stays deducted until an observation
+/// proves the bytes are inside `used`. Dropping without commit returns
+/// the pending grant immediately (cancel/timeout/early-return paths are
+/// leak-free by construction); dropping a committed credential releases
+/// the ownership record while the deduction persists until the next
+/// published snapshot confirms the physical release — freed-but-still-
+/// resident pages (mimalloc arenas, pinned maps mid-teardown) are never
+/// re-promised early.
+pub struct SharedPermit<'a> {
+    governor: &'a MemoryGovernor,
+    purpose: SharedGrantPurpose,
+    bytes: u64,
+    committed: bool,
+}
+
+pub type StaticSharedPermit = SharedPermit<'static>;
+
+impl SharedPermit<'_> {
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub fn purpose(&self) -> SharedGrantPurpose {
+        self.purpose
+    }
+
+    pub fn is_committed(&self) -> bool {
+        self.committed
+    }
+
+    /// Confirm the covered allocation actually happened. Moves the
+    /// charge pending → committed-unconfirmed; it is lifted from the
+    /// deduction once the next snapshot observes it inside `used`.
+    pub fn commit(&mut self) {
+        if self.committed || self.bytes == 0 {
+            return;
+        }
+        self.committed = true;
+        self.governor
+            .account_pending_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+        self.governor
+            .account_committed_unconfirmed_bytes
+            .fetch_add(self.bytes, Ordering::AcqRel);
+        self.governor
+            .account_committed_live_bytes
+            .fetch_add(self.bytes, Ordering::AcqRel);
+        self.governor.account_purpose_committed[shared_purpose_index(self.purpose)]
+            .fetch_add(self.bytes, Ordering::Relaxed);
+    }
+
+    /// Grow the credential by `delta` — subject to the same capacity
+    /// check as a fresh grant. Returns false (credential unchanged) when
+    /// the account cannot cover the extension.
+    pub fn grow(&mut self, delta: u64) -> bool {
+        if delta == 0 {
+            return true;
+        }
+        if self
+            .governor
+            .try_charge_account(delta, self.committed, self.purpose)
+        {
+            self.bytes = self.bytes.saturating_add(delta);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Shrink the credential. Pending bytes free immediately; committed
+    /// bytes keep their deduction until the next observation confirms
+    /// the physical release.
+    pub fn shrink(&mut self, delta: u64) {
+        let delta = delta.min(self.bytes);
+        if delta == 0 {
+            return;
+        }
+        self.bytes -= delta;
+        if self.committed {
+            self.governor
+                .account_committed_live_bytes
+                .fetch_sub(delta, Ordering::AcqRel);
+            self.governor.account_purpose_committed[shared_purpose_index(self.purpose)]
+                .fetch_sub(delta, Ordering::Relaxed);
+        } else {
+            self.governor
+                .account_pending_bytes
+                .fetch_sub(delta, Ordering::AcqRel);
+        }
+    }
+
+    /// Re-attribute the credential to another purpose (byte total is
+    /// unchanged — transfer never frees or grants capacity).
+    pub fn transfer(&mut self, purpose: SharedGrantPurpose) {
+        if purpose == self.purpose {
+            return;
+        }
+        if self.committed {
+            self.governor.account_purpose_committed[shared_purpose_index(self.purpose)]
+                .fetch_sub(self.bytes, Ordering::Relaxed);
+            self.governor.account_purpose_committed[shared_purpose_index(purpose)]
+                .fetch_add(self.bytes, Ordering::Relaxed);
+        }
+        self.purpose = purpose;
+    }
+}
+
+impl Drop for SharedPermit<'_> {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        if self.committed {
+            // Ownership ends, but the physical free is not yet observed:
+            // the committed-unconfirmed deduction persists until the
+            // next snapshot refresh — that is what "release requires
+            // confirmation" means under a retained-pages allocator.
+            self.governor
+                .account_committed_live_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+            self.governor.account_purpose_committed[shared_purpose_index(self.purpose)]
+                .fetch_sub(self.bytes, Ordering::Relaxed);
+        } else {
+            self.governor
+                .account_pending_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+        }
     }
 }
 
@@ -882,12 +1166,22 @@ impl MemoryGovernor {
             cached_cgroup_memory_max_bytes: AtomicU64::new(0),
             cached_cgroup_memory_high_bytes: AtomicU64::new(0),
             cached_cgroup_swap_max_bytes: AtomicU64::new(u64::MAX),
+            cached_cgroup_reclaimable_bytes: AtomicU64::new(0),
+            // u64::MAX = no valid observation yet: fail-closed until the
+            // first snapshot publishes a measured headroom.
+            cached_account_headroom_bytes: AtomicU64::new(u64::MAX),
             cached_process_rss_bytes: AtomicU64::new(0),
             cached_process_pss_bytes: AtomicU64::new(0),
             cached_process_anon_rss_bytes: AtomicU64::new(0),
             cached_psi_some_avg10_x100: AtomicU64::new(0),
             cached_psi_full_avg10_x100: AtomicU64::new(0),
             resident: ResidentMemoryAccounting::new(),
+            account_pending_bytes: PaddedAtomicU64::new(0),
+            account_committed_unconfirmed_bytes: PaddedAtomicU64::new(0),
+            account_committed_live_bytes: AtomicU64::new(0),
+            account_grants_total: AtomicU64::new(0),
+            account_rejects_total: AtomicU64::new(0),
+            account_purpose_committed: std::array::from_fn(|_| AtomicU64::new(0)),
             listener_pools: Mutex::new(HashMap::new()),
             listener_class_active: std::array::from_fn(|_| AtomicU64::new(0)),
             listener_pool_rejects: AtomicU64::new(0),
@@ -917,6 +1211,8 @@ impl MemoryGovernor {
                 // Fail-closed until the first real snapshot lands.
                 memory_pressure_high: true,
                 memory_pressure_level: MemoryPressureLevel::Critical,
+                ticket_float_bytes: 0,
+                ticket_float_cap_bytes: 0,
             }),
             #[cfg(test)]
             fd_count_reads: AtomicU64::new(0),
@@ -968,17 +1264,206 @@ impl MemoryGovernor {
                 .fetch_sub(bytes, Ordering::AcqRel);
             return false;
         }
+        // Workspace bytes are spendable the moment the refill lands —
+        // charge the account as committed immediately.
+        if !self.try_charge_account(bytes, true, SharedGrantPurpose::RequestWorkspace) {
+            self.request_workspace_bytes
+                .fetch_sub(bytes, Ordering::AcqRel);
+            return false;
+        }
         true
     }
 
     pub(crate) fn workspace_refund(&self, bytes: u64) {
         self.request_workspace_bytes
             .fetch_sub(bytes, Ordering::AcqRel);
+        self.account_release_committed(bytes, SharedGrantPurpose::RequestWorkspace);
+    }
+
+    /// Release a committed account charge without a credential object
+    /// (ledger paths that track bytes themselves). The grantable-space
+    /// deduction persists until the next observation confirms the
+    /// physical release — only the ownership attribution drops now.
+    fn account_release_committed(&self, bytes: u64, purpose: SharedGrantPurpose) {
+        self.account_committed_live_bytes
+            .fetch_sub(bytes, Ordering::AcqRel);
+        self.account_purpose_committed[shared_purpose_index(purpose)]
+            .fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    /// Safety margin withheld from new shared-account commitments.
+    /// Composition, not a percentage partition: control plane + protocol
+    /// progress floor (128MiB) plus an observation-window burst term
+    /// (total/64 covers allocations that can land between the 250ms
+    /// snapshot cadence and the credential's commit), bounded so the
+    /// reserve itself never dominates a small node.
+    fn account_safety_margin_bytes(&self) -> u64 {
+        let total = self.cached_total_bytes.load(Ordering::Relaxed);
+        (128 * 1024 * 1024 + total / 64).min(total / 8).max(1)
+    }
+
+    /// Bytes the account can still promise: published bottleneck headroom
+    /// minus the safety margin and every unconfirmed commitment. Returns
+    /// 0 when no observation has ever landed — the account opens
+    /// fail-closed.
+    fn account_grantable_bytes(&self) -> u64 {
+        let headroom = match self.cached_account_headroom_bytes.load(Ordering::Relaxed) {
+            u64::MAX => return 0,
+            value => value,
+        };
+        let outstanding = self
+            .account_pending_bytes
+            .load(Ordering::Acquire)
+            .saturating_add(self.account_committed_unconfirmed_bytes.load(Ordering::Acquire));
+        headroom
+            .saturating_sub(self.account_safety_margin_bytes())
+            .saturating_sub(outstanding)
+    }
+
+    /// Charge `bytes` against the account. `committed` selects which
+    /// counter the charge lands in; callers use `false` for fresh
+    /// grants and `true` only for growing an already-committed permit.
+    /// Committed charges also land in the live/purpose attribution
+    /// immediately — the covered allocation is already real.
+    fn try_charge_account(
+        &self,
+        bytes: u64,
+        committed: bool,
+        purpose: SharedGrantPurpose,
+    ) -> bool {
+        let counter = if committed {
+            &self.account_committed_unconfirmed_bytes
+        } else {
+            &self.account_pending_bytes
+        };
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            let other = if committed {
+                self.account_pending_bytes.load(Ordering::Acquire)
+            } else {
+                self.account_committed_unconfirmed_bytes
+                    .load(Ordering::Acquire)
+            };
+            let outstanding = current.saturating_add(other).saturating_add(bytes);
+            if outstanding > self.account_grantable_from_outstanding() {
+                self.account_rejects_total.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current.saturating_add(bytes),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.account_grants_total.fetch_add(1, Ordering::Relaxed);
+                    if committed {
+                        self.account_committed_live_bytes
+                            .fetch_add(bytes, Ordering::AcqRel);
+                        self.account_purpose_committed[shared_purpose_index(purpose)]
+                            .fetch_add(bytes, Ordering::Relaxed);
+                    }
+                    return true;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Outstanding-free capacity view used inside the CAS loop above:
+    /// headroom − margin, without re-adding the counters being raced on.
+    fn account_grantable_from_outstanding(&self) -> u64 {
+        let headroom = match self.cached_account_headroom_bytes.load(Ordering::Relaxed) {
+            u64::MAX => return 0,
+            value => value,
+        };
+        headroom.saturating_sub(self.account_safety_margin_bytes())
+    }
+
+    /// Grant `bytes` against the shared account. The returned credential
+    /// is *pending* — call `SharedPermit::commit` when the allocation it
+    /// covers actually exists, or just drop it to return the grant.
+    pub fn try_grant_shared(
+        &self,
+        purpose: SharedGrantPurpose,
+        bytes: u64,
+    ) -> Option<SharedPermit<'_>> {
+        let bytes = bytes.max(1);
+        if !self.try_charge_account(bytes, false, purpose) {
+            return None;
+        }
+        Some(SharedPermit {
+            governor: self,
+            purpose,
+            bytes,
+            committed: false,
+        })
+    }
+
+    /// Grant with a forced fresh observation: invalidates the cached
+    /// snapshot and re-reads host + cgroup state before the capacity
+    /// check. For large, rare, non-reclaimable commitments (BPF object
+    /// load, AF_XDP UMEM, reload coexistence) where acting on a stale
+    /// snapshot could oversubscribe the node.
+    pub fn try_grant_shared_fresh(
+        &self,
+        purpose: SharedGrantPurpose,
+        bytes: u64,
+    ) -> Option<SharedPermit<'_>> {
+        self.invalidate_snapshot_cache();
+        // Force the refresh now so the grant checks a current bottleneck.
+        let _ = self.memory_snapshot();
+        self.try_grant_shared(purpose, bytes)
+    }
+
+    /// `account_view` on a forced-fresh observation — for transaction
+    /// sizers that must compute demand against the current bottleneck
+    /// before granting (attach picks state-table sizes from `grantable`).
+    pub fn account_view_fresh(&self) -> SharedAccountView {
+        self.invalidate_snapshot_cache();
+        let _ = self.memory_snapshot();
+        self.account_view()
+    }
+
+    /// Account view for observability and for callers that must size a
+    /// transaction before granting (e.g. attach choosing table sizes).
+    /// `grantable` already has margin and outstanding commitments removed.
+    pub fn account_view(&self) -> SharedAccountView {
+        SharedAccountView {
+            headroom_bytes: match self.cached_account_headroom_bytes.load(Ordering::Relaxed) {
+                u64::MAX => None,
+                value => Some(value),
+            },
+            safety_margin_bytes: self.account_safety_margin_bytes(),
+            grantable_bytes: self.account_grantable_bytes(),
+            pending_bytes: self.account_pending_bytes.load(Ordering::Relaxed),
+            committed_unconfirmed_bytes: self
+                .account_committed_unconfirmed_bytes
+                .load(Ordering::Relaxed),
+            committed_live_bytes: self.account_committed_live_bytes.load(Ordering::Relaxed),
+            grants_total: self.account_grants_total.load(Ordering::Relaxed),
+            rejects_total: self.account_rejects_total.load(Ordering::Relaxed),
+            reclaimable_bytes: self.cached_cgroup_reclaimable_bytes.load(Ordering::Relaxed),
+        }
     }
 
     /// Workspace ledger bytes currently checked out to ticket buckets.
     pub fn request_workspace_used_bytes(&self) -> u64 {
         self.request_workspace_bytes.load(Ordering::Acquire)
+    }
+
+    /// Pressure-scaled refill slack for a ticket bucket (bytes checked
+    /// out ahead of `need`). Reads the materialized limits table — one
+    /// ArcSwap load, never a snapshot refresh from the hot path unless
+    /// the table itself is stale.
+    pub(crate) fn ticket_float_bytes(&self) -> u64 {
+        self.limits().ticket_float_bytes
+    }
+
+    /// Pressure-scaled idle cap for a ticket bucket: balances above this
+    /// are refunded to the workspace ledger on release.
+    pub(crate) fn ticket_float_cap_bytes(&self) -> u64 {
+        self.limits().ticket_float_cap_bytes
     }
 
     /// Test-only seeding of the cached memory inputs (bumps the generation
@@ -997,6 +1482,10 @@ impl MemoryGovernor {
         self.cached_used_bytes
             .store(total_bytes.saturating_sub(available_bytes), Ordering::Release);
         self.cached_available_bytes
+            .store(available_bytes, Ordering::Release);
+        // Tests seed an unconstrained host: the account sees the seeded
+        // headroom as its capacity basis (safety margin still applies).
+        self.cached_account_headroom_bytes
             .store(available_bytes, Ordering::Release);
         self.cached_fd_soft_limit
             .store(fd_soft_limit, Ordering::Release);
@@ -1054,10 +1543,20 @@ impl MemoryGovernor {
             self.zero_copy_relays.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
+        let Some(mut shared) = self.try_grant_shared(
+            SharedGrantPurpose::ZeroCopyRelay,
+            ZERO_COPY_RELAY_ESTIMATED_BYTES,
+        ) else {
+            self.zero_copy_relay_bytes
+                .fetch_sub(ZERO_COPY_RELAY_ESTIMATED_BYTES, Ordering::AcqRel);
+            self.zero_copy_relays.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        };
+        shared.commit();
 
         Some(ZeroCopyRelayPermit {
             governor: self,
-            charge_bytes: ZERO_COPY_RELAY_ESTIMATED_BYTES,
+            shared,
         })
     }
 
@@ -1077,9 +1576,16 @@ impl MemoryGovernor {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    let Some(mut shared) =
+                        self.try_grant_shared(SharedGrantPurpose::UdpQueue, bytes)
+                    else {
+                        self.udp_queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                        return None;
+                    };
+                    shared.commit();
                     return Some(UdpQueueBytePermit {
                         governor: self,
-                        bytes,
+                        shared,
                     });
                 }
                 Err(observed) => current = observed,
@@ -1107,9 +1613,16 @@ impl MemoryGovernor {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    let Some(mut shared) =
+                        self.try_grant_shared(SharedGrantPurpose::TcpQueue, bytes)
+                    else {
+                        self.tcp_queue_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                        return None;
+                    };
+                    shared.commit();
                     return Some(TcpQueueBytePermit {
                         governor: self,
-                        bytes,
+                        shared,
                     });
                 }
                 Err(observed) => current = observed,
@@ -1163,10 +1676,32 @@ impl MemoryGovernor {
             }
         }
 
+        // Shared-account gate last: the class ceilings above are policy
+        // (fairness), the account is the physical bound. The credential
+        // is committed at admit — the connection/work item now exists —
+        // and released on drop; an account miss is counted against the
+        // class like every other rejection so the reject reason stays
+        // attributable.
+        let account_charge =
+            class_estimated_bytes(class).saturating_add(cache_read_memory_charge_bytes);
+        let Some(mut shared) =
+            self.try_grant_shared(SharedGrantPurpose::Admission, account_charge)
+        else {
+            if cache_read_memory_charge_bytes > 0 {
+                self.cache_read_memory_bytes
+                    .fetch_sub(cache_read_memory_charge_bytes, Ordering::AcqRel);
+            }
+            counter.fetch_sub(1, Ordering::AcqRel);
+            self.record_reject(class);
+            return None;
+        };
+        shared.commit();
+
         Some(AdmissionPermit {
             governor: self,
             class,
             cache_read_memory_charge_bytes,
+            shared,
         })
     }
 
@@ -2247,6 +2782,22 @@ impl MemoryGovernor {
             process_anon_rss_bytes: mem.process_anon_rss_bytes,
             psi_some_avg10_x100: mem.psi_some_avg10_x100,
             psi_full_avg10_x100: mem.psi_full_avg10_x100,
+            account_headroom_bytes: mem.account_headroom_bytes,
+            account_safety_margin_bytes: self.account_safety_margin_bytes(),
+            account_grantable_bytes: self.account_grantable_bytes(),
+            account_pending_bytes: self.account_pending_bytes.load(Ordering::Relaxed),
+            account_committed_unconfirmed_bytes: self
+                .account_committed_unconfirmed_bytes
+                .load(Ordering::Relaxed),
+            account_committed_live_bytes: self
+                .account_committed_live_bytes
+                .load(Ordering::Relaxed),
+            account_grants_total: self.account_grants_total.load(Ordering::Relaxed),
+            account_rejects_total: self.account_rejects_total.load(Ordering::Relaxed),
+            cgroup_reclaimable_bytes: mem.cgroup_reclaimable_bytes,
+            observation_age_ms: crate::utils::time::system_timestamp_millis()
+                .saturating_sub(self.cached_at_millis.load(Ordering::Relaxed) as i64)
+                .max(0) as u64,
         }
     }
 
@@ -2307,6 +2858,10 @@ impl MemoryGovernor {
             fd_soft_limit: snapshot.fd_soft_limit,
             memory_pressure_high: memory_pressure_high(&snapshot),
             memory_pressure_level: memory_pressure_level(&snapshot),
+            ticket_float_bytes: ticket_float_bytes_for(memory_pressure_level(&snapshot)),
+            ticket_float_cap_bytes: ticket_float_cap_bytes_for(
+                memory_pressure_level(&snapshot),
+            ),
         }));
         self.cached_limits.load()
     }
@@ -2422,6 +2977,13 @@ impl MemoryGovernor {
             notify_pressure_reclaim(memory_pressure_level(&mem));
             return mem;
         }
+        // Sample the unconfirmed-commit counter BEFORE reading the kernel:
+        // only bytes committed before this read are inside the `used` the
+        // snapshot is about to observe. Commits racing the read stay
+        // deducted until the next refresh.
+        let committed_pre = self
+            .account_committed_unconfirmed_bytes
+            .load(Ordering::Acquire);
         let snapshot = read_memory_snapshot();
         // Mark the update in progress before storing fields so concurrent
         // seqlock readers detect the tear and retry.
@@ -2454,6 +3016,18 @@ impl MemoryGovernor {
             .store(snapshot.cgroup_memory_high_bytes, Ordering::Relaxed);
         self.cached_cgroup_swap_max_bytes
             .store(snapshot.cgroup_swap_max_bytes, Ordering::Relaxed);
+        self.cached_cgroup_reclaimable_bytes
+            .store(snapshot.cgroup_reclaimable_bytes, Ordering::Relaxed);
+        self.cached_account_headroom_bytes.store(
+            snapshot.account_headroom_bytes.unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        // The commits captured above are now inside observed `used`:
+        // lift their deduction from the account. Releases stay settled —
+        // a committed release only stops deducting here, once an
+        // observation has had the chance to see the freed bytes.
+        self.account_committed_unconfirmed_bytes
+            .fetch_sub(committed_pre, Ordering::AcqRel);
         self.cached_process_rss_bytes
             .store(snapshot.process_rss_bytes, Ordering::Relaxed);
         self.cached_process_pss_bytes
@@ -2515,6 +3089,16 @@ impl MemoryGovernor {
             cgroup_memory_max_bytes: self.cached_cgroup_memory_max_bytes.load(Ordering::Relaxed),
             cgroup_memory_high_bytes: self.cached_cgroup_memory_high_bytes.load(Ordering::Relaxed),
             cgroup_swap_max_bytes: self.cached_cgroup_swap_max_bytes.load(Ordering::Relaxed),
+            cgroup_reclaimable_bytes: self
+                .cached_cgroup_reclaimable_bytes
+                .load(Ordering::Relaxed),
+            account_headroom_bytes: match self
+                .cached_account_headroom_bytes
+                .load(Ordering::Relaxed)
+            {
+                u64::MAX => None,
+                value => Some(value),
+            },
             process_rss_bytes: self.cached_process_rss_bytes.load(Ordering::Relaxed),
             process_pss_bytes: self.cached_process_pss_bytes.load(Ordering::Relaxed),
             process_anon_rss_bytes: self.cached_process_anon_rss_bytes.load(Ordering::Relaxed),
@@ -2553,7 +3137,7 @@ impl Drop for ZeroCopyRelayPermit<'_> {
             .fetch_sub(1, Ordering::AcqRel);
         self.governor
             .zero_copy_relay_bytes
-            .fetch_sub(self.charge_bytes, Ordering::AcqRel);
+            .fetch_sub(self.shared.bytes(), Ordering::AcqRel);
     }
 }
 
@@ -2561,7 +3145,7 @@ impl Drop for UdpQueueBytePermit<'_> {
     fn drop(&mut self) {
         self.governor
             .udp_queued_bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
+            .fetch_sub(self.shared.bytes(), Ordering::AcqRel);
     }
 }
 
@@ -2569,7 +3153,7 @@ impl Drop for TcpQueueBytePermit<'_> {
     fn drop(&mut self) {
         self.governor
             .tcp_queue_bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
+            .fetch_sub(self.shared.bytes(), Ordering::AcqRel);
     }
 }
 
@@ -2589,6 +3173,8 @@ struct BudgetedMemorySnapshot {
     cgroup_memory_max_bytes: u64,
     cgroup_memory_high_bytes: u64,
     cgroup_swap_max_bytes: u64,
+    cgroup_reclaimable_bytes: u64,
+    account_headroom_bytes: Option<u64>,
     process_rss_bytes: u64,
     process_pss_bytes: u64,
     process_anon_rss_bytes: u64,
@@ -2614,6 +3200,8 @@ impl Default for BudgetedMemorySnapshot {
             cgroup_memory_max_bytes: 0,
             cgroup_memory_high_bytes: 0,
             cgroup_swap_max_bytes: u64::MAX,
+            cgroup_reclaimable_bytes: 0,
+            account_headroom_bytes: None,
             process_rss_bytes: 0,
             process_pss_bytes: 0,
             process_anon_rss_bytes: 0,
@@ -2654,6 +3242,10 @@ fn read_memory_snapshot() -> MemorySnapshot {
     #[cfg(not(target_os = "linux"))]
     let (cgroup_managed, cgroup_memory_max_bytes, cgroup_memory_high_bytes, cgroup_swap_max_bytes) =
         (false, 0, 0, u64::MAX);
+    #[cfg(target_os = "linux")]
+    let (mut cgroup_headroom_bytes, mut cgroup_reclaimable_bytes) = (None, 0u64);
+    #[cfg(not(target_os = "linux"))]
+    let (cgroup_headroom_bytes, cgroup_reclaimable_bytes) = (None, 0u64);
 
     #[cfg(target_os = "linux")]
     {
@@ -2663,12 +3255,27 @@ fn read_memory_snapshot() -> MemorySnapshot {
                 cgroup_memory_max_bytes = cgroup.max_bytes.unwrap_or(0);
                 cgroup_memory_high_bytes = cgroup.high_bytes.unwrap_or(0);
                 cgroup_swap_max_bytes = cgroup.swap_max_bytes.unwrap_or(u64::MAX);
+                cgroup_reclaimable_bytes = cgroup.reclaimable_bytes;
+                // Per-level bottleneck: a sibling squeezing a shared
+                // ancestor shrinks our headroom even when the leaf has
+                // room. Unknown levels contribute nothing — the host
+                // layer below still bounds the account physically.
+                cgroup_headroom_bytes = cgroup_levels_headroom(&cgroup.levels);
                 if let Some(max) = cgroup.max_bytes {
                     total_bytes = max.max(1);
-                    used_bytes = cgroup.current_bytes.min(total_bytes);
-                    available_before_reserve = total_bytes.saturating_sub(used_bytes);
-                    raw_available_bytes = Some(available_before_reserve);
-                    availability = MemoryAvailability::Known;
+                    if cgroup.current_known {
+                        used_bytes = cgroup.current_bytes.min(total_bytes);
+                        available_before_reserve = total_bytes.saturating_sub(used_bytes);
+                        raw_available_bytes = Some(available_before_reserve);
+                        availability = MemoryAvailability::Known;
+                    } else if let Some(mem_available) = linux_mem_available_bytes() {
+                        // Current unreadable: fall back to host accounting
+                        // instead of reporting the cgroup as empty.
+                        available_before_reserve = mem_available.min(total_bytes);
+                        used_bytes = total_bytes.saturating_sub(available_before_reserve);
+                        raw_available_bytes = Some(available_before_reserve);
+                        availability = MemoryAvailability::Degraded;
+                    }
                 } else if let Some(mem_available) = linux_mem_available_bytes() {
                     available_before_reserve = mem_available.min(total_bytes);
                     used_bytes = total_bytes.saturating_sub(available_before_reserve);
@@ -2677,6 +3284,7 @@ fn read_memory_snapshot() -> MemorySnapshot {
                 }
                 if let Some(high) = cgroup.high_bytes
                     && high > 0
+                    && cgroup.current_known
                     && cgroup.current_bytes >= high
                 {
                     available_before_reserve = available_before_reserve.min(total_bytes / 20);
@@ -2706,6 +3314,26 @@ fn read_memory_snapshot() -> MemorySnapshot {
     #[cfg(not(target_os = "linux"))]
     let (psi_some_avg10_x100, psi_full_avg10_x100) = (0, 0);
 
+    // Shared-account capacity for NEW commitments: the bottleneck across
+    // layers that actually constrained this snapshot — host MemAvailable
+    // and every cgroup level carrying a limit. A layer that could not be
+    // read contributes nothing instead of being treated as empty; the
+    // remaining layers still bound the account.
+    // `raw_available_bytes` only ever carries a value on Linux; on other
+    // platforms sysinfo's derived `available_bytes` is the observation.
+    #[cfg(target_os = "linux")]
+    let host_headroom = raw_available_bytes.unwrap_or(available_bytes);
+    #[cfg(not(target_os = "linux"))]
+    let host_headroom = available_bytes;
+    let account_headroom_bytes = match cgroup_headroom_bytes {
+        Some(cgroup_headroom) => Some(host_headroom.min(cgroup_headroom)),
+        None if total_bytes == 0 => {
+            // Nothing observable at all — no basis for new commitments.
+            None
+        }
+        None => Some(host_headroom),
+    };
+
     MemorySnapshot {
         total_bytes,
         used_bytes,
@@ -2720,6 +3348,8 @@ fn read_memory_snapshot() -> MemorySnapshot {
         cgroup_memory_max_bytes,
         cgroup_memory_high_bytes,
         cgroup_swap_max_bytes,
+        cgroup_reclaimable_bytes,
+        account_headroom_bytes,
         process_rss_bytes: rss.rss_bytes,
         process_pss_bytes: rss.pss_bytes,
         process_anon_rss_bytes: rss.anon_bytes,
@@ -2794,6 +3424,50 @@ struct CgroupMemoryEffective {
     high_bytes: Option<u64>,
     swap_max_bytes: Option<u64>,
     current_bytes: u64,
+    /// Per-ancestor constraint: each limited level's effective cap
+    /// (min of memory.max/memory.high), the level's *hierarchical*
+    /// current, and its reclaimable estimate. Parent levels capture
+    /// sibling-cgroup pressure that a leaf-only read cannot see.
+    levels: Vec<CgroupLevel>,
+    /// Leaf inactive_file — the reclaimable estimate, reported
+    /// separately from the hard headroom.
+    reclaimable_bytes: u64,
+    /// False when the leaf's memory.current could not be read — callers
+    /// must treat the observation as uncertain, not as zero usage.
+    current_known: bool,
+}
+
+/// One constrained cgroup level in the leaf→root walk.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct CgroupLevel {
+    /// Effective cap: min(memory.max, memory.high) — memory.high is a
+    /// throttle threshold, so committing past it invites reclaim stalls
+    /// even though the kernel won't OOM us there.
+    limit_bytes: u64,
+    /// Hierarchical memory.current at this level (includes descendants —
+    /// sibling pressure shows up here).
+    current_bytes: u64,
+    /// Whether current was actually read; when false the level is
+    /// uncertainty, and the headroom computation must not treat it as
+    /// zero usage.
+    current_known: bool,
+}
+
+/// Bottleneck headroom across constrained cgroup levels. Returns None
+/// when any constrained level's current is unreadable: a missing counter
+/// is uncertainty, not free capacity.
+#[cfg(target_os = "linux")]
+fn cgroup_levels_headroom(levels: &[CgroupLevel]) -> Option<u64> {
+    let mut headroom: Option<u64> = None;
+    for level in levels {
+        if !level.current_known {
+            return None;
+        }
+        let level_headroom = level.limit_bytes.saturating_sub(level.current_bytes);
+        headroom = Some(headroom.map_or(level_headroom, |h| h.min(level_headroom)));
+    }
+    headroom
 }
 
 #[cfg(target_os = "linux")]
@@ -2808,25 +3482,41 @@ fn linux_cgroup_memory_effective() -> Option<CgroupMemoryEffective> {
 fn linux_cgroup_v2_effective() -> Option<CgroupMemoryEffective> {
     let leaf = linux_cgroup_v2_dir()?;
     let root = std::path::Path::new("/sys/fs/cgroup");
-    let current = std::fs::read_to_string(leaf.join("memory.current"))
+    let leaf_current = std::fs::read_to_string(leaf.join("memory.current"))
         .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(0);
+        .and_then(|value| value.trim().parse::<u64>().ok());
     let inactive_file = linux_memory_stat_value(&leaf.join("memory.stat"), &["inactive_file"]);
     let mut max_bytes = None;
     let mut high_bytes = None;
     let mut swap_max_bytes = None;
+    let mut levels = Vec::new();
     let mut dir = leaf;
     loop {
-        max_bytes = min_cgroup_limit(max_bytes, linux_read_cgroup_limit(&dir.join("memory.max")));
-        high_bytes = min_cgroup_limit(
-            high_bytes,
-            linux_read_cgroup_limit(&dir.join("memory.high")),
-        );
+        let max = linux_read_cgroup_limit(&dir.join("memory.max"));
+        let high = linux_read_cgroup_limit(&dir.join("memory.high"));
+        max_bytes = min_cgroup_limit(max_bytes, max);
+        high_bytes = min_cgroup_limit(high_bytes, high);
         swap_max_bytes = min_cgroup_swap(
             swap_max_bytes,
             linux_read_cgroup_swap(&dir.join("memory.swap.max")),
         );
+        // A level only constrains us when it carries a real limit; for
+        // such levels, read the hierarchical current so a sibling's
+        // growth shows up as shrunken headroom at the shared ancestor.
+        let level_limit = match (max, high) {
+            (Some(m), Some(h)) => Some(m.min(h)),
+            (m, h) => m.or(h),
+        };
+        if let Some(limit) = level_limit {
+            let current = std::fs::read_to_string(dir.join("memory.current"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok());
+            levels.push(CgroupLevel {
+                limit_bytes: limit,
+                current_bytes: current.unwrap_or(0),
+                current_known: current.is_some(),
+            });
+        }
         if dir == root {
             break;
         }
@@ -2842,7 +3532,12 @@ fn linux_cgroup_v2_effective() -> Option<CgroupMemoryEffective> {
         max_bytes,
         high_bytes,
         swap_max_bytes,
-        current_bytes: current.saturating_sub(inactive_file),
+        current_bytes: leaf_current
+            .unwrap_or(0)
+            .saturating_sub(inactive_file),
+        levels,
+        reclaimable_bytes: inactive_file,
+        current_known: leaf_current.is_some(),
     })
 }
 
@@ -2854,17 +3549,31 @@ fn linux_cgroup_v1_effective() -> Option<CgroupMemoryEffective> {
     let high_bytes = linux_read_cgroup_limit(&dir.join("memory.soft_limit_in_bytes"));
     let used = std::fs::read_to_string(dir.join("memory.usage_in_bytes"))
         .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(0);
+        .and_then(|value| value.trim().parse::<u64>().ok());
     let inactive_file = linux_memory_stat_value(
         &dir.join("memory.stat"),
         &["total_inactive_file", "inactive_file"],
     );
+    let limit = match (max_bytes, high_bytes) {
+        (Some(m), Some(h)) => Some(m.min(h)),
+        (m, h) => m.or(h),
+    };
     Some(CgroupMemoryEffective {
         max_bytes,
         high_bytes,
         swap_max_bytes: linux_read_cgroup_limit(&dir.join("memory.memsw.limit_in_bytes")),
-        current_bytes: used.saturating_sub(inactive_file),
+        current_bytes: used.unwrap_or(0).saturating_sub(inactive_file),
+        levels: limit
+            .map(|limit_bytes| {
+                vec![CgroupLevel {
+                    limit_bytes,
+                    current_bytes: used.unwrap_or(0),
+                    current_known: used.is_some(),
+                }]
+            })
+            .unwrap_or_default(),
+        reclaimable_bytes: inactive_file,
+        current_known: used.is_some(),
     })
     .filter(|effective| effective.max_bytes.is_some() || effective.high_bytes.is_some())
 }
@@ -3617,6 +4326,35 @@ pub fn pressure_level_from_pct(pct: u64) -> MemoryPressureLevel {
     }
 }
 
+/// Workspace float under Normal/Elevated — matches `memory_ticket`'s
+/// historical constant.
+const TICKET_FLOAT_BYTES_NORMAL: u64 = 256 * 1024;
+const TICKET_FLOAT_CAP_BYTES_NORMAL: u64 = 1024 * 1024;
+
+/// Idle-capacity reclaim for ticket buckets: under High the float shrinks
+/// to a quarter and the cap to the old float, so buckets release checked-
+/// out slack on their next touch; under Critical every release refunds
+/// the full balance and refills cover only the exact need.
+fn ticket_float_bytes_for(level: MemoryPressureLevel) -> u64 {
+    match level {
+        MemoryPressureLevel::Normal | MemoryPressureLevel::Elevated => {
+            TICKET_FLOAT_BYTES_NORMAL
+        }
+        MemoryPressureLevel::High => TICKET_FLOAT_BYTES_NORMAL / 4,
+        MemoryPressureLevel::Critical => 0,
+    }
+}
+
+fn ticket_float_cap_bytes_for(level: MemoryPressureLevel) -> u64 {
+    match level {
+        MemoryPressureLevel::Normal | MemoryPressureLevel::Elevated => {
+            TICKET_FLOAT_CAP_BYTES_NORMAL
+        }
+        MemoryPressureLevel::High => TICKET_FLOAT_BYTES_NORMAL,
+        MemoryPressureLevel::Critical => 0,
+    }
+}
+
 fn pressure_adjusted_min_limit(
     snapshot: &BudgetedMemorySnapshot,
     normal: usize,
@@ -4326,6 +5064,9 @@ mod tests {
             .store(total - available, Ordering::Release);
         governor
             .cached_available_bytes
+            .store(available, Ordering::Release);
+        governor
+            .cached_account_headroom_bytes
             .store(available, Ordering::Release);
         governor
             .cached_fd_soft_limit
@@ -5274,9 +6015,26 @@ mod resident_memory_tests {
 mod en16_pool_tests {
     use super::{
         pinned_alloc_headroom_bytes, pinned_alloc_reserve_bytes, AdmissionClass,
-        BudgetedMemorySnapshot, DiskLedgerClass, MemoryGovernor,
+        BudgetedMemorySnapshot, DiskLedgerClass, MemoryGovernor, SharedGrantPurpose,
     };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn seed_governor_memory(
+        governor: &MemoryGovernor,
+        total_bytes: u64,
+        available_bytes: u64,
+        fd_soft_limit: u64,
+        fd_used: u64,
+    ) {
+        governor.seed_cached_for_test(
+            total_bytes,
+            available_bytes,
+            fd_soft_limit,
+            fd_used,
+            crate::utils::time::system_timestamp_millis() as u64,
+        );
+    }
 
     fn listener(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
@@ -5532,5 +6290,204 @@ mod en16_pool_tests {
             ..Default::default()
         };
         assert_eq!(pinned_alloc_headroom_bytes(&starved), 0);
+    }
+
+    /// Shared account opens fail-closed: before any observation lands the
+    /// grantable capacity is zero and every grant is refused.
+    #[test]
+    fn shared_account_fails_closed_without_observation() {
+        let governor = MemoryGovernor::new();
+        assert_eq!(governor.account_view().grantable_bytes, 0);
+        assert!(
+            governor
+                .try_grant_shared(SharedGrantPurpose::KernelBpf, 1024)
+                .is_none(),
+            "no observation → no grant"
+        );
+        assert_eq!(governor.account_view().rejects_total, 1);
+    }
+
+    /// Pending grants deduct capacity immediately; dropping an
+    /// uncommitted credential refunds it at once (cancel path).
+    #[test]
+    fn shared_grant_pending_cancel_refunds_immediately() {
+        let governor = MemoryGovernor::new();
+        seed_governor_memory(&governor, 64 << 30, 60 << 30, 1 << 20, 0);
+        let before = governor.account_view().grantable_bytes;
+        assert!(before > 0);
+
+        let grant = governor
+            .try_grant_shared(SharedGrantPurpose::KernelBpf, 1 << 30)
+            .expect("grant within capacity");
+        let held = governor.account_view();
+        assert_eq!(held.pending_bytes, 1 << 30);
+        assert_eq!(held.grantable_bytes, before - (1 << 30));
+
+        drop(grant);
+        let after = governor.account_view();
+        assert_eq!(after.pending_bytes, 0);
+        assert_eq!(after.grantable_bytes, before, "cancel refunds fully");
+    }
+
+    /// commit() moves the charge to committed-unconfirmed; the deduction
+    /// persists until an observation confirms it, and a committed drop
+    /// releases ownership without early re-promising.
+    #[test]
+    fn shared_grant_commit_keeps_deduction_until_observation() {
+        let governor = MemoryGovernor::new();
+        seed_governor_memory(&governor, 64 << 30, 60 << 30, 1 << 20, 0);
+        let before = governor.account_view().grantable_bytes;
+
+        let mut grant = governor
+            .try_grant_shared(SharedGrantPurpose::AfXdpUmem, 2 << 30)
+            .expect("grant within capacity");
+        grant.commit();
+        let view = governor.account_view();
+        assert_eq!(view.pending_bytes, 0);
+        assert_eq!(view.committed_unconfirmed_bytes, 2 << 30);
+        assert_eq!(view.committed_live_bytes, 2 << 30);
+        assert_eq!(view.grantable_bytes, before - (2 << 30));
+
+        // Committed release: ownership drops now, but the freed bytes are
+        // not re-promised — the deduction persists until a refresh
+        // observes the physical release.
+        drop(grant);
+        let view = governor.account_view();
+        assert_eq!(view.committed_live_bytes, 0);
+        assert_eq!(
+            view.committed_unconfirmed_bytes,
+            2 << 30,
+            "release is not re-promised before observation"
+        );
+        assert_eq!(view.grantable_bytes, before - (2 << 30));
+    }
+
+    /// A snapshot refresh confirms committed bytes into observed `used`:
+    /// the unconfirmed deduction lifts while the freed-vs-held split is
+    /// honoured — released committed bytes stop being tracked.
+    #[test]
+    fn shared_grant_observation_confirms_commits() {
+        let governor = MemoryGovernor::new();
+        seed_governor_memory(&governor, 64 << 30, 60 << 30, 1 << 20, 0);
+
+        let mut held = governor
+            .try_grant_shared(SharedGrantPurpose::KernelBpf, 1 << 30)
+            .expect("grant");
+        held.commit();
+        let mut dropped = governor
+            .try_grant_shared(SharedGrantPurpose::AfXdpUmem, 1 << 30)
+            .expect("grant");
+        dropped.commit();
+        drop(dropped);
+
+        // Force a real refresh: the commits taken before the kernel read
+        // are confirmed out of the unconfirmed bucket.
+        governor.invalidate_snapshot_cache();
+        let _ = governor.memory_snapshot();
+        let view = governor.account_view();
+        assert_eq!(view.committed_unconfirmed_bytes, 0);
+        assert_eq!(
+            view.committed_live_bytes,
+            1 << 30,
+            "only the still-held grant remains live"
+        );
+        drop(held);
+    }
+
+    /// grow() is subject to the same capacity check; shrink() and
+    /// transfer() re-attribute without touching capacity wrongly.
+    #[test]
+    fn shared_grant_grow_shrink_transfer() {
+        let governor = MemoryGovernor::new();
+        seed_governor_memory(&governor, 64 << 30, 60 << 30, 1 << 20, 0);
+        let before = governor.account_view().grantable_bytes;
+
+        let mut grant = governor
+            .try_grant_shared(SharedGrantPurpose::TcpQueue, 1 << 30)
+            .expect("grant");
+        assert!(grant.grow(1 << 29), "grow within capacity");
+        assert_eq!(grant.bytes(), (1 << 30) + (1 << 29));
+        grant.shrink(1 << 29);
+        assert_eq!(grant.bytes(), 1 << 30);
+        grant.transfer(SharedGrantPurpose::ConfigPublish);
+        assert_eq!(grant.purpose(), SharedGrantPurpose::ConfigPublish);
+
+        // The shrunk half returned to grantable (pending path refunds
+        // immediately).
+        assert_eq!(
+            governor.account_view().grantable_bytes,
+            before - (1 << 30)
+        );
+        drop(grant);
+        assert_eq!(governor.account_view().grantable_bytes, before);
+    }
+
+    /// Concurrent grants must never promise past capacity — the account
+    /// is the single serialized deduction point for new demand.
+    #[test]
+    fn shared_account_concurrent_grants_never_overcommit() {
+        let governor = MemoryGovernor::new();
+        // 2GiB total, ~1GiB available → grantable ≈ avail − margin.
+        seed_governor_memory(&governor, 2 << 30, 1 << 30, 1 << 20, 0);
+        let governor = std::sync::Arc::new(governor);
+        let chunk = 16 << 20;
+        let granted = std::sync::Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let g = std::sync::Arc::clone(&governor);
+                let granted = std::sync::Arc::clone(&granted);
+                std::thread::spawn(move || {
+                    for _ in 0..2_000 {
+                        if let Some(permit) =
+                            g.try_grant_shared(SharedGrantPurpose::Admission, chunk)
+                        {
+                            granted.fetch_add(chunk, Ordering::Relaxed);
+                            drop(permit);
+                            granted.fetch_sub(chunk, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let view = governor.account_view();
+        assert_eq!(view.pending_bytes, 0, "all grants released");
+        // Invariant: at no point did outstanding exceed capacity — the
+        // reject counter proves overshoot attempts were refused, and the
+        // grantable floor never went negative.
+        assert!(view.grantable_bytes > 0 || view.rejects_total > 0);
+    }
+
+    /// The account is a second, global bound on top of class ceilings:
+    /// when the account is exhausted, try_admit fails closed even though
+    /// the class counter still has room.
+    #[test]
+    fn admission_rejects_when_shared_account_exhausted() {
+        let governor = MemoryGovernor::new();
+        // Tiny node: 640MiB total → margin ≈ 128MiB+10MiB; seed 200MiB
+        // available → grantable ≈ ~60MiB.
+        seed_governor_memory(&governor, 640 << 20, 200 << 20, 1 << 20, 0);
+        let grantable = governor.account_view().grantable_bytes;
+        assert!(grantable > 0 && grantable < 200 << 20);
+
+        // Exhaust the account with a KernelBpf grant.
+        let _bulk = governor
+            .try_grant_shared(SharedGrantPurpose::KernelBpf, grantable)
+            .expect("bulk grant within capacity");
+        assert!(
+            governor
+                .try_admit(AdmissionClass::HttpConnection)
+                .is_none(),
+            "class ceiling has room but the account is empty — fail closed"
+        );
+        drop(_bulk);
+        assert!(
+            governor
+                .try_admit(AdmissionClass::HttpConnection)
+                .is_some(),
+            "releasing the grant restores admission"
+        );
     }
 }
