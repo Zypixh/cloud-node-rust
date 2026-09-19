@@ -103,7 +103,9 @@ impl OriginH3ClientSession {
 /// (never a silent kernel fallback).
 async fn create_h3_endpoint(server_addr: StdSocketAddr) -> PingoraResult<Endpoint> {
     #[cfg(target_os = "linux")]
-    if crate::xdp::afxdp_upstream_selected() {
+    // Loopback upstreams take the kernel path — `lo` has no XSK/reactor
+    // queue, so an AF_XDP dial to one can only fail.
+    if crate::xdp::afxdp_upstream_selected() && !server_addr.ip().is_loopback() {
         let socket = crate::xdp::af_xdp_dial_udp(server_addr, None)
             .await
             .map_err(|err| {

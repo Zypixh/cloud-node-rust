@@ -179,7 +179,10 @@ async fn connect_backend_udp_socket(
 ) -> io::Result<UpstreamUdpSocket> {
     #[cfg(target_os = "linux")]
     {
-        if crate::xdp::afxdp_upstream_selected() {
+        // Loopback upstreams can never ride AF_XDP — `lo` has no XSK and
+        // no reactor queue. A co-located upstream takes the kernel path
+        // explicitly (not a silent fallback for dataplane failures).
+        if crate::xdp::afxdp_upstream_selected() && !backend_addr.ip().is_loopback() {
             let socket =
                 crate::xdp::af_xdp_dial_udp(backend_addr, preferred.map(|addr| addr.port()))
                     .await?;

@@ -836,7 +836,17 @@ async fn connect_upstream_afxdp(
     if backends.is_empty() {
         anyhow::bail!("no socket address resolved for AF_XDP upstream {backend_addr}");
     }
-    let toa_enabled = toa_config.map(|cfg| cfg.is_on).unwrap_or(false);
+    // Loopback upstreams can never ride AF_XDP — `lo` carries no XSK and
+    // `ip route get` for a loopback target resolves to dev `lo`, which
+    // has no reactor queue. A co-located upstream service must still be
+    // reachable, so an all-loopback resolution takes the kernel path
+    // (explicitly, not as a silent fallback for AF_XDP failures).
+    if backends.iter().all(|addr| addr.ip().is_loopback()) {
+        return connect_with_toa(backend_addr, remote_addr, toa_config, connect_timeout)
+            .await
+            .map(UpstreamL4Stream::Kernel);
+    }
+    let toa_enabled = toa_config.as_ref().map(|cfg| cfg.is_on).unwrap_or(false);
     // TOA on the AF_XDP path is a SYN option we write ourselves — the
     // cloud_toa_sender kernel module never sees these packets (no
     // LOCAL_OUT traversal), and its port allocator is not involved.
@@ -852,6 +862,26 @@ async fn connect_upstream_afxdp(
     let dial_all = async {
         let mut attempts = String::new();
         for backend in &backends {
+            // Mixed resolutions (e.g. `localhost` → 127.0.0.1 + public):
+            // loopback members take the kernel path — AF_XDP has no
+            // reactor on `lo`, so the reactor dial would fail closed.
+            if backend.ip().is_loopback() {
+                match connect_with_toa(
+                    &backend.to_string(),
+                    remote_addr,
+                    toa_config.clone(),
+                    connect_timeout,
+                )
+                .await
+                {
+                    Ok(stream) => return Ok(UpstreamL4Stream::Kernel(stream)),
+                    Err(err) => {
+                        use std::fmt::Write as _;
+                        let _ = writeln!(attempts, "  {backend} (kernel loopback): {err:#}");
+                    }
+                }
+                continue;
+            }
             match crate::xdp::af_xdp_dial_tcp(*backend, syn_extra_options.clone()).await {
                 Ok(stream) => return Ok(UpstreamL4Stream::AfXdp(Box::new(stream))),
                 Err(err) => {
@@ -938,8 +968,11 @@ mod tests {
         });
         crate::runtime_mode::RuntimeConfig::set_current(config);
         let client: SocketAddr = "198.51.100.9:4444".parse().unwrap();
+        // Non-loopback target: loopback upstreams legitimately take the
+        // kernel path (AF_XDP has no reactor on `lo`) — only a routable
+        // destination exercises the missing-registry fail-closed check.
         let err = match connect_upstream(
-            "127.0.0.1:1",
+            "203.0.113.7:443",
             client,
             None,
             Duration::from_secs(1),
