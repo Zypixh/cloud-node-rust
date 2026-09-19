@@ -4268,8 +4268,237 @@ fn projected_bpf_map_bytes_respects_state_table_overrides() {
 fn kernel_bpf_budget_is_bounded_by_state_budget() {
     let snapshot = crate::memory_governor::MEMORY_GOVERNOR
         .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
-    assert!(snapshot.kernel_bpf_budget_bytes >= 32 * 1024 * 1024);
     assert!(snapshot.kernel_bpf_budget_bytes <= snapshot.memory_total_bytes);
+    assert!(snapshot.kernel_bpf_budget_bytes <= snapshot.memory_available_bytes);
+}
+
+/// Pinned-byte accounting must not confuse an absent pin dir with real
+/// pins: an empty directory yields zero owned bytes.
+#[test]
+#[cfg(target_os = "linux")]
+fn pinned_spec_bytes_empty_pin_dir_is_zero() {
+    let dir = std::env::temp_dir().join(format!("cloud-node-test-pins-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(
+        linux::pinned_spec_bytes_at(&crate::runtime_mode::XdpConfig::default(), &dir),
+        0
+    );
+    assert_eq!(
+        linux::pinned_map_max_entries_at("XDP_TCP_CT", aya::maps::MapType::Hash, 8, 8, &dir),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// New-byte charging: with no pins the whole projection is new demand —
+/// headroom above it passes, headroom below it fails and the error names
+/// projected/pinned/new/headroom so operators see real accounting.
+#[test]
+#[cfg(target_os = "linux")]
+fn ensure_bpf_map_budget_charges_only_new_bytes() {
+    let config = crate::runtime_mode::XdpConfig::default();
+    let dir = std::env::temp_dir().join(format!("cloud-node-test-pins-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let projected = linux::projected_bpf_map_bytes(&config);
+
+    linux::ensure_bpf_map_budget_at(&config, projected, &dir)
+        .expect("headroom covering the full projection must pass");
+
+    let err = linux::ensure_bpf_map_budget_at(&config, 1024, &dir)
+        .expect_err("headroom below the projection must fail");
+    let msg = err.to_string();
+    for needle in [
+        &projected.to_string()[..],
+        "already-pinned=0",
+        "headroom 1024",
+        "new pinned memory",
+    ] {
+        assert!(msg.contains(needle), "error must name {needle:?}: {msg}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M1 — shrink recovery: a node whose scalable tables were pinned at a
+/// shrunken size must re-attach at those pinned sizes even when headroom
+/// would fit the defaults again. Resolving to `None` (object defaults)
+/// mismatches the pins and trips the stale-pin gate — that is how the
+/// incident node lost XDP while memory was free.
+#[test]
+#[cfg(target_os = "linux")]
+fn auto_scale_locks_fully_pinned_knobs_to_pinned_sizes() {
+    let config = crate::runtime_mode::XdpConfig::default();
+    let mut survey = linux::PinnedMapSurvey::new();
+    for name in [
+        "XDP_TCP_CT",
+        "XDP_UDP_CT",
+        "XDP_PENDING",
+        "XDP_SNAT_REV",
+        "XDP_FLOW_ACCT",
+        "XDP_RATE_V4",
+        "XDP_RATE_V6",
+        "XDP_BLOCKED_V4",
+        "XDP_BLOCKED_V6",
+        "XDP_BLOCKED_V4_LPM",
+        "XDP_BLOCKED_V6_LPM",
+        "XDP_ALLOWED_V4",
+        "XDP_ALLOWED_V6",
+        "XDP_ALLOWED_V4_LPM",
+        "XDP_ALLOWED_V6_LPM",
+    ] {
+        survey.insert(name, 2_048);
+    }
+    let tables = linux::auto_scale_state_tables(&config, 64 << 20, &survey)
+        .expect("pinned footprint must fit even under modest headroom")
+        .expect("pinned sizes must be adopted, not re-derived from headroom");
+    assert_eq!(tables.ct_max_entries, Some(2_048));
+    assert_eq!(tables.pending_max_entries, Some(2_048));
+    assert_eq!(tables.snat_rev_max_entries, Some(2_048));
+    assert_eq!(tables.flow_acct_max_entries, Some(2_048));
+    assert_eq!(tables.rate_v4_max_entries, Some(2_048));
+    assert_eq!(tables.rate_v6_max_entries, Some(2_048));
+    assert_eq!(tables.acl_blocked_max_entries, Some(2_048));
+    assert_eq!(tables.acl_allowed_max_entries, Some(2_048));
+}
+
+/// A knob with only some members pinned still locks to the smallest
+/// pinned size — unpinned members are created at that size, never
+/// re-derived from `available`. Knobs with no pins keep their defaults
+/// when headroom is ample (emitting a `None` override preserves the
+/// per-member default spec, including mixed sizes inside a group).
+#[test]
+#[cfg(target_os = "linux")]
+fn auto_scale_locks_partially_pinned_knob_and_keeps_free_knob_defaults() {
+    let config = crate::runtime_mode::XdpConfig::default();
+    let mut survey = linux::PinnedMapSurvey::new();
+    survey.insert("XDP_TCP_CT", 4_096);
+    let tables = linux::auto_scale_state_tables(&config, 1 << 30, &survey)
+        .unwrap()
+        .expect("a pinned member resolves the whole knob");
+    assert_eq!(tables.ct_max_entries, Some(4_096));
+    // No pins for the ACL groups and ample headroom → no override emitted
+    // (members keep their own defaults, e.g. hash 262144 / LPM 65536).
+    assert_eq!(tables.acl_blocked_max_entries, None);
+    assert_eq!(tables.rate_v4_max_entries, None);
+}
+
+/// No pins and ample headroom → no override at all (None keeps the
+/// object's default table sizes).
+#[test]
+#[cfg(target_os = "linux")]
+fn auto_scale_without_pins_fits_defaults_and_returns_none() {
+    let config = crate::runtime_mode::XdpConfig::default();
+    let survey = linux::PinnedMapSurvey::new();
+    assert_eq!(
+        linux::auto_scale_state_tables(&config, 1 << 30, &survey).unwrap(),
+        None
+    );
+    // And genuinely insufficient headroom still fails explicitly.
+    linux::auto_scale_state_tables(&config, 1024, &survey)
+        .expect_err("headroom below the floored minimum must fail");
+}
+
+/// M1 — reload publish gap: the successor generation must share the
+/// predecessor's dial registry from the moment it is published, so new
+/// upstream dials never hit a registry-less current manager while the
+/// new generation prepares. Sharing is a clone, not a takeover — the
+/// predecessor keeps its own handle.
+#[test]
+#[cfg(target_os = "linux")]
+fn replace_manager_shares_dial_registry_during_prepare() {
+    let _guard = crate::runtime_mode::runtime_config_test_guard();
+    RuntimeConfig::set_current(RuntimeConfig { xdp: test_proxy_config("eth-old") });
+    let old_manager = replace_manager_from_runtime();
+    mark_test_proxy_bridge_ready(&old_manager);
+    let registry = std::sync::Arc::new(af_xdp::AfXdpDialRegistry::new(old_manager.clone()));
+    *old_manager.dial_registry.lock() = Some(registry.clone());
+
+    RuntimeConfig::set_current(RuntimeConfig { xdp: test_proxy_config("eth-new") });
+    let new_manager = replace_manager_from_runtime();
+
+    assert!(
+        std::sync::Arc::ptr_eq(&new_manager.dial_registry().unwrap(), &registry),
+        "successor must share the predecessor's registry during prepare"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&old_manager.dial_registry().unwrap(), &registry),
+        "predecessor keeps owning its registry until handover"
+    );
+}
+
+/// M1 — attach-failure false commit: a reload whose prepare fails must
+/// not publish the failed generation. The previous manager stays current,
+/// keeps its dataplane bookkeeping, and its dial registry keeps serving
+/// new upstream dials. Before the fix, `fallback=pass` swallowed the
+/// error and swapped in an unattached manager.
+#[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the config guard intentionally serializes global runtime config across awaits in tests"
+)]
+async fn reload_prepare_failure_keeps_previous_manager_serving() {
+    let _guard = crate::runtime_mode::runtime_config_test_guard();
+    RuntimeConfig::set_current(RuntimeConfig { xdp: test_proxy_config("eth-old") });
+    let old_manager = replace_manager_from_runtime();
+    mark_test_proxy_bridge_ready(&old_manager);
+    #[cfg(target_os = "linux")]
+    {
+        let registry =
+            std::sync::Arc::new(af_xdp::AfXdpDialRegistry::new(old_manager.clone()));
+        *old_manager.dial_registry.lock() = Some(registry.clone());
+    }
+
+    let mut bad = test_proxy_config("eth-old");
+    bad.ebpf_object = Some("/nonexistent/cloud-node-missing-object.o".to_string());
+    RuntimeConfig::set_current(RuntimeConfig { xdp: bad });
+
+    let err = reload_from_runtime()
+        .await
+        .expect_err("a prepare failure must reject the reload, not publish it");
+    assert!(
+        err.to_string().contains("eBPF object"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        manager_is_current(&old_manager),
+        "failed generation must not stay published"
+    );
+    assert!(
+        old_manager.status().attached,
+        "predecessor dataplane bookkeeping must be untouched"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        af_xdp_dial_registry().is_some(),
+        "the predecessor's dial registry must keep serving after rollback"
+    );
+}
+
+/// M1 — the fallback=pass contract covers cold start only: with a serving
+/// predecessor, a config that cannot attach (empty interfaces) is a
+/// rejected reload, not a silently published empty generation.
+#[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the config guard intentionally serializes global runtime config across awaits in tests"
+)]
+async fn reload_rejects_unattachable_config_with_serving_predecessor() {
+    let _guard = crate::runtime_mode::runtime_config_test_guard();
+    let old_manager = std::sync::Arc::new(XdpManager::new(test_proxy_config("eth0")));
+    mark_test_proxy_bridge_ready(&old_manager);
+    let empty = XdpConfig {
+        enabled: true,
+        interfaces: Vec::new(),
+        ..XdpConfig::default()
+    };
+    let new_manager = std::sync::Arc::new(XdpManager::new(empty.clone()));
+    new_manager
+        .initialize_inner(Some(&old_manager), Some(&new_manager))
+        .await
+        .expect_err("empty interfaces during reload must reject");
+
+    // Cold start keeps the fallback contract.
+    let fresh = std::sync::Arc::new(XdpManager::new(empty));
+    fresh.initialize().await.expect("fallback=pass cold start");
 }
 
 /// EN-12: during reactor startup the worker lease keeps the bridge alive

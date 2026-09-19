@@ -2225,8 +2225,8 @@ impl MemoryGovernor {
             logging_retry_budget_bytes: event_queue_budget_bytes(&mem) / 3,
             local_log_queue_budget_bytes: event_queue_budget_bytes(&mem) / 8,
             ip_report_queue_budget_bytes: event_queue_budget_bytes(&mem) / 8,
-            af_xdp_budget_bytes: state_budget_bytes(&mem) / 4,
-            kernel_bpf_budget_bytes: state_budget_bytes(&mem),
+            af_xdp_budget_bytes: pinned_alloc_headroom_bytes(&mem),
+            kernel_bpf_budget_bytes: pinned_alloc_headroom_bytes(&mem),
             listener_pool_active: self.listener_pool_active_slots(),
             listener_pool_tracked: self.listener_pool_tracked() as u64,
             listener_pool_rejects: self.listener_pool_rejects.load(Ordering::Relaxed),
@@ -3283,6 +3283,27 @@ fn metrics_queue_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
         MIN_METRICS_QUEUE_CAPACITY,
         MAX_METRICS_QUEUE_CAPACITY,
     )
+}
+
+/// Headroom for NEW non-reclaimable allocations (eBPF map pins, AF_XDP
+/// UMEM): `available` minus the reserve that keeps the OS and the daemon's
+/// reclaimable working set alive. Pinned memory cannot shrink once
+/// committed, so it is charged once at allocation and never re-judged
+/// against this moving watermark — the previous percentage-of-available
+/// partition let reclaimable growth silently strand an already-committed
+/// dataplane (a re-attach then failed against a shrunken budget and the
+/// node lost XDP despite ample free memory).
+fn pinned_alloc_headroom_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
+    snapshot
+        .available_bytes
+        .saturating_sub(pinned_alloc_reserve_bytes(snapshot.total_bytes))
+}
+
+/// Reserve withheld from new pinned allocations. Bounded: total/16 gives
+/// small nodes a meaningful dataplane while the 2GiB cap stops large
+/// nodes from withholding memory the workload could actually use.
+fn pinned_alloc_reserve_bytes(total_bytes: u64) -> u64 {
+    (total_bytes / 16).clamp(64 * 1024 * 1024, 2 * 1024 * 1024 * 1024)
 }
 
 fn state_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
@@ -5251,7 +5272,10 @@ mod resident_memory_tests {
 
 #[cfg(test)]
 mod en16_pool_tests {
-    use super::{AdmissionClass, DiskLedgerClass, MemoryGovernor};
+    use super::{
+        pinned_alloc_headroom_bytes, pinned_alloc_reserve_bytes, AdmissionClass,
+        BudgetedMemorySnapshot, DiskLedgerClass, MemoryGovernor,
+    };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn listener(port: u16) -> SocketAddr {
@@ -5459,5 +5483,54 @@ mod en16_pool_tests {
         assert_eq!(snap.negative_cache_used_bytes, 64);
         // Freed capacity admits new owners again.
         assert!(governor.resident_memory_replace_owned_with_cap(cat, "c", 64, 2));
+    }
+
+    /// Pinned-resource headroom is a single global watermark:
+    /// available minus a bounded reserve — never a fixed percentage
+    /// partition. Reserve = total/16 clamped to [64MiB, 2GiB].
+    #[test]
+    fn pinned_alloc_reserve_is_bounded() {
+        // Small node: total/16 < floor → floor wins.
+        assert_eq!(
+            pinned_alloc_reserve_bytes(512 << 20),
+            64 << 20,
+            "512MiB node must still keep the 64MiB floor reserve"
+        );
+        // Mid node: total/16 inside bounds.
+        assert_eq!(
+            pinned_alloc_reserve_bytes(2 << 30),
+            128 << 20,
+            "2GiB node reserve is exactly total/16"
+        );
+        // Large node: total/16 > cap → cap wins.
+        assert_eq!(
+            pinned_alloc_reserve_bytes(64 << 30),
+            2 << 30,
+            "64GiB node reserve must cap at 2GiB, not 4GiB"
+        );
+    }
+
+    /// Headroom is available-minus-reserve, saturated — a dataplane already
+    /// holding pinned bytes never competes with its own budget again.
+    #[test]
+    fn pinned_alloc_headroom_is_available_minus_reserve() {
+        let snapshot = BudgetedMemorySnapshot {
+            total_bytes: 2 << 30,
+            available_bytes: 1600 << 20,
+            ..Default::default()
+        };
+        // 2GiB total → 128MiB reserve → 1472MiB headroom: the incident node's
+        // ~1.6GiB-available state yields ample room for ~300MiB of state maps.
+        assert_eq!(
+            pinned_alloc_headroom_bytes(&snapshot),
+            (1600 - 128) << 20
+        );
+        // Available below reserve → headroom saturates at 0, not negative.
+        let starved = BudgetedMemorySnapshot {
+            total_bytes: 2 << 30,
+            available_bytes: 64 << 20,
+            ..Default::default()
+        };
+        assert_eq!(pinned_alloc_headroom_bytes(&starved), 0);
     }
 }

@@ -567,14 +567,12 @@ pub fn prepare_af_xdp_sockets(config: &XdpConfig) -> anyhow::Result<AfXdpRuntime
                 .ok_or_else(|| anyhow::anyhow!("AF_XDP total byte count overflow"))?;
         }
     }
-    let budget = crate::memory_governor::MEMORY_GOVERNOR
+    let headroom = crate::memory_governor::MEMORY_GOVERNOR
         .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
         .af_xdp_budget_bytes;
     anyhow::ensure!(
-        projected_bytes <= budget,
-        "AF_XDP projected memory {} exceeds node budget {}",
-        projected_bytes,
-        budget
+        projected_bytes <= headroom,
+        "AF_XDP projected memory {projected_bytes} exceeds pinned-allocation headroom {headroom}"
     );
     let mut queues = Vec::with_capacity(socket_count);
     let mut statuses = Vec::with_capacity(socket_count);
@@ -855,23 +853,40 @@ pub async fn attach(
             anyhow::anyhow!("create bpffs pin dir {}: {err}", xdp_bpf_pin_dir())
         })?;
     // When the operator gave no explicit stateTables, size the scalable
-    // state maps to this node's kernel-BPF budget — default tables can
-    // exceed the budget on small nodes and would otherwise fail attach.
-    // Explicit operator sizes are never silently shrunk: they either fit
-    // or fail the budget check below.
-    let bpf_budget = crate::memory_governor::MEMORY_GOVERNOR
-        .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
-        .kernel_bpf_budget_bytes;
+    // state maps to the pinned-allocation headroom — only *new* pinned
+    // bytes are charged, so a re-attach reusing its existing pins always
+    // fits. Explicit operator sizes are never silently shrunk: they either
+    // fit or fail the headroom check below.
     let mut effective_config = config.clone();
     // `queues: []` on an interface entry means "auto" — resolve the NIC's
     // RX queues from sysfs here (single choke point covering daemon, CLI
     // and smoke attach paths). A miss yields [0] and bind fails loudly.
     crate::xdp_auto_config::fill_missing_xdp_interface_queues(&mut effective_config);
-    if effective_config.state_tables.is_none() {
-        effective_config.state_tables = auto_scale_state_tables(&effective_config, bpf_budget)?;
+    let sizing = |config: &mut XdpConfig| -> anyhow::Result<()> {
+        let headroom = crate::memory_governor::MEMORY_GOVERNOR
+            .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
+            .kernel_bpf_budget_bytes;
+        // One pin survey per attempt: sizing and enforcement must judge
+        // the same pin set — separate reads race a pin appearing or
+        // disappearing mid-attach.
+        let survey = pinned_map_survey(config);
+        if config.state_tables.is_none() {
+            config.state_tables = auto_scale_state_tables(config, headroom, &survey)?;
+        }
+        ensure_bpf_map_budget_with_survey(config, headroom, &survey)
+    };
+    if let Err(first) = sizing(&mut effective_config) {
+        // Reclaimable pools (caches, regex, connector caches) yield before a
+        // pinned allocation is refused — sweep once, refresh the snapshot,
+        // then re-judge the same water level.
+        tracing::warn!(
+            "eBPF attach sizing short of headroom ({first}); reclaiming caches and retrying"
+        );
+        crate::memory_reclaim::reclaim_for_level(crate::memory_governor::MemoryPressureLevel::High);
+        crate::memory_governor::MEMORY_GOVERNOR.invalidate_snapshot_cache();
+        sizing(&mut effective_config)?;
     }
     let config = &effective_config;
-    ensure_bpf_map_budget(config, bpf_budget)?;
     // State-pin gate runs before any load attempt: an ABI-incompatible
     // pinned state map is a migration boundary, not an attach side effect.
     // Refusing keeps the live dataplane running and reports exactly which
@@ -2896,84 +2911,166 @@ pub(crate) fn projected_bpf_map_bytes(config: &XdpConfig) -> u64 {
     total
 }
 
-/// Auto-size the sizeable state tables to the kernel-BPF budget when the
-/// operator gave no explicit `xdp.stateTables`. Without this a default
-/// configuration exceeds the budget on small nodes (e.g. 2 GiB VPS) and
-/// attach would fail outright. The scale-down is proportional across the
-/// scalable tables with a per-table floor; if even floored tables do not
-/// fit, the node is too small and attach fails explicitly.
-fn auto_scale_state_tables(config: &XdpConfig, budget: u64) -> anyhow::Result<Option<XdpStateTables>> {
-    let projected = projected_bpf_map_bytes(config);
-    if projected <= budget {
-        return Ok(None);
-    }
+/// One bpffs pin survey per attach attempt: map name → pinned max_entries
+/// for pins whose type/key/value match the object spec. Sizing and
+/// enforcement must judge the same pin set — re-reading pins between the
+/// scale-down and the budget check races a pin appearing or disappearing
+/// mid-attach and lets the two steps disagree about what is already owned.
+pub(crate) type PinnedMapSurvey = std::collections::HashMap<&'static str, u32>;
+
+pub(crate) fn pinned_map_survey_at(config: &XdpConfig, pin_dir: &Path) -> PinnedMapSurvey {
+    bpf_map_specs(config)
+        .iter()
+        .filter_map(|(name, ty, key, value, _)| {
+            pinned_map_max_entries_at(name, *ty, *key, *value, pin_dir).map(|max| (*name, max))
+        })
+        .collect()
+}
+
+fn pinned_map_survey(config: &XdpConfig) -> PinnedMapSurvey {
+    pinned_map_survey_at(config, Path::new(xdp_bpf_pin_dir()))
+}
+
+fn pinned_spec_bytes_from_survey(config: &XdpConfig, survey: &PinnedMapSurvey) -> u64 {
+    bpf_map_specs(config)
+        .iter()
+        .map(|(name, ty, key, value, max)| match survey.get(name) {
+            Some(pinned) if pinned == max => map_spec_bytes(*ty, *key, *value, *pinned),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Auto-size the sizeable state tables to the pinned-allocation headroom
+/// when the operator gave no explicit `xdp.stateTables`. A knob whose maps
+/// are all pinned at one spec-compatible size is *locked* to that size —
+/// already-owned kernel memory is exempt, and the footprint survives
+/// restarts and headroom drift instead of being re-derived from the
+/// moving `available` watermark (which is what stranded a once-shrunk
+/// node: defaults came back, the stale-pin gate refused, attach failed).
+/// Knobs with no pins scale into the remaining headroom with a per-table
+/// floor; if even floored *new* bytes do not fit, attach fails explicitly.
+pub(crate) fn auto_scale_state_tables(
+    config: &XdpConfig,
+    headroom: u64,
+    survey: &PinnedMapSurvey,
+) -> anyhow::Result<Option<XdpStateTables>> {
     const STATE_TABLE_FLOOR: u32 = 1_024;
-    // Fixed cost = maps not covered by state_table_override. `config` here
-    // always carries the default table sizes (this runs only when the
-    // operator left `stateTables` unset).
+    /// (map name, per-entry bytes, default max_entries) per scalable map.
+    type Member = (&'static str, u64, u32);
+    let projected = projected_bpf_map_bytes(config);
+    // Fixed cost = maps not covered by state_table_override — but only the
+    // share not already pinned at spec size. `config` here always carries
+    // the default table sizes (this runs only when the operator left
+    // `stateTables` unset).
     let mut fixed = 0u64;
-    let mut scalable: Vec<(&'static str, u64, u32, aya::maps::MapType, u32, u32)> = Vec::new();
+    let mut knobs: Vec<(&'static str, Vec<Member>)> = Vec::new();
     for (name, ty, key, value, max) in bpf_map_specs(config) {
         let bytes = map_spec_bytes(ty, key, value, max);
         if state_table_override_scalable(name) {
-            scalable.push((name, bytes / u64::from(max).max(1), max, ty, key, value));
-        } else {
+            let knob = state_table_knob(name);
+            let per_entry = bytes / u64::from(max).max(1);
+            match knobs.iter_mut().find(|(k, _)| *k == knob) {
+                Some((_, members)) => members.push((name, per_entry, max)),
+                None => knobs.push((knob, vec![(name, per_entry, max)])),
+            }
+        } else if survey.get(name) != Some(&max) {
             fixed = fixed.saturating_add(bytes);
         }
     }
-    let headroom = budget.saturating_sub(fixed);
-    // Scale factor in milli-units to keep integer math.
-    let scalable_total: u64 = scalable
-        .iter()
-        .map(|(_, per_entry, max, ..)| per_entry.saturating_mul(u64::from(*max)))
-        .sum();
-    if scalable_total == 0 {
-        return Ok(None);
-    }
-    let scale_milli = headroom.saturating_mul(1000) / scalable_total;
-    // Per-map candidate sizes. Prefer an existing spec-compatible pin: the
-    // stale-pin gate refuses any max mismatch, so adopting the pinned size
-    // keeps restarts stable when this boot's scale factor drifts. Pins that
-    // no longer fit the headroom fail the capacity check below explicitly.
-    let mut candidates: Vec<(&'static str, &'static str, u64, u32)> =
-        Vec::with_capacity(scalable.len());
-    for (name, per_entry, default_max, ty, key, value) in &scalable {
-        let pinned_max = pinned_map_max_entries(name, *ty, *key, *value);
-        let scaled_max = u64::from(*default_max)
-            .saturating_mul(scale_milli)
-            / 1000;
-        let candidate = match pinned_max {
-            Some(pin_max) => pin_max.min(*default_max),
-            None => (scaled_max as u32).max(STATE_TABLE_FLOOR).min(*default_max),
-        };
-        candidates.push((state_table_knob(name), name, *per_entry, candidate));
-    }
-    // A stateTables knob covers every map in its group with ONE value, so
-    // the charged size must be the group minimum — a member charged at its
-    // own larger candidate would make the real projection exceed the
-    // accounted total. Members whose pin exceeds the chosen value trip the
-    // stale-pin gate later: an explicit refusal, not silent state loss.
-    let mut knob_values: Vec<(&'static str, u32)> = Vec::new();
-    for (knob, _name, _per_entry, candidate) in &candidates {
-        match knob_values.iter_mut().find(|(k, _)| k == knob) {
-            Some((_, v)) => *v = (*v).min(*candidate),
-            None => knob_values.push((knob, *candidate)),
+    // Lock every knob that already has spec-compatible pins to the
+    // smallest pinned size in the group: members pinned at that size are
+    // reused for free, unpinned members are created at it (charged), and
+    // members pinned *larger* trip the stale-pin gate later — an explicit
+    // refusal, not silent state loss.
+    let mut locked: Vec<(&'static str, u32)> = Vec::new();
+    let mut locked_new_bytes = 0u64;
+    for (knob, members) in &knobs {
+        let pinned_sizes: Vec<u32> = members
+            .iter()
+            .filter_map(|(name, ..)| survey.get(name).copied())
+            .collect();
+        if pinned_sizes.is_empty() {
+            continue;
+        }
+        let chosen = pinned_sizes.iter().copied().min().unwrap_or(0);
+        locked.push((*knob, chosen));
+        for (name, per_entry, _) in members {
+            if survey.get(name) != Some(&chosen) {
+                locked_new_bytes =
+                    locked_new_bytes.saturating_add(per_entry.saturating_mul(u64::from(chosen)));
+            }
         }
     }
-    let mut scaled_total = 0u64;
-    for (knob, _name, per_entry, candidate) in &candidates {
-        let chosen = knob_values
+    let remaining = headroom
+        .saturating_sub(fixed)
+        .saturating_sub(locked_new_bytes);
+    let free_total: u64 = knobs
+        .iter()
+        .filter(|(knob, _)| !locked.iter().any(|(k, _)| k == knob))
+        .flat_map(|(_, members)| members.iter())
+        .map(|(_, per_entry, max)| per_entry.saturating_mul(u64::from(*max)))
+        .sum();
+    // Scale factor in milli-units to keep integer math; only knobs without
+    // pins compete for the remaining headroom.
+    let scale_milli = remaining
+        .saturating_mul(1000)
+        .checked_div(free_total)
+        .unwrap_or(1000);
+    let mut knob_values: Vec<(&'static str, u32)> = Vec::new();
+    let mut new_bytes = fixed.saturating_add(locked_new_bytes);
+    let mut differs_from_default = false;
+    for (knob, members) in &knobs {
+        if let Some((_, chosen)) = locked.iter().find(|(k, _)| k == knob) {
+            let chosen = *chosen;
+            // Emit the pinned size even when it equals the defaults — a
+            // `None` knob would resolve to default specs and mismatch the
+            // pin. Members pinned larger than `chosen` were charged above
+            // and trip the stale-pin gate.
+            knob_values.push((*knob, chosen));
+            if members.iter().any(|(_, _, default_max)| *default_max != chosen) {
+                differs_from_default = true;
+            }
+            continue;
+        }
+        // Unpinned knob: scale into the remaining headroom, clamped per
+        // member to [floor, its own default]. A group shares one knob
+        // value, so the emitted size is the member minimum — but only
+        // emit it when scaling actually shrank the group; emitting the
+        // default would silently shrink members with larger defaults.
+        let scaled: Vec<u32> = members
             .iter()
-            .find(|(k, _)| k == knob)
-            .map(|(_, v)| *v)
-            .unwrap_or(*candidate);
-        scaled_total =
-            scaled_total.saturating_add(per_entry.saturating_mul(u64::from(chosen)));
+            .map(|(_, _, default_max)| {
+                (u64::from(*default_max).saturating_mul(scale_milli) / 1000)
+                    .min(u64::from(*default_max))
+                    .max(u64::from(STATE_TABLE_FLOOR)) as u32
+            })
+            .collect();
+        let shrank = members
+            .iter()
+            .zip(scaled.iter())
+            .any(|((_, _, default_max), s)| *s != *default_max);
+        let spec_size = if shrank {
+            let chosen = scaled.iter().copied().min().unwrap_or(STATE_TABLE_FLOOR);
+            knob_values.push((*knob, chosen));
+            differs_from_default = true;
+            chosen
+        } else {
+            0 // per-member defaults below
+        };
+        for ((_, per_entry, _), s) in members.iter().zip(scaled.iter()) {
+            let spec = if shrank { spec_size } else { *s };
+            new_bytes = new_bytes.saturating_add(per_entry.saturating_mul(u64::from(spec)));
+        }
     }
     anyhow::ensure!(
-        scaled_total <= headroom,
-        "eBPF state tables cannot fit kernel-bpf budget {budget} even at the {STATE_TABLE_FLOOR}-entry floor (fixed={fixed}, need={scaled_total})"
+        new_bytes <= headroom,
+        "eBPF state tables need {new_bytes}B of new pinned memory; attach headroom {headroom}B \
+         (fixed-new={fixed}, already-pinned reusable — grow memory, shrink stateTables, or purge stale pins)"
     );
+    if !differs_from_default {
+        return Ok(None);
+    }
     let get = |knob: &str| -> Option<u32> {
         knob_values
             .iter()
@@ -2989,7 +3086,7 @@ fn auto_scale_state_tables(config: &XdpConfig, budget: u64) -> anyhow::Result<Op
     let acl_allowed = get("acl_allowed");
     let rate_v4 = get("rate_v4");
     tracing::warn!(
-        "eBPF state tables auto-scaled to fit kernel-bpf budget {budget}B (projected {projected}B): ct={ct:?} pending={pending:?} snatRev={snat_rev:?} flowAcct={flow_acct:?} rateV4={rate_v4:?} rateV6={rate_v6:?} aclBlocked={acl_blocked:?} aclAllowed={acl_allowed:?}"
+        "eBPF state tables resolved for attach headroom {headroom}B (projected {projected}B): ct={ct:?} pending={pending:?} snatRev={snat_rev:?} flowAcct={flow_acct:?} rateV4={rate_v4:?} rateV6={rate_v6:?} aclBlocked={acl_blocked:?} aclAllowed={acl_allowed:?}"
     );
     Ok(Some(XdpStateTables {
         ct_max_entries: ct,
@@ -3027,20 +3124,50 @@ fn state_table_knob(name: &str) -> &'static str {
     }
 }
 
+/// Bytes of eBPF map memory already pinned under bpffs at `config`'s spec
+/// sizes — the maps a re-attach reuses unchanged. Already-committed kernel
+/// memory is never charged against the headroom watermark again: charging
+/// owned bytes a second time is what wedged small nodes into attach
+/// failure once the moving budget shrank under daemon RSS growth.
+pub(crate) fn pinned_spec_bytes(config: &XdpConfig) -> u64 {
+    pinned_spec_bytes_at(config, Path::new(xdp_bpf_pin_dir()))
+}
+
+pub(crate) fn pinned_spec_bytes_at(config: &XdpConfig, pin_dir: &Path) -> u64 {
+    pinned_spec_bytes_from_survey(config, &pinned_map_survey_at(config, pin_dir))
+}
+
 /// Ensure the object's projected map memory fits the kernel-BPF ledger.
 /// Called before load: map memory is preallocated and non-reclaimable, so
 /// over-budget objects must fail attach explicitly rather than silently
-/// pinning unbounded kernel memory. `budget` is a single caller-supplied
-/// snapshot — the governor's budget moves with live free memory, and
-/// sizing against one snapshot while enforcing another races (a shrinking
-/// snapshot can reject tables that were scaled to fit the earlier one).
-fn ensure_bpf_map_budget(config: &XdpConfig, budget: u64) -> anyhow::Result<()> {
+/// pinning unbounded kernel memory. Only *new* bytes are charged —
+/// maps already pinned at their spec sizes are owned, not re-bought.
+/// `headroom` is a single caller-supplied snapshot so the scale-down and
+/// this check judge the same water level.
+fn ensure_bpf_map_budget_with_survey(
+    config: &XdpConfig,
+    headroom: u64,
+    survey: &PinnedMapSurvey,
+) -> anyhow::Result<()> {
     let projected = projected_bpf_map_bytes(config);
+    let pinned = pinned_spec_bytes_from_survey(config, survey);
+    let new_bytes = projected.saturating_sub(pinned);
     anyhow::ensure!(
-        projected <= budget,
-        "eBPF map projected memory {projected} exceeds kernel-bpf budget {budget}"
+        new_bytes <= headroom,
+        "eBPF maps need {new_bytes}B of new pinned memory; attach headroom {headroom}B \
+         (projected={projected}B, already-pinned={pinned}B — grow memory, shrink stateTables, \
+         or purge stale pins)"
     );
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn ensure_bpf_map_budget_at(
+    config: &XdpConfig,
+    headroom: u64,
+    pin_dir: &Path,
+) -> anyhow::Result<()> {
+    ensure_bpf_map_budget_with_survey(config, headroom, &pinned_map_survey_at(config, pin_dir))
 }
 
 /// EN-16 post-load audit: every map the object actually declares must be
@@ -3176,16 +3303,18 @@ pub fn open_pinned_flow_events() -> anyhow::Result<Option<aya::maps::RingBuf<aya
 }
 
 /// Max entries of a pinned map whose type/key/value match the object spec —
-/// used by auto-scaling to prefer the live pinned size so restart sizing is
-/// stable. Returns `None` when the pin is absent, unreadable, or has an
-/// ABI-different layout (in which case the stale-pin gate still applies).
-fn pinned_map_max_entries(
+/// used by the pin survey so attach sizing prefers the live pinned size and
+/// restart sizing is stable. Returns `None` when the pin is absent,
+/// unreadable, or has an ABI-different layout (in which case the stale-pin
+/// gate still applies).
+pub(crate) fn pinned_map_max_entries_at(
     name: &str,
     spec_ty: aya::maps::MapType,
     spec_key: u32,
     spec_value: u32,
+    pin_dir: &Path,
 ) -> Option<u32> {
-    let path = Path::new(xdp_bpf_pin_dir()).join(name);
+    let path = pin_dir.join(name);
     let info = aya::maps::MapInfo::from_pin(&path).ok()?;
     (info.map_type().ok() == Some(spec_ty)
         && info.key_size() == spec_key

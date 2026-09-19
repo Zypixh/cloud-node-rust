@@ -749,7 +749,10 @@ impl XdpManager {
         }
         if self.config.interfaces.is_empty() {
             self.set_fallback_reason("runtime xdp.interfaces is empty");
-            if self.config.fallback.fail_start() {
+            // A reload must never publish a generation that cannot attach:
+            // rejecting keeps the predecessor's dataplane serving. The
+            // fallback=pass contract only covers cold start.
+            if self.config.fallback.fail_start() || predecessor.is_some() {
                 anyhow::bail!("xdp enabled but no interfaces configured");
             }
             return Ok(());
@@ -757,7 +760,7 @@ impl XdpManager {
         let proxy_frame_size_detail = xdp_proxy_frame_size_detail(&self.config);
         if !proxy_frame_size_detail.is_empty() {
             self.set_fallback_reason(format!("{proxy_frame_size_detail}; traffic will PASS"));
-            if self.config.fallback.fail_start() {
+            if self.config.fallback.fail_start() || predecessor.is_some() {
                 anyhow::bail!("{proxy_frame_size_detail}");
             }
             self.persist_status();
@@ -776,7 +779,7 @@ impl XdpManager {
                 "configured eBPF object {} is missing",
                 path.display()
             ));
-            if self.config.fallback.fail_start() {
+            if self.config.fallback.fail_start() || predecessor.is_some() {
                 anyhow::bail!("xdp eBPF object is missing: {}", path.display());
             }
             self.persist_status();
@@ -815,8 +818,18 @@ impl XdpManager {
             self.attach_committed.store(false, Ordering::Relaxed);
             self.attach_dataplane_restored
                 .store(false, Ordering::Relaxed);
+            // Reload keeps the resolved footprint: when the operator left
+            // `stateTables` unset, inherit the predecessor's effective
+            // sizes so attach never re-derives them from the moving
+            // `available` watermark. Restart recovery (no predecessor)
+            // happens inside attach via the pin survey.
+            let mut attach_config = self.config.clone();
+            if attach_config.state_tables.is_none() {
+                attach_config.state_tables =
+                    predecessor.and_then(|old| old.effective_state_tables.read().clone());
+            }
             match linux::attach(
-                &self.config,
+                &attach_config,
                 object_override.as_deref(),
                 false,
                 Some(&self.attach_committed),
@@ -871,7 +884,11 @@ impl XdpManager {
                 }
                 Err(err) => {
                     self.set_fallback_reason(format!("attach failed: {err}"));
-                    if self.config.fallback.fail_start() {
+                    // On reload the failed generation must not stay
+                    // published — `fallback=pass` would silently drop the
+                    // predecessor's dataplane with it. Reject the change
+                    // and let the rollback restore the serving manager.
+                    if self.config.fallback.fail_start() || predecessor.is_some() {
                         return Err(err);
                     }
                 }
@@ -880,7 +897,7 @@ impl XdpManager {
         #[cfg(not(target_os = "linux"))]
         {
             self.set_fallback_reason("XDP attach is supported on Linux only");
-            if self.config.fallback.fail_start() {
+            if self.config.fallback.fail_start() || predecessor.is_some() {
                 anyhow::bail!("XDP attach is supported on Linux only");
             }
         }
@@ -2256,6 +2273,22 @@ impl XdpManager {
         0
     }
 
+    /// eBPF map bytes already pinned under bpffs at the effective spec —
+    /// the share of `projectedBytes` a re-attach does not re-charge.
+    #[cfg(target_os = "linux")]
+    fn bpf_map_pinned_bytes(&self) -> u64 {
+        let mut config = self.config.clone();
+        if let Some(tables) = self.effective_state_tables.read().clone() {
+            config.state_tables = Some(tables);
+        }
+        linux::pinned_spec_bytes(&config)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn bpf_map_pinned_bytes(&self) -> u64 {
+        0
+    }
+
     #[cfg(target_os = "linux")]
     fn detach_after_runtime_failure(&self, reason: String) {
         if let Err(err) = linux::detach_blocking(&self.config) {
@@ -2450,6 +2483,7 @@ impl XdpManager {
             },
             "kernelBpfBudget": {
                 "projectedBytes": self.bpf_map_projected_bytes(),
+                "pinnedBytes": self.bpf_map_pinned_bytes(),
                 "budgetBytes": crate::memory_governor::MEMORY_GOVERNOR
                     .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
                     .kernel_bpf_budget_bytes,
@@ -2886,7 +2920,20 @@ fn replace_manager_from_runtime() -> std::sync::Arc<XdpManager> {
     });
     let mut current = manager.write();
     let previous = current.clone();
-    *current = std::sync::Arc::new(XdpManager::new(config));
+    let next = std::sync::Arc::new(XdpManager::new(config));
+    #[cfg(target_os = "linux")]
+    {
+        // Share — never take — the predecessor's dial registry so new
+        // upstream dials keep resolving the serving generation while this
+        // one prepares (publish happens before `initialize_inner`, and a
+        // registry-less current manager would fail every dial with
+        // NotConnected). A failed prepare drops only this clone — the
+        // predecessor's registry keeps serving after rollback; a real
+        // handover replaces it via `set_dial_registry` or
+        // `adopt_af_xdp_runtime`.
+        *next.dial_registry.lock() = previous.dial_registry.lock().clone();
+    }
+    *current = next;
     previous.stop_rule_sweeper();
     previous.stop_map_sync_worker();
     previous.stop_flow_event_consumer();
@@ -3316,6 +3363,18 @@ pub async fn reload_from_runtime() -> anyhow::Result<()> {
         .await
     {
         Ok(()) => {
+            // Publish gate: an enabled generation that never attached must
+            // not replace a serving predecessor. `initialize_inner` already
+            // rejects every failure path on reload, so this is the last
+            // line of defense — roll back instead of reporting success.
+            if runtime_config.enabled && manager.attached.read().is_empty() {
+                manager.release_for_handover();
+                restore_manager(old_manager.clone());
+                old_manager.persist_status_blocking();
+                return Err(anyhow::anyhow!(
+                    "XDP reload produced an unattached generation; previous generation kept serving"
+                ));
+            }
             start_rule_sweeper(&manager);
             start_flow_event_consumer(&manager);
             manager.persist_status_blocking();
