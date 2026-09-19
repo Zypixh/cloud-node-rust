@@ -1218,6 +1218,12 @@ impl AfXdpTcpReactor {
         self.hot_sessions.len()
     }
 
+    /// EN-17 test hook: observe the batched sweep cursor.
+    #[cfg(test)]
+    pub(crate) fn sweep_cursor(&self) -> usize {
+        self.sweep_pos
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_wake_count(&self) -> usize {
         self.wake_set.len()
@@ -1911,8 +1917,14 @@ impl AfXdpTcpReactor {
     }
 
     /// EN-17: a session keeps its hot slot while it still has observable
-    /// work — undelivered ingress, unflushed egress, an unstarted proxy, a
-    /// close in flight, or more socket receive data.
+    /// work — undelivered ingress, unflushed egress, a close in flight, or
+    /// more socket receive data. A pre-proxy session awaiting its peer's
+    /// next move is NOT work: the completing ACK marks it hot via
+    /// `enqueue_ingress`, handshake retransmits are driven by the smoltcp
+    /// poll-delay wake, and the pre-proxy idle reap is sweep/retainer
+    /// cadence. Keeping every unverified session hot here would busy-pump
+    /// the whole SYN-noise population every round — on a public port that
+    /// population never empties, so the reactor would never idle.
     fn session_still_active(&self, flow: AfXdpTcpFlowKey) -> bool {
         let Some(session) = self.sessions.get(&flow) else {
             return false;
@@ -1926,7 +1938,6 @@ impl AfXdpTcpReactor {
             return false;
         }
         if session.closing
-            || !session.proxy_started
             || !session.pending_ingress.is_empty()
             || !session.pending_egress.is_empty()
         {

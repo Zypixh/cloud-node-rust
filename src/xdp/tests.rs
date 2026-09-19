@@ -2743,10 +2743,13 @@ fn af_xdp_tcp_reactor_ingress_queue_overflow_is_explicit_refusal() {
 
 #[cfg(any(test, target_os = "linux"))]
 #[test]
-fn af_xdp_tcp_reactor_unstarted_sessions_stay_hot_until_swept() {
-    // Without proxy managers a session can never start: it must stay in the
-    // hot set (re-pumped each round) until the cadence-gated reaper collects
-    // it — never stranded by a missed signal.
+fn af_xdp_tcp_reactor_unstarted_sessions_go_cold_until_reaped() {
+    // Without proxy managers a session can never start — but a pre-proxy
+    // session awaiting its peer's next packet has no observable work after
+    // the SYN-ACK is emitted. It must leave the hot set so the reactor
+    // idles: a public port's SYN-noise population never empties, and
+    // permanent heat here would spin the queue thread forever. The
+    // cadence-gated reaper — not heat — is what prevents stranding.
     let frame = ipv4_tcp_syn_frame(false);
     let af_xdp::AfXdpProxyFrame::Tcp {
         route,
@@ -2761,13 +2764,90 @@ fn af_xdp_tcp_reactor_unstarted_sessions_stay_hot_until_swept() {
     assert_eq!(reactor.hot_session_count(), 0);
 
     // A wake signal (the real proxy→reactor path) marks the session hot; the
-    // poll drains it and the unstarted session re-marks itself.
+    // poll drains it and the unstarted session must NOT re-mark itself.
     reactor.wake_set.insert(flow, ());
     assert_eq!(reactor.pending_wake_count(), 1);
     reactor.poll();
     assert_eq!(reactor.pending_wake_count(), 0);
     assert_eq!(reactor.session_count(), 1);
+    assert_eq!(reactor.hot_session_count(), 0);
+    assert!(!reactor.has_queued_work());
+
+    // Going cold does not strand the session: the retainer still collects
+    // it once the pre-proxy idle timeout elapses.
+    let reap_at = smoltcp::time::Instant::from_millis(
+        crate::utils::time::now_timestamp_millis() + 4_001,
+    );
+    let _ = reactor.poll_at_for_test(reap_at);
+    assert_eq!(reactor.session_count(), 0);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_pre_proxy_wakes_on_completing_ack() {
+    // The cold pre-proxy session's wakeup path is the handshake-completing
+    // ACK itself: ingress marks the flow hot and the same poll round sees
+    // Established. With no proxy managers the spawn fails closed — the
+    // socket aborts and the session is reaped, never stranded.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let frame = ipv4_tcp_syn_frame(false);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    assert_eq!(
+        reactor.ingest(route.clone(), flow, ip_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+    let egress = reactor.poll();
+    assert_eq!(egress.len(), 1);
+    assert_eq!(reactor.hot_session_count(), 0);
+    assert!(!reactor.has_queued_work());
+
+    // The completing ACK must carry our SYN-ACK's seq+1.
+    let syn_ack = &egress[0].1;
+    let tcp = 20;
+    let our_next_seq = u32::from_be_bytes([
+        syn_ack[tcp + 4],
+        syn_ack[tcp + 5],
+        syn_ack[tcp + 6],
+        syn_ack[tcp + 7],
+    ])
+    .wrapping_add(1);
+    let ack_frame = ipv4_tcp_ack_frame(false, 2, our_next_seq);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route: ack_route,
+        flow: ack_flow,
+        ip_packet: ack_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &ack_frame).expect("valid TCP ACK frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    assert_eq!(ack_flow, flow);
+    assert_eq!(
+        reactor.ingest(ack_route, ack_flow, ack_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
     assert_eq!(reactor.hot_session_count(), 1);
+
+    // Established without a handler → fail-closed abort; the cadence-gated
+    // retainer collects the dead session at the next sweep cycle.
+    let _ = reactor.poll();
+    let reap_at = smoltcp::time::Instant::from_millis(
+        crate::utils::time::now_timestamp_millis()
+            + af_xdp::AF_XDP_TCP_SWEEP_INTERVAL.as_millis() as i64
+            + 1,
+    );
+    let _ = reactor.poll_at_for_test(reap_at);
+    assert_eq!(reactor.session_count(), 0);
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -2795,21 +2875,24 @@ fn af_xdp_tcp_reactor_sweep_is_batched_not_unbounded() {
     }
     assert_eq!(reactor.hot_session_count(), 0);
 
-    // First round past the interval: exactly one batch is pumped. Unstarted
-    // sessions stay active, so each swept session lands in the hot set.
+    // First round past the interval: exactly one batch is pumped. Idle
+    // pre-proxy sessions go cold rather than re-marking hot, so the sweep
+    // cursor — not the hot set — shows the batch bound.
     let t1 = smoltcp::time::Instant::from_millis(
         t0.total_millis() + af_xdp::AF_XDP_TCP_SWEEP_INTERVAL.as_millis() as i64 + 1,
     );
     reactor.poll_at_for_test(t1);
     assert_eq!(
-        reactor.hot_session_count(),
+        reactor.sweep_cursor(),
         af_xdp::AF_XDP_TCP_SWEEP_BATCH_BUDGET
     );
+    assert_eq!(reactor.hot_session_count(), 0);
 
-    // Second round finishes the cycle: hot sessions re-pump via the queue
-    // (budget 512 >= batch) and the remaining entries are swept.
+    // Second round finishes the cycle: the remaining entries are swept
+    // and no session re-marks itself hot without real work.
     reactor.poll_at_for_test(smoltcp::time::Instant::from_millis(t1.total_millis() + 1));
-    assert_eq!(reactor.hot_session_count(), session_total);
+    assert_eq!(reactor.sweep_cursor(), session_total);
+    assert_eq!(reactor.hot_session_count(), 0);
     assert_eq!(reactor.session_count(), session_total);
 }
 
@@ -3550,6 +3633,41 @@ fn ipv4_tcp_syn_frame_with_source(
         0,
         0x50,
         0x02,
+        0xff,
+        0xff,
+        0,
+        0,
+        0,
+        0,
+    ]);
+    write_ipv4_checksum(&mut frame, ethernet_header_len(vlan));
+    write_tcp4_checksum(&mut frame, ethernet_header_len(vlan));
+    frame
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn ipv4_tcp_ack_frame(vlan: bool, seq: u32, ack: u32) -> Vec<u8> {
+    let mut frame = ethernet_header(0x0800, vlan);
+    let total_len = 20 + 20;
+    frame.extend_from_slice(&[
+        0x45, 0, (total_len >> 8) as u8, total_len as u8, 0, 1, 0, 0, 64, 6, 0, 0, 192, 0, 2, 10,
+        198, 51, 100, 5,
+    ]);
+    frame.extend_from_slice(&[
+        0xcf,
+        0x08,
+        0x01,
+        0xbb,
+        (seq >> 24) as u8,
+        (seq >> 16) as u8,
+        (seq >> 8) as u8,
+        seq as u8,
+        (ack >> 24) as u8,
+        (ack >> 16) as u8,
+        (ack >> 8) as u8,
+        ack as u8,
+        0x50,
+        0x10,
         0xff,
         0xff,
         0,
