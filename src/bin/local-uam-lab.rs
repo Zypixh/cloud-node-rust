@@ -175,6 +175,7 @@ fn main() -> anyhow::Result<()> {
         access_log_pipeline: AccessLogPipelineConfig::default(),
         relay: Default::default(),
         kernel_tuning: Default::default(),
+        cache: Default::default(),
     });
     let cert_selector = Arc::new(DynamicCertSelector::new());
 

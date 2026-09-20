@@ -492,6 +492,7 @@ mod tests {
             access_log_pipeline: Default::default(),
             relay: Default::default(),
             kernel_tuning: Default::default(),
+            cache: Default::default(),
         }
     }
 
@@ -844,6 +845,7 @@ mod node_log_uploader_tests {
             access_log_pipeline: Default::default(),
             relay: Default::default(),
             kernel_tuning: Default::default(),
+            cache: Default::default(),
         }
     }
 

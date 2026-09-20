@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI8, Ordering};
 use std::sync::LazyLock as Lazy;
 use std::sync::RwLock;
 
@@ -24,6 +25,31 @@ pub struct ApiConfig {
     pub relay: RelayConfig,
     #[serde(rename = "kernelTuning", default)]
     pub kernel_tuning: KernelTuningConfig,
+    #[serde(rename = "cache", default)]
+    pub cache: LocalCacheConfig,
+}
+
+/// Node-local cache overrides. Every field is a tri-state: absent means
+/// "follow whatever the control-plane cache policy pushes"; an explicit
+/// bool forces the behavior on this node regardless of the pushed value.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct LocalCacheConfig {
+    #[serde(rename = "sendfile", default)]
+    pub sendfile: Option<bool>,
+}
+
+/// -1 = follow the pushed policy, 0 = force off, 1 = force on. Refreshed by
+/// every `ApiConfig::load` so config edits take effect on the next policy
+/// application without a restart of unrelated state.
+static LOCAL_CACHE_SENDFILE: AtomicI8 = AtomicI8::new(-1);
+
+/// Effective node-local sendfile override, if the operator set one.
+pub fn local_cache_sendfile_override() -> Option<bool> {
+    match LOCAL_CACHE_SENDFILE.load(Ordering::Relaxed) {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -252,6 +278,14 @@ impl ApiConfig {
             anyhow::bail!("'secret' required in {:?}", path.as_ref());
         }
         Self::set_runtime_rpc_endpoints(config.rpc_endpoints.clone())?;
+        LOCAL_CACHE_SENDFILE.store(
+            match config.cache.sendfile {
+                Some(true) => 1,
+                Some(false) => 0,
+                None => -1,
+            },
+            Ordering::Relaxed,
+        );
         Ok(config)
     }
 
@@ -418,6 +452,38 @@ secret: "secret"
         .unwrap();
 
         assert!(config.kernel_tuning.normalized().enabled);
+    }
+
+    #[test]
+    fn cache_sendfile_defaults_to_following_pushed_policy() {
+        let config: ApiConfig = serde_yaml::from_str(
+            r#"
+rpc.endpoints:
+  - https://api.example.com
+nodeId: "1"
+secret: "secret"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.cache.sendfile, None);
+    }
+
+    #[test]
+    fn cache_sendfile_override_parses_bool() {
+        let config: ApiConfig = serde_yaml::from_str(
+            r#"
+rpc.endpoints:
+  - https://api.example.com
+nodeId: "1"
+secret: "secret"
+cache:
+  sendfile: true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.cache.sendfile, Some(true));
     }
 
     #[test]

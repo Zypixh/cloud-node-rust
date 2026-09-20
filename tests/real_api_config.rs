@@ -45,6 +45,7 @@ fn real_api_config_from_env() -> anyhow::Result<Option<ApiConfig>> {
         access_log_pipeline: Default::default(),
         relay: Default::default(),
         kernel_tuning: Default::default(),
+        cache: Default::default(),
     }))
 }
 

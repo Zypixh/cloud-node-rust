@@ -466,6 +466,15 @@ impl Stream {
         let _ = mem::replace(&mut self.stream, stream);
     }
 
+    /// Whether this transport can serve a file descriptor via
+    /// `sendfile(2)` — true only for a raw kernel TCP socket on Linux.
+    /// Unix sockets and AF_XDP virtual sockets have no TCP socket fd and
+    /// always decline.
+    pub fn accepts_sendfile(&self) -> bool {
+        cfg!(target_os = "linux")
+            && matches!(self.stream().get_ref().stream, RawStream::Tcp(_))
+    }
+
     /// Write `len` bytes from `file` starting at `offset` directly to the
     /// socket via `sendfile(2)`, bypassing the userspace copy entirely.
     ///
@@ -1150,5 +1159,25 @@ mod tests {
         let mut buffer = vec![];
         stream.read_to_end(&mut buffer).await.unwrap();
         assert_eq!(buffer, message[2..]);
+    }
+
+    #[tokio::test]
+    async fn test_accepts_sendfile_only_for_tcp_on_linux() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream: Stream = TcpStream::connect(addr).await.unwrap().into();
+        assert_eq!(stream.accepts_sendfile(), cfg!(target_os = "linux"));
+
+        #[cfg(unix)]
+        {
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("sendfile-gate-{}", std::process::id()));
+            let unix_listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let unix_stream: Stream =
+                tokio::net::UnixStream::connect(&path).await.unwrap().into();
+            drop(unix_listener);
+            let _ = std::fs::remove_file(&path);
+            assert!(!unix_stream.accepts_sendfile());
+        }
     }
 }

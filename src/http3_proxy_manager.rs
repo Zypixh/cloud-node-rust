@@ -956,6 +956,7 @@ mod tests {
                 crate::api_config::AccessLogPipelineConfig::default(),
             relay: crate::api_config::RelayConfig::default(),
             kernel_tuning: crate::api_config::KernelTuningConfig::default(),
+            cache: Default::default(),
         });
         let waf_state = Arc::new(crate::firewall::state::WafStateManager::new());
         let proxy_logic = crate::proxy::EdgeProxy {

@@ -74,6 +74,18 @@ impl Session {
         matches!(self, Self::Custom(_))
     }
 
+    /// Whether `write_body_file` can serve a [`pingora_http::FileBody`]
+    /// through `sendfile(2)`. Only HTTP/1.x on a raw kernel TCP socket can;
+    /// TLS, AF_XDP virtual sockets, and non-Linux transports always decline,
+    /// in which case callers should prefer the hit handler's own read path
+    /// (mmap-backed chunks) rather than the file-body fallback.
+    pub fn accepts_sendfile(&self) -> bool {
+        match self {
+            Self::H1(s) => s.accepts_sendfile(),
+            _ => false,
+        }
+    }
+
     /// Read the request header. This method is required to be called first before doing anything
     /// else with the session.
     /// - `Ok(true)`: successful

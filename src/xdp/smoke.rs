@@ -1250,6 +1250,7 @@ async fn xdp_proxy_smoke_managers(
         access_log_pipeline: crate::api_config::AccessLogPipelineConfig::default(),
         relay: crate::api_config::RelayConfig::default(),
         kernel_tuning: crate::api_config::KernelTuningConfig::default(),
+        cache: Default::default(),
     });
     let proxy_logic = crate::proxy::EdgeProxy {
         config: std::sync::Arc::new(store.clone()),

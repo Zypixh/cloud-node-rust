@@ -814,6 +814,19 @@ impl HttpSession {
         }
     }
 
+    /// Whether [`Self::write_body_file`] can use `sendfile(2)` on this
+    /// session's transport — true only when the underlying stream is a raw
+    /// kernel TCP socket on Linux. TLS sessions encrypt in userspace and
+    /// virtual transports have no socket fd, so they always take the
+    /// buffered fallback.
+    pub fn accepts_sendfile(&self) -> bool {
+        self.underlying_stream
+            .as_any()
+            .downcast_ref::<crate::protocols::l4::stream::Stream>()
+            .map(|s| s.accepts_sendfile())
+            .unwrap_or(false)
+    }
+
     /// Write a file-backed response body to the client.
     ///
     /// When the body framing is `Content-Length` and the transport is a plain

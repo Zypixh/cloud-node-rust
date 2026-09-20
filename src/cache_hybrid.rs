@@ -4099,10 +4099,15 @@ impl HybridStorage {
                         .collect::<Vec<_>>()
                 });
 
-            let enable_sendfile = options
-                .get("enableSendfile")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+            // A node-local `cache.sendfile` in api_node.yaml wins over the
+            // pushed flag; absent, the control-plane value (default on) rules.
+            let sendfile_override = crate::api_config::local_cache_sendfile_override();
+            let enable_sendfile = sendfile_override.unwrap_or_else(|| {
+                options
+                    .get("enableSendfile")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true)
+            });
             let enable_file_cache = options
                 .get("openFileCache")
                 .and_then(|v| v.get("isOn"))
@@ -4111,8 +4116,14 @@ impl HybridStorage {
 
             if let Some(main) = main_dir {
                 info!(
-                    "RPC_CACHE: Updating cache configuration (Sendfile: {}, HandleCache: {})",
-                    enable_sendfile, enable_file_cache
+                    "RPC_CACHE: Updating cache configuration (Sendfile: {}{}, HandleCache: {})",
+                    enable_sendfile,
+                    if sendfile_override.is_some() {
+                        " [local]"
+                    } else {
+                        ""
+                    },
+                    enable_file_cache
                 );
                 self.l2.update_config(
                     main,

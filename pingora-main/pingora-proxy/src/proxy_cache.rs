@@ -406,13 +406,11 @@ where
             // throttling the byte path would have done per chunk.
             let file_body = if maybe_range_filter.is_none()
                 && session.downstream_modules_ctx.is_empty()
-                // Only H1 transports can serve an fd directly; other session
-                // types would just re-read the range into Bytes anyway,
-                // which the mmap read path already does with less work.
-                && matches!(
-                    session.as_downstream(),
-                    pingora_core::protocols::http::server::Session::H1(_)
-                )
+                // Only raw kernel TCP can serve an fd directly; TLS and
+                // virtual transports would decline sendfile and re-read the
+                // range through a file fd anyway, which the mmap read path
+                // already does with fewer copies.
+                && session.as_downstream().accepts_sendfile()
             {
                 session.cache.hit_handler().file_body()
             } else {

@@ -2285,6 +2285,7 @@ mod tests {
             access_log_pipeline: crate::api_config::AccessLogPipelineConfig::default(),
             relay: crate::api_config::RelayConfig::default(),
             kernel_tuning: crate::api_config::KernelTuningConfig::default(),
+            cache: Default::default(),
         });
         let proxy_logic = crate::proxy::EdgeProxy {
             config: Arc::new(store.clone()),
