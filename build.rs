@@ -232,6 +232,18 @@ fn embed_xdp_ebpf_object() -> Result<(), Box<dyn std::error::Error>> {
     // sysroot or -Z build-std looks for rust-src under the stable dir.
     cmd.env_remove("RUSTC");
     cmd.env_remove("RUSTUP_TOOLCHAIN");
+    // A leaked CARGO_TARGET_DIR pushes the child into the parent's target
+    // dir, where it blocks on the parent's build lock; leaked per-target
+    // rustflags (e.g. target-cpu for the host triple) miscompile the
+    // child's x86 host dependencies.
+    cmd.env_remove("CARGO_TARGET_DIR");
+    cmd.env_remove("RUSTFLAGS");
+    for (key, _) in std::env::vars_os() {
+        let Some(key) = key.to_str() else { continue };
+        if key.starts_with("CARGO_TARGET_") && key.ends_with("_RUSTFLAGS") {
+            cmd.env_remove(key);
+        }
+    }
     let built = cmd
         .status()
         .map(|status| status.success())
