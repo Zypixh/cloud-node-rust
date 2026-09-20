@@ -415,7 +415,17 @@ pub(crate) async fn start_proxy_bridge_inner(
         // not a reason to hot-loop restarts.
         let mut served = manager;
         loop {
-            if served.config.enabled {
+            // The settle gate applies to the *first* generation too:
+            // `xdp.proxy.ports` is synced from the live control-plane
+            // config tens of seconds after startup, so the initial manager
+            // can still be mid-attach (or waiting on ports) with no AF_XDP
+            // runtime. Serving it now records a spurious permanent failure
+            // and the supervisor exits, leaving every later generation
+            // unbridged.
+            if served.config.enabled
+                && !served.attached.read().is_empty()
+                && af_xdp_runtime_settled(&served)
+            {
                 run_proxy_bridge(
                     served.clone(),
                     quic_demux.clone(),
@@ -430,33 +440,20 @@ pub(crate) async fn start_proxy_bridge_inner(
                     return;
                 }
             }
-            // Disabled or stale manager: wait for the next generation to
+            // Disabled, unattached, or unsettled manager: wait for a
+            // generation that is worth serving — the next generation to
             // become current and finish attaching (its AF_XDP runtime is
-            // only populated by `initialize`), then serve it. Poll —
-            // manager identity changes are rare and the gap between
-            // generations is transient.
+            // only populated by `initialize`). Poll — manager identity
+            // changes are rare and the gap between generations is
+            // transient.
             loop {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let current = manager_from_runtime();
                 if !Arc::ptr_eq(&current, &served) {
                     served = current;
                 }
-                // Serve the generation once `initialize` has finished its
-                // AF_XDP setup (or skip waiting while XDP is disabled or
-                // has no proxy interfaces). `af_xdp` is populated by
-                // `configure_af_xdp_runtime` — success *or* recorded
-                // per-queue failure — so this gate never waits forever on
-                // a failed setup.
-                let proxy_ifaces = served
-                    .config
-                    .interfaces
-                    .iter()
-                    .any(|interface| interface.mode == XdpRuntimeMode::Proxy);
                 let attached = !served.attached.read().is_empty();
-                let af_xdp_settled = !proxy_ifaces
-                    || served.af_xdp.lock().is_some()
-                    || !served.xsk_status.read().is_empty();
-                if !served.config.enabled || (attached && af_xdp_settled) {
+                if !served.config.enabled || (attached && af_xdp_runtime_settled(&served)) {
                     break;
                 }
             }
@@ -510,6 +507,22 @@ pub(crate) fn af_xdp_queue_cpu(
         return *cpu;
     }
     (ordinal % online_cpus.max(1)) as u32
+}
+
+/// Whether a generation's AF_XDP setup has reached its terminal state:
+/// `af_xdp` is populated by `configure_af_xdp_runtime` — success *or*
+/// recorded per-queue failure — so this gate never waits forever on a
+/// failed setup. Non-proxy configurations settle trivially (nothing to
+/// bridge).
+#[cfg(target_os = "linux")]
+pub(crate) fn af_xdp_runtime_settled(manager: &Arc<XdpManager>) -> bool {
+    !manager
+        .config
+        .interfaces
+        .iter()
+        .any(|interface| interface.mode == XdpRuntimeMode::Proxy)
+        || manager.af_xdp.lock().is_some()
+        || !manager.xsk_status.read().is_empty()
 }
 
 #[cfg(target_os = "linux")]
@@ -2153,6 +2166,7 @@ pub(crate) fn compact_udp_route_cache(
 #[cfg(all(test, target_os = "linux"))]
 mod sched_aqm_tests {
     use super::*;
+    use crate::runtime_mode::XdpInterfaceConfig;
     use cloud_node_transport::codel::{Codel, CodelAction, Stamp, DEFAULT_INTERVAL, DEFAULT_TARGET};
     use cloud_node_transport::sched::Scheduler;
     use cloud_node_transport::TransportInstant;
@@ -2370,5 +2384,57 @@ mod sched_aqm_tests {
             "cap must shed — counted by caller"
         );
         assert_eq!(total, AF_XDP_TX_RETRY_CAP);
+    }
+
+    fn proxy_manager() -> Arc<XdpManager> {
+        Arc::new(XdpManager::new(XdpConfig {
+            enabled: true,
+            interfaces: vec![XdpInterfaceConfig {
+                name: "eth0".to_string(),
+                queues: vec![0],
+                mode: XdpRuntimeMode::Proxy,
+                ..XdpInterfaceConfig::default()
+            }],
+            ..XdpConfig::default()
+        }))
+    }
+
+    #[test]
+    fn af_xdp_runtime_settled_gates_first_generation() {
+        // Boot-order regression: a proxy-mode generation with no AF_XDP
+        // runtime and no recorded queue status is *unsettled* — the bridge
+        // supervisor must keep waiting instead of serving it and exiting
+        // permanently when ports sync in later.
+        let manager = proxy_manager();
+        assert!(!af_xdp_runtime_settled(&manager));
+
+        // A recorded per-queue failure is a terminal state too — settle so
+        // the failure path can record its reason and the supervisor moves on.
+        *manager.xsk_status.write() = vec![XdpQueueStatus {
+            interface: "eth0".to_string(),
+            queue: 0,
+            configured: true,
+            socket_created: false,
+            registered: false,
+            ready: false,
+            detail: "AF_XDP socket setup failed".to_string(),
+            ..Default::default()
+        }];
+        assert!(af_xdp_runtime_settled(&manager));
+    }
+
+    #[test]
+    fn af_xdp_runtime_settled_trivially_true_without_proxy_interfaces() {
+        let manager = Arc::new(XdpManager::new(XdpConfig {
+            enabled: true,
+            interfaces: vec![XdpInterfaceConfig {
+                name: "eth0".to_string(),
+                queues: vec![0],
+                mode: XdpRuntimeMode::Observe,
+                ..XdpInterfaceConfig::default()
+            }],
+            ..XdpConfig::default()
+        }));
+        assert!(af_xdp_runtime_settled(&manager));
     }
 }

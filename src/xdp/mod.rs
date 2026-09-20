@@ -40,6 +40,12 @@ const XDP_RULE_SWEEP_INTERVAL_SECS: u64 = 5;
 // whole-second resonance with the rule sweeper.
 const XDP_MAP_SYNC_DEBOUNCE_MS: u64 = 47;
 const XDP_PROXY_DATAPLANE_ACTIVE: bool = true;
+// Status-file writes are last-writer-wins by claim order: `persist_status`
+// spawns one async writer per call and they can complete out of order, so
+// each claim carries a sequence and a stale claim drops its write instead
+// of clobbering a newer snapshot.
+static XDP_STATUS_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+static XDP_STATUS_WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 #[cfg(any(test, target_os = "linux"))]
 const XDP_XSK_STATUS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -1600,21 +1606,33 @@ impl XdpManager {
         let paths = crate::paths::NodePaths::current();
         let path = paths.xdp_state_file();
         let status = self.status();
+        let seq = XDP_STATUS_WRITE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
+                    if seq != XDP_STATUS_WRITE_SEQ.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let _guard = XDP_STATUS_WRITE_LOCK.lock();
+                    if seq != XDP_STATUS_WRITE_SEQ.load(Ordering::Relaxed) {
+                        return;
+                    }
                     if let Some(parent) = path.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
+                        let _ = std::fs::create_dir_all(parent);
                     }
                     match serde_json::to_vec_pretty(&status) {
                         Ok(body) => {
-                            let _ = tokio::fs::write(path, body).await;
+                            let _ = std::fs::write(&path, body);
                         }
                         Err(err) => tracing::warn!("failed to encode XDP status: {}", err),
                     }
                 });
             }
             Err(_) => {
+                let _guard = XDP_STATUS_WRITE_LOCK.lock();
+                if seq != XDP_STATUS_WRITE_SEQ.load(Ordering::Relaxed) {
+                    return;
+                }
                 if let Err(err) = write_status_snapshot_blocking(&path, &status) {
                     tracing::warn!("failed to write XDP status: {}", err);
                 }
@@ -1629,6 +1647,11 @@ impl XdpManager {
         );
         let path = crate::paths::NodePaths::current().xdp_state_file();
         let status = self.status();
+        let seq = XDP_STATUS_WRITE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        let _guard = XDP_STATUS_WRITE_LOCK.lock();
+        if seq != XDP_STATUS_WRITE_SEQ.load(Ordering::Relaxed) {
+            return;
+        }
         if let Err(err) = write_status_snapshot_blocking(&path, &status) {
             tracing::warn!("failed to write XDP status: {}", err);
         }
