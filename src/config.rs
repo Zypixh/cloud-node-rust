@@ -1919,9 +1919,6 @@ impl ConfigStore {
         lock.udp_server_by_port.clear();
 
         for server in &lock.all_servers {
-            if !server.is_on {
-                continue;
-            }
             if !server.is_quic_passthrough() {
                 for port in Self::server_udp_ports(server, false) {
                     if let Some(existing) = lock.udp_server_by_port.get(&port) {
@@ -2048,9 +2045,6 @@ impl ConfigStore {
         server: &Arc<ServerConfig>,
         ports: Vec<u16>,
     ) {
-        if !server.is_on {
-            return;
-        }
         for name in server.get_plain_server_names() {
             let name = Self::normalize_host(&name);
             if name.is_empty() {
@@ -2843,6 +2837,102 @@ mod tests {
                 .sni_passthrough_server
                 .map(|server| server.numeric_id()),
             Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn sni_passthrough_indexes_regardless_of_server_is_on() {
+        // The control plane pushes `"isOn": false` for every server in this
+        // protocol revision — the field does not carry the console enable
+        // state — so it must not gate passthrough indexing, or every route
+        // silently falls back to local L7 termination.
+        let store = ConfigStore::new();
+        let passthrough_server = Arc::new(ServerConfig {
+            id: Some(7),
+            is_on: false,
+            server_names: vec![ServerNameConfig {
+                name: "speeds-116.speedtest.net@sni_passthrough".to_string(),
+                ..Default::default()
+            }],
+            https: Some(HTTPSConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("https".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+                ssl_policy: None,
+                supports_http3: None,
+            }),
+            ..Default::default()
+        });
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "speeds-116.speedtest.net".to_string(),
+            passthrough_server.clone(),
+        );
+        let all_servers = vec![passthrough_server.clone()];
+        store
+            .update_config(
+                1,
+                1,
+                0,
+                0,
+                all_servers,
+                servers,
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                false,
+                "random".to_string(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(store.has_any_sni_passthrough_sync());
+        let route = store
+            .inspect_tls_route_sync("speeds-116.speedtest.net", 443)
+            .expect("TLS route should inspect configured host");
+        assert!(!route.has_l7_server);
+        assert_eq!(
+            route
+                .sni_passthrough_server
+                .map(|server| server.numeric_id()),
+            Some(7)
         );
     }
 
