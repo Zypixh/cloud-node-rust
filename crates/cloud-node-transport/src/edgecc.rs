@@ -5,23 +5,65 @@
 //! (§2.3), applies the [`Envelope`] safety ceiling (§2.5), and emits a
 //! congestion window + pacing rate through [`CongestionController`].
 //!
-//! # Single action committer (§2.4 单一控制权)
+//! # BDP-assignment work point (skyline-style, §2.4 改造)
 //!
-//! Every round the controller picks exactly ONE action, in strict
-//! priority:
+//! The window law is a direct assignment, not an incremental control:
+//! every ACK the inflight target is recomputed as
+//! `bw × base_rtt × gain × 1/(1−p)` — the measured BDP times a mode
+//! gain, inflated for the path's own quiet-path loss rate. Loss itself
+//! never shrinks the window: on high-p_rand WAN links the loss stream
+//! carries no congestion information, and collapsing the window on
+//! every random drop is what kept the old law pinned in recovery.
 //!
-//! 1. **Recovery/safety** — RTO, PRR fast recovery, belief response,
-//!    envelope set. Wins over everything.
-//! 2. **Startup/drain** — prior-seeded or exponential start, queue
-//!    drain to BDP.
-//! 3. **base_rtt refresh** — coordinated down-probe when the floor is
-//!    stale (§2.4 base_rtt 刷新).
-//! 4. **Bandwidth probe** — uncertainty-driven dose-response trial
-//!    (§2.4 不确定度驱动探测); at most one prober per aggregate (T6
-//!    arbitrates via [`crate::aggregate`]).
-//! 5. **Utility tune** — bounded ±ε paired trials (PCC-Vivace, D-E2).
-//! 6. **Steady state** — dual-mode work point: `delay_target` when the
-//!    delay signal is clean, `plateau_probe` when jitter swamps it.
+//! Two modes only:
+//!
+//! - **startup** — shared gain `STARTUP_GAIN` for cwnd and pacing;
+//!   exits to cruise on a bandwidth plateau (growth below
+//!   `STARTUP_GROWTH_RATIO` for `STARTUP_PLATEAU_ROUNDS` rounds) or on
+//!   a tripped guardrail. Without a bandwidth estimate it falls back
+//!   to ACK-clocked growth (TCP slow-start analog).
+//! - **cruise** — cwnd gain `CRUISE_INFLIGHT_GAIN` (deliberately
+//!   generous; the window only needs to not be the limiter) and pacing
+//!   gain `CRUISE_PACING_GAIN` — the pacing rate is the real limiter
+//!   and the >1.0 gain is how the bandwidth estimate keeps refreshing.
+//!
+//! The congestion signals are queue delay and ECN: when `qdelay`
+//! exceeds the tier-scaled guardrail threshold or a CE mark arrives,
+//! `queue_clamped` engages for that round and both gains drop to
+//! `GUARDRAIL_GAIN` (and loss inflation is suppressed — extra window
+//! is what the clamp drains). The envelope (§2.5) stays as an outer
+//! safety ceiling for strong-CE events and aggregate share caps; PRR
+//! bookkeeping still tracks recovery for observability but no longer
+//! governs the window — retransmission pacing is the stack's job.
+//!
+//! # Guardrail-blind paths (shallow-buffer, short-RTT)
+//!
+//! The delay guardrail is structurally blind where the bottleneck
+//! queue drains faster than the tier floor can measure: on a 5 ms RTT
+//! link one BDP of standing queue adds ~5 ms of delay, far under the
+//! T1 floor of 70 ms. Where `base_rtt < guardrail_thresh` the
+//! controller therefore substitutes loss-free rate evidence:
+//!
+//! - **slope bound on work rate** — the confirmed-delivered slope
+//!   (windowed / proven-peak / lifetime, all cum-based and immune to
+//!   per-sample ACK compression) caps the work estimate so inflated
+//!   delivery samples cannot detonate the BDP assignment;
+//! - **proven-window cap on inflight** — the target is additionally
+//!   clipped to ~3× the proven window (slope × RTT): nothing else
+//!   stops an inflated work rate from parking several buffer-loads in
+//!   the pipe;
+//! - **self-inflicted-loss clamp** — a loss taken while inflight
+//!   exceeds 1.5× the proven window is buffer-overflow evidence and
+//!   engages the clamp for ~2 srtt; a loss observed *after the flight
+//!   has drained below ~1.2× the proven window* disproves the
+//!   self-infliction hypothesis (external loss) and disables the test
+//!   for ~8 srtt. Drain-backlog drops are deliberately not counted as
+//!   disproof.
+//!
+//! On WAN paths (base_rtt ≥ threshold) none of this applies: the
+//! delay guardrail sees a standing queue, the work rate follows the
+//! EWMA estimate directly, and a stall-diluted slope bound would
+//! throttle the recovery burst — a self-fulfilling depression.
 //!
 //! `reason_code` records every mode/target change (§2.1.6 可审计).
 //!
@@ -37,6 +79,7 @@
 //! round began (BBR packet-conservation semantics, implemented via
 //! `cum_ack` vs the sent-total snapshot taken at round start).
 
+use crate::TransportInstant;
 use crate::cc::parts::{HyStart, HystartVerdict, Prr};
 use crate::cc::{CcSnapshot, CongestionController};
 use crate::envelope::Envelope;
@@ -44,112 +87,56 @@ use crate::inference::Inference;
 use crate::model::PathModel;
 use crate::rate_sample::RateSample;
 use crate::rtt::RttState;
-use crate::TransportInstant;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------
 // Pinned constants (§2.4; T10 may retune — not a runtime config surface)
 // ---------------------------------------------------------------------
 
-/// Startup pacing gain (BBR STARTUP `pacing_gain` = 2/ln(2) ≈ 2.89;
-/// plan §2.4 lists 2.77 as the candidate pending source check — we pin
-/// the BBR value, which is the documented source for this mechanism).
-const STARTUP_PACING_GAIN: f64 = 2.77;
+/// Startup gain — shared by the cwnd target and the pacing rate while
+/// the bandwidth estimate is still climbing (upstream `startup_gain`).
+const STARTUP_GAIN: f64 = 3.0;
 
 /// Prior-seeded start (§2.4 启动): pace at ~½ prior bandwidth, cap
 /// inflight at 1.5× prior BDP until verified by fresh delivery.
 const PRIOR_BW_GAIN: f64 = 0.5;
 const PRIOR_BDP_GAIN: f64 = 1.5;
 
-/// Full-bandwidth exit test: delivery rate must keep growing for this
-/// many consecutive rounds before startup considers the pipe full
-/// (BBR `full_bw_cnt` = 3 rounds within 25%).
-const FULL_BW_MARGIN: f64 = 0.25;
-const FULL_BW_ROUNDS: u32 = 3;
+/// Startup plateau exit (upstream `startup_growth_ratio` /
+/// `startup_plateau_rtts`): bandwidth growth below the ratio for this
+/// many consecutive rounds means the pipe is full — switch to cruise.
+const STARTUP_GROWTH_RATIO: f64 = 0.20;
+const STARTUP_PLATEAU_ROUNDS: u32 = 5;
 
-/// Delay-target mode: qdelay goal as a fraction of base_rtt (Copa-style
-/// δ; bounded so the target stays inside the tier budget).
-const D_TARGET_BASE_FRAC: f64 = 0.125;
-/// Bounded proportional rate step for delay-target mode
-/// (Copa window change is bounded per RTT; we bound the *rate* step).
-const DELAY_TARGET_STEP: f64 = 0.25;
+/// Cruise cwnd-target gain (upstream `cruise_inflight_gain`) —
+/// deliberately generous; the window only needs to not be the
+/// limiter, the pacing rate below is.
+const CRUISE_INFLIGHT_GAIN: f64 = 3.0;
+/// Cruise pacing gain (upstream `cruise_pacing_gain`) — the real rate
+/// limiter; >1.0 keeps the bandwidth estimate refreshing since cruise
+/// has no separate probing episode.
+const CRUISE_PACING_GAIN: f64 = 1.25;
+/// Guardrail gain (upstream `guardrail_gain`): applied to both the
+/// cwnd target and pacing while `queue_clamped` — an active cut to
+/// 80% of the measured rate, not merely "stop accelerating".
+const GUARDRAIL_GAIN: f64 = 0.8;
 
-/// Minimum probe duration (≥1 RTT per §2.4).
-const PROBE_MIN_RTTS: u32 = 1;
-/// Probe amplitude bounds as a fraction of bw_est — proportional to
-/// uncertainty but bounded (§2.4 探测幅度与不确定度成比例（有上下限）).
-const PROBE_AMP_MIN: f64 = 0.05;
-const PROBE_AMP_MAX: f64 = 0.5;
-/// Randomized horizon between spontaneous probes, in RTTs.
-const PROBE_HORIZON_RTTS_MIN: u32 = 8;
-const PROBE_HORIZON_RTTS_SPAN: u32 = 16;
-/// Accept a probe when delivered rate grew by at least this fraction of
-/// the attempted inflight increase (dose-response acceptance, BBRv3).
-const PROBE_ACCEPT_MIN_GAIN: f64 = 0.5;
+/// Loss-inflation cap on `p` in `1/(1−p)` (upstream
+/// `loss_inflation_max_ratio`, high-random-loss profile): at most
+/// ×2.0 send-rate compensation for the measured quiet-path loss rate.
+const LOSS_INFLATION_MAX: f64 = 0.5;
 
-/// Belief response (§2.4): `inflight_lo = inflight × (1 − β·belief)`;
-/// β caps the maximum single-round proportional cut.
-const BELIEF_BETA: f64 = 0.7;
-/// Belief above this is treated as congestion evidence for response.
-const BELIEF_RESPOND_MILLI: u32 = 650;
-
-/// Strong evidence → envelope set (§2.5): CE fraction or loss+qdelay.
+/// Strong evidence → envelope set (§2.5): CE fraction. Loss+qdelay no
+/// longer sets the ceiling — the per-round queue guardrail owns that
+/// response now and cannot ratchet the way a sticky ceiling could.
 const ENVELOPE_CE_FRAC: f64 = 0.5;
-const ENVELOPE_LOSS_QDELAY_BYTES: u64 = 4 * 1460;
-
-/// Steady pacing gain (deliver at estimated bandwidth, no overdrive).
-const STEADY_PACING_GAIN: f64 = 1.0;
-/// Delay-target mode pacing gain (Copa keeps a small margin).
-const DELAY_PACING_GAIN: f64 = 1.0;
-
-/// base_rtt refresh: when the floor has not been re-confirmed for this
-/// horizon, take a coordinated down-probe (BBR ProbeRTT analog; §2.4
-/// base_rtt 刷新 — bounded, never starves: capped at 4·MSS inflight for
-/// at most `BASE_RTT_PROBE_RTTS` rounds then refill).
-const BASE_RTT_STALE: Duration = Duration::from_secs(10);
-const BASE_RTT_PROBE_RTTS: u32 = 1;
-const BASE_RTT_PROBE_INFLIGHT_MSS: u64 = 4;
-
-/// Utility tuner (D-E2, PCC-Vivace bounded): ±ε fraction of the current
-/// rate, observation window in RTTs, cooldown between trials.
-const UTILITY_EPSILON: f64 = 0.05;
-const UTILITY_WINDOW_RTTS: u32 = 4;
-const UTILITY_COOLDOWN_RTTS: u32 = 8;
-/// Minimum lifetime (RTTs) and required stability before utility tuning
-/// may run (§2.4 受限使用).
-const UTILITY_MIN_AGE_RTTS: u32 = 5;
-/// Utility noise gate: a utility delta below this fraction of |U| is a
-/// tie — direction is not changed on noise.
-const UTILITY_NOISE_FRAC: f64 = 0.02;
-/// Fixed dimensionless weights for U = goodput^a − b·(rate·grad)+ −
-/// c·rate·loss (D-E1 initial values; T10 sweep may retune, data only).
-const UTILITY_A: f64 = 0.9;
-const UTILITY_B: f64 = 1.0;
-const UTILITY_C: f64 = 1.0;
-
-/// Dual-mode hysteresis (§2.4 切换带迟滞): delay mode requires the
-/// delay-signal quality above HI; it drops to plateau below LO.
-const DSQ_ENTER_HI: f64 = 0.6;
-const DSQ_EXIT_LO: f64 = 0.35;
-
-/// Inflight floor: never target below 4·MSS (RWND/loss liveness).
-/// Startup inflight cap once the model has a BDP estimate (BBR
-/// startup cwnd_gain ≈ 2×BDP): unbounded doubling + HyStart's 3-round
-/// fuse would otherwise overshoot a shallow buffer by ~an order of
-/// magnitude.
-const STARTUP_BDP_CAP: f64 = 2.0;
 
 const MIN_INFLIGHT_MSS: u64 = 4;
 
-/// Belief/loss-response inflight floor: 8×MSS, not the liveness floor —
-/// a window of ~4 MSS turns every tail loss into an RTO (no trailing
-/// segments left to generate the three dupacks fast recovery needs).
+/// Envelope floor unit: the ceiling never drops below the path's
+/// proven work point or this many MSS.
 const RESPOND_FLOOR_MSS: u64 = 8;
 
-/// Belief must hold above the gate for this many consecutive rounds
-/// before the proportional cut applies — a single borderline sample
-/// near the threshold must not pin the window (flicker → RTO churn).
-const BELIEF_RESPOND_ROUNDS: u32 = 2;
 /// Absolute inflight cap sanity bound (256 MiB — memory-governed paths
 /// enforce tighter caps externally; this only prevents u64 silliness).
 const MAX_INFLIGHT: u64 = 256 * 1024 * 1024;
@@ -158,12 +145,10 @@ const MAX_INFLIGHT: u64 = 256 * 1024 * 1024;
 pub mod modes {
     pub const PACED_START: &str = "paced_start";
     pub const STARTUP: &str = "startup";
-    pub const DRAIN: &str = "drain";
-    pub const DELAY_TARGET: &str = "delay_target";
-    pub const PLATEAU_PROBE: &str = "plateau_probe";
-    pub const PROBE: &str = "probe";
-    pub const UTILITY_TUNE: &str = "utility_tune";
-    pub const BASE_RTT_PROBE: &str = "base_rtt_probe";
+    pub const CRUISE: &str = "cruise";
+    /// Display mode while PRR fast recovery is in flight — the window
+    /// law is identical to cruise (BDP assignment), the token exists
+    /// only so /status can see recovery episodes.
     pub const RECOVERY: &str = "recovery";
 }
 
@@ -173,29 +158,20 @@ pub mod reasons {
     pub const PRIOR_START: &str = "prior_start";
     pub const PLATEAU_EXIT: &str = "plateau_exit";
     pub const HYSTART_EXIT: &str = "hystart_exit";
-    pub const LOSS_EXIT: &str = "loss_exit";
-    pub const CE_EXIT: &str = "ce_exit";
-    pub const DRAIN_DONE: &str = "drain_done";
-    pub const PROBE_START: &str = "probe_start";
-    pub const PROBE_ACCEPT: &str = "probe_accept";
-    pub const PROBE_REJECT: &str = "probe_reject";
-    pub const MODE_DELAY: &str = "mode_delay";
-    pub const MODE_PLATEAU: &str = "mode_plateau";
-    pub const BELIEF_RESPONSE: &str = "belief_response";
+    pub const GUARDRAIL: &str = "guardrail";
+    pub const RECOVERY_DONE: &str = "recovery_done";
     pub const CE_RESPONSE: &str = "ce_response";
     pub const RTO_RECOVER: &str = "rto_model_recover";
     pub const ENVELOPE_SET: &str = "envelope_set";
     pub const ENVELOPE_REFILL: &str = "envelope_refill";
-    pub const BASE_RTT_REFRESH: &str = "base_rtt_refresh";
     pub const IDLE_RESTART: &str = "idle_restart";
     pub const MSS_UPDATE: &str = "mss_update";
-    pub const UTILITY_TUNE: &str = "utility_tune";
-    pub const AGG_CLAMP: &str = "agg_clamp";
+    pub const LOSS_UNDO: &str = "loss_undo";
 }
 
-/// Business tier (§2.4 `Q_budget(tier)`): the self-queue delay budget
-/// the flow is allowed to stand. T0 = control progress, T1 =
-/// completion-time sensitive, T2 = bulk.
+/// Business tier (§2.4 `Q_budget(tier)`): the self-queue delay the
+/// flow is allowed to stand before the guardrail trips. T0 = control
+/// progress, T1 = completion-time sensitive, T2 = bulk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tier {
     /// Interactive / latency-sensitive: smallest queue budget.
@@ -208,7 +184,8 @@ pub enum Tier {
 }
 
 impl Tier {
-    /// Queue-delay budget for the dual-mode target and belief evidence.
+    /// Queue-delay budget used as belief evidence by [`Inference`]:
+    /// queue occupancy beyond this counts toward congestion belief.
     /// Relative to base_rtt where known; these are absolute floors.
     pub fn q_budget(&self, base_rtt: Option<Duration>) -> Duration {
         let base = base_rtt.unwrap_or(Duration::from_millis(50));
@@ -223,6 +200,22 @@ impl Tier {
             Tier::T2 => Duration::from_millis(15),
         };
         floor.max(Duration::from_micros(
+            (base.as_micros() as f64 * frac) as u64,
+        ))
+    }
+
+    /// Queue-delay guardrail threshold (upstream `max_queue_delay`):
+    /// `max(absolute floor, fraction × base_rtt)`. The T1 pair is the
+    /// upstream production default (70ms, 0.6); T0 tightens for
+    /// latency-sensitive traffic, T2 tolerates more standing queue.
+    pub fn guardrail_thresh(&self, base_rtt: Option<Duration>) -> Duration {
+        let base = base_rtt.unwrap_or(Duration::from_millis(50));
+        let (floor_ms, frac) = match self {
+            Tier::T0 => (40, 0.4),
+            Tier::T1 => (70, 0.6),
+            Tier::T2 => (120, 0.8),
+        };
+        Duration::from_millis(floor_ms).max(Duration::from_micros(
             (base.as_micros() as f64 * frac) as u64,
         ))
     }
@@ -242,63 +235,6 @@ pub struct PathPrior {
     pub alpha: f64,
     /// Confidence ∈ [0,1] — scales how much the prior seeds startup.
     pub confidence: f64,
-}
-
-/// Ablation switches (§7.4): each flag removes one mechanism so its
-/// marginal contribution is measurable against the full controller.
-/// All-false is the only production-valid value.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Ablations {
-    /// No uncertainty-driven bandwidth probes.
-    pub no_probe: bool,
-    /// No paired ±ε utility tuning.
-    pub no_utility: bool,
-    /// No belief-proportional inflight floor — loss recovery still
-    /// runs (PRR), only the belief-scaled cap is removed.
-    pub no_belief: bool,
-    /// Single steady mode: never enter plateau mode.
-    pub no_plateau: bool,
-}
-
-/// State of an in-flight dose-response / bandwidth probe.
-#[derive(Clone, Copy, Debug, Default)]
-struct Probe {
-    active: bool,
-    /// Inflight target before the probe (restore on reject).
-    base_inflight: u64,
-    /// Delivery rate baseline at probe start (bytes/s).
-    base_rate: u64,
-    /// Attempted inflight increase (bytes).
-    delta: u64,
-    /// Round count inside the probe.
-    rounds: u32,
-    /// Best delivery rate observed during the probe.
-    best_rate: u64,
-}
-
-/// Bounded PCC-Vivace utility tuner (D-E2). Paired ±ε trials: run at
-/// rate·(1+ε) for a window, rate·(1−ε) for a window, compare U; move
-/// the reference point toward the better side, hold on a tie.
-#[derive(Clone, Copy, Debug, Default)]
-struct Utility {
-    /// 0 = idle, 1 = high arm, 2 = low arm, 3 = decided/cooldown.
-    phase: u8,
-    /// Reference rate the trial orbits (bytes/s).
-    ref_rate: u64,
-    /// Accumulated utility inputs for the current arm.
-    arm_goodput: u64,
-    arm_loss: u64,
-    arm_grad_sum: f64,
-    arm_samples: u64,
-    /// Completed-arm utilities.
-    u_high: Option<f64>,
-    u_low: Option<f64>,
-    /// Rounds left in current arm.
-    rounds_left: u32,
-    /// Cooldown rounds before the next trial.
-    cooldown: u32,
-    /// Rounds since flow start (age gate).
-    age_rounds: u32,
 }
 
 /// Aggregate coordination handle (§2.6/T6). The controller *asks*;
@@ -351,36 +287,68 @@ pub struct EdgeCc {
     /// in_flight at previous rate sample (delta feeds inference).
     prev_in_flight: u64,
 
-    /// inflight_lo — belief-proportional floor-in-response cap (§2.4).
-    /// `None` when no belief response is active.
-    inflight_lo: Option<u64>,
-    /// Consecutive rounds with belief ≥ the response gate (hysteresis).
-    belief_hi_rounds: u32,
+    /// Queue-delay/ECN guardrail state — recomputed once per round,
+    /// never sticky: the round after the queue drains or CE marks
+    /// stop, the cruise gains apply again (upstream `queue_clamped`).
+    queue_clamped: bool,
+    /// CE bytes seen since the last round boundary — a fresh mark this
+    /// round trips the guardrail.
+    round_ce: bool,
+    /// Self-inflicted-loss guardrail (shallow-buffer paths): the
+    /// qdelay guardrail is blind where a full buffer drains faster
+    /// than an ACK can measure — on a 5 ms RTT link one BDP of queue
+    /// adds only ~5 ms, under the tier threshold floor. There, a loss
+    /// event while inflight exceeds 1.5× the slope-proven window IS
+    /// the congestion signal: a buffer overflow the flow itself
+    /// caused. `loss_clamp_until_us` engages `queue_clamped` for ~2
+    /// srtt; losses persisting through the clamp prove the loss was
+    /// external, so the test disables itself for ~8 srtt
+    /// (`loss_clamp_off_until_us`) to keep the loss-blind law honest.
+    /// `loss_clamp_off_shift` doubles the disable window on each
+    /// disproof (8→16→32→64 srtt): an honestly lossy path keeps
+    /// disproving, so the test backs off exponentially instead of
+    /// burning ~2 srtt of throughput per re-arm cycle. A truly
+    /// self-inflicted path never disproves — losses stop while the
+    /// clamp drains — so the shift stays low there.
+    /// All timestamps are transport µs.
+    loss_clamp_until_us: u64,
+    loss_clamp_off_shift: u32,
+    /// Loss events before this instant are the pre-clamp drops'
+    /// delayed marks — stale evidence that must not disarm the test.
+    loss_clamp_judge_us: u64,
+    /// The slope-proven window (bytes) captured when the clamp
+    /// engaged. The drain backlog keeps shedding self-inflicted drops
+    /// while inflight is still above it, so only a loss taken at or
+    /// below ~1.2× this window counts as external-loss disproof.
+    loss_clamp_bdp: u64,
+    loss_clamp_off_until_us: u64,
+    /// Latest transport instant seen (round boundary checks compare
+    /// against the clamp timestamps).
+    now_us: u64,
+    /// High-water mark of `bw_slope_proven` (B/s) — the best rate the
+    /// path demonstrably sustained for a full RTT. Slope measures
+    /// what the flow *achieved*, not what the path *can do*: a bare
+    /// `delivered × slack` cap is self-fulfilling (low pacing → low
+    /// slope → low cap → lower pacing) and locks in post-stall
+    /// depression. Bounding by the proven peak keeps the cap honest
+    /// without throttling recovery — the guardrails own the response
+    /// if the path genuinely degraded. Stored with its refresh
+    /// instant: a peak unproven for >4 s halves (per check) so a
+    /// permanently degraded path cannot hold a stale bound forever.
+    peak_slope: Option<(u64, u64)>,
 
     // --- startup ---
     hystart: HyStart,
-    startup_full_bw: u64,
-    startup_full_cnt: u32,
+    /// Consecutive rounds with bandwidth growth below
+    /// `STARTUP_GROWTH_RATIO` — the plateau exit counter.
+    plateau_rounds: u32,
+    /// Bandwidth estimate at the previous round boundary (plateau
+    /// comparison baseline).
+    prior_round_bw: u64,
     prior: Option<PathPrior>,
     /// Inflight cap applied until prior is validated (prior mode only).
     prior_inflight_cap: Option<u64>,
 
-    // --- steady state ---
-    probe: Probe,
-    /// Rounds until the next spontaneous uncertainty probe.
-    probe_horizon: u32,
-    /// Deterministic per-flow counter for randomized horizons (splitmix
-    /// of sent_total — deterministic replay needs no RNG import).
-    horizon_ctr: u64,
-    utility: Utility,
-    /// Probe permit borrowed from the aggregate (T6), if installed.
-    agg_permit_held: bool,
-    /// Probe trigger fired but the aggregate permit was denied —
-    /// reported via `wants_probe` so the arbiter can grant it later.
-    probe_want: bool,
-    /// Last time base_rtt floor was confirmed (now-derived).
-    base_rtt_confirmed_at: u64,
-    base_probe_rounds_left: u32,
     last_srtt: Option<Duration>,
     /// Aggregate lease (installed by the T6 wiring layer).
     /// Boxed trait object: the aggregate owns the shared state; the
@@ -388,18 +356,17 @@ pub struct EdgeCc {
     agg: Option<Box<dyn AggregateLease>>,
 
     // --- recovery ---
+    /// PRR bookkeeping: tracks fast-recovery episodes for the mode
+    /// display and loss accounting. Its cwnd output is deliberately
+    /// ignored — the BDP assignment owns the window in every state,
+    /// so the window never collapses inside recovery (upstream: "M2
+    /// owns cwnd directly in every CA state, bypassing PRR entirely").
     prr: Prr,
-    /// Eifel checkpoint: (inflight_target, mode) at loss entry.
-    saved: Option<(u64, &'static str)>,
-    /// Prior-good rate recorded at recovery entry (restore bound).
-    recovery_entry_rate: u64,
 
     /// Ablation flag (§2.9 LossBlindRef): when set, the belief path
     /// sees loss-blinded samples while the model still sees true loss
-    /// (recovery/PRR unchanged). Production controllers never set it.
+    /// (p_rand still needs it). Production controllers never set it.
     pub loss_blind: bool,
-    /// §7.4 per-mechanism ablation switches.
-    pub ablations: Ablations,
 }
 
 impl EdgeCc {
@@ -421,28 +388,24 @@ impl EdgeCc {
             round_end_cum: 0,
             rounds: 0,
             prev_in_flight: 0,
-            inflight_lo: None,
-            belief_hi_rounds: 0,
+            queue_clamped: false,
+            round_ce: false,
+            loss_clamp_until_us: 0,
+            loss_clamp_off_shift: 0,
+            loss_clamp_judge_us: 0,
+            loss_clamp_bdp: 0,
+            loss_clamp_off_until_us: 0,
+            now_us: 0,
+            peak_slope: None,
             hystart: HyStart::new(),
-            startup_full_bw: 0,
-            startup_full_cnt: 0,
+            plateau_rounds: 0,
+            prior_round_bw: 0,
             prior,
             prior_inflight_cap: None,
-            probe: Probe::default(),
-            probe_horizon: PROBE_HORIZON_RTTS_MIN,
-            horizon_ctr: 0x9e3779b97f4a7c15,
-            utility: Utility::default(),
-            agg_permit_held: false,
-            probe_want: false,
-            base_rtt_confirmed_at: 0,
-            base_probe_rounds_left: 0,
             last_srtt: None,
             agg: None,
             prr: Prr::default(),
-            saved: None,
-            recovery_entry_rate: 0,
             loss_blind: false,
-            ablations: Ablations::default(),
         };
         if let Some(p) = prior.filter(|p| p.bw_bps > 0 && p.confidence > 0.0) {
             // §2.4 启动: ~0.5× prior bw pacing, ≤1.5× prior BDP inflight,
@@ -451,8 +414,7 @@ impl EdgeCc {
             let seed_bw = (p.bw_bps as f64 * PRIOR_BW_GAIN * conf) as u64;
             let prior_bdp = (p.bw_bps as f64 * p.base_rtt.as_secs_f64()) as u64;
             cc.pacing_bps = seed_bw.max(1);
-            cc.prior_inflight_cap =
-                Some(((prior_bdp as f64 * PRIOR_BDP_GAIN) as u64).max(4 * mss));
+            cc.prior_inflight_cap = Some(((prior_bdp as f64 * PRIOR_BDP_GAIN) as u64).max(4 * mss));
             cc.inflight_target = cc.prior_inflight_cap.unwrap_or(4 * mss);
             cc.mode = modes::PACED_START;
             cc.reason = reasons::PRIOR_START;
@@ -475,10 +437,7 @@ impl EdgeCc {
         }
         self.model
             .set_bw_bounds(snap.bandwidth_hi_bps, snap.bandwidth_lo_bps);
-        let bw = snap
-            .bandwidth_lo_bps
-            .or(snap.bandwidth_hi_bps)
-            .unwrap_or(0);
+        let bw = snap.bandwidth_lo_bps.or(snap.bandwidth_hi_bps).unwrap_or(0);
         if bw > 0 {
             self.prior = Some(PathPrior {
                 bw_bps: bw,
@@ -494,29 +453,16 @@ impl EdgeCc {
                 confidence: 0.5,
             });
         }
-        self.mode = modes::DELAY_TARGET;
+        self.mode = modes::CRUISE;
         self.reason = "migrate_restore";
     }
 
-    /// SplitMix64 step for deterministic randomized horizons.
-    fn next_rand(&mut self) -> u64 {
-        self.horizon_ctr ^= self.sent_total;
-        self.horizon_ctr = self
-            .horizon_ctr
-            .wrapping_add(0x9e3779b97f4a7c15);
-        let mut z = self.horizon_ctr;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-        z ^ (z >> 31)
-    }
-
     /// The inflight target after every applicable cap — envelope §2.5,
-    /// belief response §2.4, aggregate share §2.6, sanity bounds.
+    /// aggregate share §2.6, sanity bounds. Loss is absent here by
+    /// design: random loss is not congestion evidence, so the window
+    /// is never cut for it.
     fn effective_target(&self) -> u64 {
         let mut t = self.inflight_target;
-        if let Some(lo) = self.inflight_lo {
-            t = t.min(lo);
-        }
         t = self.envelope.clamp(t);
         if let Some(cap) = self.agg.as_ref().and_then(|a| a.inflight_share_cap()) {
             t = t.min(cap);
@@ -535,92 +481,198 @@ impl EdgeCc {
         }
         if rs.cum_ack > self.round_end_cum {
             self.rounds = self.rounds.saturating_add(1);
-            self.utility.age_rounds = self.utility.age_rounds.saturating_add(1);
             self.round_end_cum = rs.cum_ack + 1; // provisional; on_sent re-arms
             return true;
         }
         false
     }
 
-    /// Dual-mode pick with hysteresis (§2.4 双模控制).
-    fn pick_steady_mode(&mut self) {
-        if self.ablations.no_plateau {
-            self.mode = modes::DELAY_TARGET;
-            return;
-        }
-        let quality = self.model.delay_signal_quality().unwrap_or(0.0);
-        match self.mode {
-            modes::DELAY_TARGET => {
-                if quality < DSQ_EXIT_LO {
-                    self.mode = modes::PLATEAU_PROBE;
-                    self.reason = reasons::MODE_PLATEAU;
-                }
-            }
-            _ => {
-                if quality > DSQ_ENTER_HI {
-                    self.mode = modes::DELAY_TARGET;
-                    self.reason = reasons::MODE_DELAY;
-                } else {
-                    self.mode = modes::PLATEAU_PROBE;
-                    self.reason = reasons::MODE_PLATEAU;
-                }
-            }
-        }
-    }
-
     /// The rate the work point paces at. `bw_est` is the honest EWMA
     /// point estimate; on random-loss paths the delivered stream sags
     /// while the windowed `bw_max` keeps the last proven rate — the gap
-    /// is itself the loss-vs-capacity signal (a congested link cannot
-    /// deliver bursts above its serialization rate). The max is bounded
-    /// by the probed `bw_hi` so a stale peak cannot overshoot a measured
-    /// dose-response ceiling.
+    /// is itself the loss-vs-capacity signal. The peak is allowed to
+    /// lift the estimate, but only by PEAK_LIFT: raw `bw_max` is a
+    /// 4-second max filter that ACK compression can poison with
+    /// back-to-back-burst samples many times the serialization rate —
+    /// pacing straight off it was what burst a 10 Mbps link into
+    /// 6× the retransmits of the loss path it was compensating for.
+    /// The final bound is `bw_slope`: the cum_ack slope over ~2 srtt
+    /// cannot be inflated by compression or stall-drains at all, so
+    /// work rate may exceed it only by SLOPE_SLACK.
     fn work_rate_bps(&self) -> Option<u64> {
+        const PEAK_LIFT_NUM: u64 = 3;
+        const PEAK_LIFT_DEN: u64 = 2;
         let est = self.model.bw_est();
         let max = self
             .model
             .bw_max()
             .map(|m| self.model.bw_hi().map_or(m, |hi| m.min(hi)));
-        match (est, max) {
-            (Some(e), Some(m)) => Some(e.max(m)),
-            (Some(e), None) => Some(e),
-            (None, m) => m,
-        }
+        let rate = match (est, max) {
+            (Some(e), Some(m)) => e.max(m.min(e.saturating_mul(PEAK_LIFT_NUM) / PEAK_LIFT_DEN)),
+            (Some(e), None) => e,
+            (None, m) => m?,
+        };
+        Some(match self.slope_bound() {
+            Some(bound) => rate.min(bound),
+            None => rate,
+        })
     }
 
-    /// Steady-state work point (§2.4 工作点):
-    /// `inflight = bw·base_rtt + Q_budget(tier)`, `pacing = bw·g`.
-    fn steady_work_point(&mut self) {
-        let bw = self.work_rate_bps();
-        let base = self.model.base_rtt();
-        let (bw, base) = match (bw, base) {
-            (Some(b), Some(r)) if b > 0 => (b, r),
-            _ => return, // no estimate yet — hold target
-        };
-        let q_budget = self.tier.q_budget(Some(base));
-        let queue_bytes = (bw as f64 * q_budget.as_secs_f64()) as u64;
-        let bdp = (bw as f64 * base.as_secs_f64()) as u64;
-        let work = bdp.saturating_add(queue_bytes).max(MIN_INFLIGHT_MSS * self.mss);
-
-        if self.mode == modes::DELAY_TARGET {
-            // Copa-style bounded proportional step toward d_target.
-            let d_target = q_budget.min(Duration::from_micros(
-                (base.as_micros() as f64 * D_TARGET_BASE_FRAC) as u64,
-            ));
-            let qd = self.model.qdelay();
-            let err = (d_target.as_secs_f64() - qd.as_secs_f64())
-                / d_target.as_secs_f64().max(1e-9);
-            let step = (err * DELAY_TARGET_STEP).clamp(-DELAY_TARGET_STEP, DELAY_TARGET_STEP);
-            let adjusted = (self.inflight_target as f64 * (1.0 + step)) as u64;
-            self.inflight_target = adjusted.max(MIN_INFLIGHT_MSS * self.mss).min(work.max(
-                MIN_INFLIGHT_MSS * self.mss,
-            ));
-            self.pacing_bps = (bw as f64 * DELAY_PACING_GAIN) as u64;
-        } else {
-            // Plateau mode: hold the BDP+budget work point.
-            self.inflight_target = work;
-            self.pacing_bps = (bw as f64 * STEADY_PACING_GAIN) as u64;
+    /// The hard bound the confirmed-delivery slope puts on any rate
+    /// derived from delivery samples — used ONLY on guardrail-blind
+    /// paths (base RTT below the tier's delay floor), where the queue
+    /// drains too fast for the delay guardrail to see and the estimate
+    /// is the only ceiling between ACK compression and a detonated
+    /// BDP assignment. The slope counts confirmed-delivered bytes over
+    /// real time, so it cannot be inflated by compressed samples —
+    /// but it CAN be diluted by stalls, so the peak/lifetime fallbacks
+    /// keep the bound alive across the drain epochs a shallow path
+    /// cycles through. While clamped the slack collapses to 1.0 —
+    /// 0.8 × (2×slope) still exceeds the delivered rate and a clamp
+    /// applied to the slackened bound could never drain the queue.
+    ///
+    /// Returns `None` on WAN paths (the delay guardrail is sighted
+    /// there — pacing follows the estimate) and when no slope exists
+    /// yet (the caller falls back to ACK-clocked growth). The floor is
+    /// a liveness guarantee, not an estimate: a degraded link can hold
+    /// the delivered slope near zero for whole windows, and capping
+    /// work rate at ~0 paces the flow into a death spiral (no sends →
+    /// no ACKs → slope stays 0).
+    fn slope_bound(&self) -> Option<u64> {
+        const SLOPE_SLACK: u64 = 2;
+        // The liveness floor's RTT input is floored at 1 ms: on
+        // retx-heavy paths Karn's rule starves honest samples and the
+        // surviving srtt can collapse to sub-ms noise, which would
+        // otherwise price the floor above the link itself.
+        let floor_rtt = self
+            .model
+            .base_rtt()
+            .or(self.last_srtt)
+            .unwrap_or(Duration::from_millis(50))
+            .max(Duration::from_millis(1));
+        let slope_floor = 4 * self.mss * 1_000_000 / floor_rtt.as_micros() as u64;
+        let slack = if self.queue_clamped { 1 } else { SLOPE_SLACK };
+        let windowed = self.model.bw_slope_windowed();
+        // The blindness test is the tier's own delay floor: if one
+        // base RTT of queue delay cannot reach the guardrail
+        // threshold, the guardrail can never see this path's
+        // congestion and the slope bound must carry the load —
+        // persistent across stalls so inflated catch-up bursts cannot
+        // re-detonate the shallow buffer.
+        let persistent = self
+            .model
+            .base_rtt()
+            .is_none_or(|b| b < self.tier.guardrail_thresh(Some(b)));
+        if !persistent {
+            // WAN regime: the delay guardrail sees the standing queue,
+            // so pacing needs no slope ceiling — and a stall-diluted
+            // bound would throttle the recovery burst into a
+            // self-fulfilling depression. The estimate (EWMA of
+            // confirmed-delivery samples) is honest here.
+            return None;
         }
+        let slope = [
+            windowed,
+            self.peak_slope.map(|(v, _)| v),
+            self.model.bw_slope_lifetime(),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        slope.map(|s| s.max(slope_floor).saturating_mul(slack))
+    }
+
+    /// Loss-rate compensation multiplier `1/(1−p)` (upstream M3). `p`
+    /// is the model's quiet-path loss baseline — loss taken while no
+    /// queue was building, i.e. the path's intrinsic drop rate, not
+    /// congestion collapse. The delivered-rate filter under-provisions
+    /// by exactly `(1−p)` on such a path, so every BDP-derived target
+    /// and the pacing rate are inflated by the reciprocal. Capped at
+    /// `LOSS_INFLATION_MAX` (×2.0) so a mis-measured path cannot run
+    /// away — the queue guardrail is the backstop either way.
+    fn loss_inflation(&self) -> f64 {
+        let p = self.model.p_rand().unwrap_or(0.0).min(LOSS_INFLATION_MAX);
+        1.0 / (1.0 - p).max(1e-9)
+    }
+
+    /// BDP assignment (upstream `skyline_bdp_packets`): the inflight
+    /// target is recomputed from the measured bandwidth and base RTT
+    /// every ACK — `bw × base_rtt × gain × inflation`, floored at the
+    /// liveness window. Returns `false` when the model has no estimate
+    /// yet (callers fall back to ACK-clocked growth).
+    ///
+    /// Loss inflation applies to the *window* only — inflight headroom
+    /// covers the retransmissions a lossy path needs in flight. It is
+    /// deliberately kept OUT of the pacing rate: pacing is the burst
+    /// maker, and letting the measured loss rate loosen the burst rate
+    /// is a positive feedback loop (overpaced bursts → tail drops →
+    /// p_rand up → faster bursts) that runs away on short-RTT links
+    /// where the queue drains before any delay guardrail can see it.
+    /// The slope cap on `bw` already bounds pacing to ~2× the rate the
+    /// path demonstrably delivers, and a pace bounded by delivered
+    /// slope self-stabilizes: drops can only lower the bound.
+    fn assign_bdp_target(&mut self, cwnd_gain: f64, pacing_gain: f64) -> bool {
+        // No slope estimate yet → nothing has been *proven* about the
+        // path, and the delivery filters can already be poisoned by
+        // compressed ACKs (the first few ACKs of a fast link report
+        // GB/s). Without the slope bound the BDP assignment would
+        // detonate the window inside the first RTT — the caller falls
+        // back to ACK-clocked growth, which is bounded by real data.
+        if self.model.bw_slope().is_none() {
+            return false;
+        }
+        // base_rtt falls back to the live srtt: on retx-heavy paths
+        // Karn's rule can starve min_rtt for whole episodes, and the
+        // ACK-clocked fallback paces off the raw delivery rate — which
+        // ACK compression inflates orders of magnitude past the link.
+        let rtt = self.model.base_rtt().or(self.last_srtt);
+        let (Some(bw), Some(base)) = (self.work_rate_bps(), rtt) else {
+            return false;
+        };
+        if bw == 0 {
+            return false;
+        }
+        // Loss inflation grants retx headroom — but only while the
+        // flow is *not* clamped. Once a guardrail says the pipe is
+        // overfilled, extra window is exactly what it is draining;
+        // carrying inflation through the clamp keeps inflight above
+        // the overflow point, losses continue, and the shallow-buffer
+        // detector reads its own tail as disproof and disarms.
+        let infl = if self.queue_clamped {
+            1.0
+        } else {
+            self.loss_inflation()
+        };
+        let bdp = bw as f64 * base.as_secs_f64();
+        let mut target = (bdp * cwnd_gain * infl) as u64;
+        // Proven-window cap (guardrail-blind paths only): where the
+        // delay guardrail cannot see the queue, nothing else stops a
+        // work-rate estimate inflated by compressed-ACK history from
+        // parking several buffer-loads in the pipe — the massacre
+        // driver on shallow buffers. `proven` is confirmed-delivered
+        // slope × RTT, so the cap self-adjusts to what the path
+        // demonstrably carried and never binds below it.
+        if self
+            .model
+            .base_rtt()
+            .is_none_or(|b| b < self.tier.guardrail_thresh(Some(b)))
+        {
+            let proven = [
+                self.model.bw_slope_windowed(),
+                self.peak_slope.map(|(v, _)| v),
+                self.model.bw_slope_lifetime(),
+            ]
+            .into_iter()
+            .flatten()
+            .max()
+            .map(|s| (s as u128 * base.as_micros().max(1) as u128 / 1_000_000).min(u64::MAX as u128) as u64);
+            if let Some(p) = proven {
+                target = target.min(p.saturating_mul(3));
+            }
+        }
+        self.inflight_target = target.max(MIN_INFLIGHT_MSS * self.mss);
+        self.pacing_bps = ((bw as f64 * pacing_gain) as u64).max(1);
+        true
     }
 
     /// Envelope floor (§2.5): the ceiling never drops below the path's
@@ -637,305 +689,38 @@ impl EdgeCc {
         proven.max(RESPOND_FLOOR_MSS * self.mss)
     }
 
-    /// Belief-proportional response (§2.4): one bounded cut per round,
-    /// `inflight_lo = inflight × (1 − β·belief)`. Never stacked with
-    /// envelope or model cuts for the same event (single committer).
-    fn belief_response(&mut self, in_flight: u64, round_done: bool) {
-        if self.ablations.no_belief {
-            return;
-        }
-        let belief_milli = self.infer.belief_milli();
-        if belief_milli >= BELIEF_RESPOND_MILLI {
-            if round_done {
-                self.belief_hi_rounds = self.belief_hi_rounds.saturating_add(1);
-            }
-            if self.belief_hi_rounds >= BELIEF_RESPOND_ROUNDS
-                || self.inflight_lo.is_some()
-            {
-                let keep = 1.0 - BELIEF_BETA * (belief_milli as f64 / 1000.0);
-                let lo = (in_flight.max(self.inflight_target) as f64 * keep) as u64;
-                self.inflight_lo = Some(lo.max(RESPOND_FLOOR_MSS * self.mss));
-                self.reason = reasons::BELIEF_RESPONSE;
-            }
-        } else {
-            if round_done {
-                self.belief_hi_rounds = 0;
-            }
-            if self.inflight_lo.is_some() {
-                // Belief decayed below the gate — release the cap
-                // gradually: refill toward the target, not an instant
-                // uncap.
-                let target = self.inflight_target;
-                let lo = self.inflight_lo.unwrap_or(target);
-                let next = lo + (target.saturating_sub(lo)) / 2;
-                self.inflight_lo =
-                    (next < target).then_some(next.max(MIN_INFLIGHT_MSS * self.mss));
-                if self.inflight_lo.is_none() {
-                    self.reason = reasons::ENVELOPE_REFILL;
-                }
-            }
-        }
-    }
-
-    /// Uncertainty-driven probe (§2.4): dose-response trial.
-    /// Trigger: high bw_sigma/bw_est, expired randomized horizon, or a
-    /// prior showing higher capacity. Requires the aggregate's single
-    /// probe permit (T6) — denied permits defer, never duplicate.
-    fn maybe_probe(&mut self, rs: &RateSample) {
-        if self.ablations.no_probe {
-            return;
-        }
-        if self.probe.active {
-            // Inside a trial: hold the raised inflight ≥1 RTT, then judge.
-            self.probe.rounds += 1;
-            self.probe.best_rate = self.probe.best_rate.max(rs.delivery_rate_bps());
-            if self.probe.rounds >= PROBE_MIN_RTTS {
-                let required = self.probe.base_rate
-                    + (self.probe.delta as f64 * PROBE_ACCEPT_MIN_GAIN
-                        / self.last_srtt.unwrap_or(Duration::from_millis(1)).as_secs_f64())
-                        as u64;
-                if self.probe.best_rate >= required {
-                    // Accept: keep the expanded work point; lift bw_lo.
-                    self.reason = reasons::PROBE_ACCEPT;
-                    let rate = self.probe.best_rate;
-                    let (hi, lo) = (self.model.bw_hi(), self.model.bw_lo());
-                    self.model
-                        .set_bw_bounds(hi, Some(lo.unwrap_or(0).max(rate)));
-                } else {
-                    // Reject: restore; the refusal is dose-response
-                    // evidence — record bw_hi at the attempted rate.
-                    // The bound can never fall below a rate the path
-                    // already proved (bw_max/bw_lo): a rejection caused
-                    // by random loss cannot disprove delivered rates.
-                    self.inflight_target = self.probe.base_inflight;
-                    let attempted = (self.probe.delta as f64
-                        / self.last_srtt.unwrap_or(Duration::from_millis(1)).as_secs_f64())
-                        as u64
-                        + self.probe.base_rate;
-                    let (hi, lo) = (self.model.bw_hi(), self.model.bw_lo());
-                    let proven = self.model.bw_max().unwrap_or(0).max(lo.unwrap_or(0));
-                    self.model.set_bw_bounds(
-                        Some(hi.map_or(attempted, |h| h.min(attempted)).max(proven)),
-                        lo,
-                    );
-                    self.reason = reasons::PROBE_REJECT;
-                }
-                self.probe = Probe::default();
-                self.release_probe_permit();
-                self.probe_horizon = PROBE_HORIZON_RTTS_MIN
-                    + (self.next_rand() as u32 % PROBE_HORIZON_RTTS_SPAN);
-            }
-            return;
-        }
-
-        if self.probe_horizon > 0 {
-            self.probe_horizon -= 1;
-        }
-        let uncertainty = match (self.model.bw_sigma(), self.model.bw_est()) {
-            (Some(s), Some(e)) if e > 0 => s as f64 / e as f64,
-            _ => 0.0,
-        };
-        let prior_says_more = self
-            .prior
-            .map(|p| {
-                p.bw_bps
-                    > self.model.bw_est().unwrap_or(0) * 2
-                    && p.confidence > 0.3
-            })
-            .unwrap_or(false);
-        let trigger = uncertainty > 0.3 || self.probe_horizon == 0 || prior_says_more;
-        if !trigger {
-            return;
-        }
-        // One prober per aggregate (§2.6).
-        if let Some(agg) = self.agg.as_mut() {
-            if !self.agg_permit_held && !agg.try_take_probe_permit() {
-                self.probe_want = true; // deferred, not duplicated
-                return;
-            }
-            self.agg_permit_held = true;
-        }
-        self.probe_want = false;
-        let amp = (PROBE_AMP_MIN + uncertainty).clamp(PROBE_AMP_MIN, PROBE_AMP_MAX);
-        let delta = (self.inflight_target as f64 * amp) as u64;
-        self.probe = Probe {
-            active: true,
-            base_inflight: self.inflight_target,
-            base_rate: self.model.bw_est().unwrap_or(0),
-            delta: delta.max(self.mss),
-            rounds: 0,
-            best_rate: 0,
-        };
-        self.inflight_target = self
-            .inflight_target
-            .saturating_add(delta.max(self.mss));
-        self.mode = modes::PROBE;
-        self.reason = reasons::PROBE_START;
-        // Causal-test window for the post-speedup loss check (§2.2).
-        self.model
-            .note_speedup(rs.now, self.last_srtt.unwrap_or(Duration::from_millis(10)) * 3);
-    }
-
-    fn release_probe_permit(&mut self) {
-        if self.agg_permit_held {
-            if let Some(agg) = self.agg.as_mut() {
-                agg.release_probe_permit();
-            }
-            self.agg_permit_held = false;
-        }
-    }
-
-    /// Bounded ±ε utility tuner (PCC-Vivace, D-E2). Two arms per trial,
-    /// each `UTILITY_WINDOW_RTTS` rounds, then a cooldown. Never runs
-    /// concurrently with a bandwidth probe (same coordinator, §2.4).
-    fn maybe_utility(&mut self, rs: &RateSample) {
-        if self.ablations.no_utility {
-            return;
-        }
-        let u = &mut self.utility;
-        u.arm_goodput += rs.delivered;
-        u.arm_loss += rs.lost;
-        u.arm_grad_sum += self.model.qdelay_grad_us_per_rtt();
-        u.arm_samples += 1;
-
-        if u.cooldown > 0 {
-            u.cooldown -= 1;
-            return;
-        }
-        if u.age_rounds < UTILITY_MIN_AGE_RTTS
-            || rs.is_app_limited
-            || self.probe.active
-            || self.mode == modes::RECOVERY
-        {
-            return;
-        }
-        if u.phase == 0 {
-            // Start a trial around the current pacing rate.
-            let Some(bw) = self.model.bw_est() else { return };
-            u.ref_rate = bw.max(1);
-            u.phase = 1;
-            u.rounds_left = UTILITY_WINDOW_RTTS;
-            u.arm_goodput = 0;
-            u.arm_loss = 0;
-            u.arm_grad_sum = 0.0;
-            u.arm_samples = 0;
-            self.mode = modes::UTILITY_TUNE;
-            self.reason = reasons::UTILITY_TUNE;
-            return;
-        }
-        if u.rounds_left > 0 {
-            u.rounds_left -= 1;
-            // Apply the arm's rate.
-            let sign = if u.phase == 1 { 1.0 } else { -1.0 };
-            let rate = (u.ref_rate as f64 * (1.0 + sign * UTILITY_EPSILON)) as u64;
-            self.pacing_bps = rate.max(1);
-            let base = self.model.base_rtt().unwrap_or(Duration::from_millis(50));
-            let bdp = (rate as f64 * base.as_secs_f64()) as u64;
-            self.inflight_target = (bdp as f64
-                + self.tier.q_budget(Some(base)).as_secs_f64() * rate as f64) as u64;
-            return;
-        }
-        // Arm complete: score it.
-        let norm = u.ref_rate.max(1) as f64;
-        let goodput = u.arm_goodput as f64;
-        let loss_rate = u.arm_loss as f64 / (u.arm_goodput + u.arm_loss).max(1) as f64;
-        let grad = (u.arm_grad_sum / u.arm_samples.max(1) as f64).max(0.0);
-        let util = goodput.powf(UTILITY_A)
-            - UTILITY_B * norm * grad.max(0.0)
-            - UTILITY_C * norm * loss_rate;
-        match u.phase {
-            1 => {
-                u.u_high = Some(util);
-                u.phase = 2;
-                u.rounds_left = UTILITY_WINDOW_RTTS;
-                u.arm_goodput = 0;
-                u.arm_loss = 0;
-                u.arm_grad_sum = 0.0;
-                u.arm_samples = 0;
-            }
-            2 => {
-                u.u_low = Some(util);
-                u.phase = 3;
-            }
-            _ => {
-                // Decide: move the reference toward the better arm;
-                // a tie below the noise gate holds position.
-                let (hi, lo) = (u.u_high.unwrap_or(0.0), u.u_low.unwrap_or(0.0));
-                let noise = hi.abs().max(lo.abs()).max(1.0) * UTILITY_NOISE_FRAC;
-                if hi - lo > noise {
-                    u.ref_rate = (u.ref_rate as f64 * (1.0 + UTILITY_EPSILON)) as u64;
-                } else if lo - hi > noise {
-                    u.ref_rate = (u.ref_rate as f64 * (1.0 - UTILITY_EPSILON)) as u64;
-                }
-                // Re-anchor the work point at the tuned rate.
-                let base = self.model.base_rtt().unwrap_or(Duration::from_millis(50));
-                let bdp = (u.ref_rate as f64 * base.as_secs_f64()) as u64;
-                self.inflight_target = (bdp as f64
-                    + self.tier.q_budget(Some(base)).as_secs_f64() * u.ref_rate as f64)
-                    as u64;
-                self.pacing_bps = u.ref_rate;
-                u.phase = 0;
-                u.u_high = None;
-                u.u_low = None;
-                u.cooldown = UTILITY_COOLDOWN_RTTS;
-                self.pick_steady_mode();
-            }
-        }
-    }
-
-    /// base_rtt coordinated down-probe (§2.4): when the floor is stale,
-    /// briefly hold inflight at 4·MSS to drain the queue and take a
-    /// clean sample. Never starves — bounded to BASE_RTT_PROBE_RTTS.
-    fn maybe_base_rtt_probe(&mut self, now: TransportInstant) -> bool {
-        if self.base_probe_rounds_left > 0 {
-            self.base_probe_rounds_left -= 1;
-            if self.base_probe_rounds_left == 0 {
-                self.pick_steady_mode();
-            }
-            return true;
-        }
-        let stale = now
-            .micros()
-            .saturating_sub(self.base_rtt_confirmed_at)
-            > BASE_RTT_STALE.as_micros() as u64
-            && self.base_rtt_confirmed_at > 0;
-        if stale && !self.probe.active && self.utility.phase == 0 {
-            self.mode = modes::BASE_RTT_PROBE;
-            self.reason = reasons::BASE_RTT_REFRESH;
-            self.base_probe_rounds_left = BASE_RTT_PROBE_RTTS;
-            self.inflight_target = BASE_RTT_PROBE_INFLIGHT_MSS * self.mss;
-            return true;
-        }
-        false
-    }
-
-    /// Strong-evidence → envelope set (§2.5). One set per round max.
+    /// Strong-evidence → envelope set (§2.5): a CE-majority ACK stream
+    /// is unambiguous congestion marking, so it still pins the safety
+    /// ceiling. Loss-with-queue no longer sets the envelope — the
+    /// per-round `queue_clamped` gain owns that response, and a sticky
+    /// ceiling is exactly what ratcheted lossy paths to the floor.
+    /// BBRv1 `lt_bw` policer verdicts still pin the pacing ceiling.
     fn envelope_check(&mut self, rs: &RateSample, in_flight: u64) {
-        let ce_strong = rs.delivered > 0
-            && (rs.delivered_ce as f64 / rs.delivered as f64) >= ENVELOPE_CE_FRAC;
-        let loss_qdelay = rs.lost >= ENVELOPE_LOSS_QDELAY_BYTES.min(rs.delivered + rs.lost)
-            && rs.lost > 0
-            && self.model.loss_congested(in_flight);
-        let policer = self.model.lt_bw().is_some();
-        if ce_strong || loss_qdelay {
+        let ce_strong =
+            rs.delivered > 0 && (rs.delivered_ce as f64 / rs.delivered as f64) >= ENVELOPE_CE_FRAC;
+        if ce_strong {
             let floor = self.envelope_floor();
-            self.envelope
-                .set_default_floored(in_flight.max(self.mss), floor, reasons::ENVELOPE_SET);
-            if ce_strong {
-                self.reason = reasons::CE_RESPONSE;
-            }
+            self.envelope.set_default_floored(
+                in_flight.max(self.mss),
+                floor,
+                reasons::ENVELOPE_SET,
+            );
+            self.reason = reasons::CE_RESPONSE;
         }
-        if policer {
-            // BBRv1 lt_bw verdict pins the rate ceiling too.
-            if let Some(lt) = self.model.lt_bw() {
-                self.pacing_bps = self.pacing_bps.min(lt);
-            }
+        if let Some(lt) = self.model.lt_bw() {
+            self.pacing_bps = self.pacing_bps.min(lt);
         }
     }
 }
 
 impl CongestionController for EdgeCc {
-    fn on_sent(&mut self, _now: TransportInstant, bytes: u64, _in_flight: u64, _is_app_limited: bool) {
+    fn on_sent(
+        &mut self,
+        _now: TransportInstant,
+        bytes: u64,
+        _in_flight: u64,
+        _is_app_limited: bool,
+    ) {
         self.sent_total = self.sent_total.saturating_add(bytes);
         self.prr.note_sent(bytes);
         // Arm the next round boundary at the latest sent edge — a round
@@ -947,6 +732,7 @@ impl CongestionController for EdgeCc {
 
     fn on_rate_sample(&mut self, rs: &RateSample, in_flight: u64, rtt: &RttState) {
         let now = rs.now;
+        self.now_us = now.micros();
         let in_flight_delta = in_flight as i64 - self.prev_in_flight as i64;
         self.prev_in_flight = in_flight;
         if let Some(s) = rtt.srtt {
@@ -957,6 +743,19 @@ impl CongestionController for EdgeCc {
         // LossBlind ablation zeroes the belief-path loss evidence only —
         // the model still gets true loss (recovery and p_rand need it).
         self.model.on_rate_sample(rs, in_flight, rtt);
+        if let Some(s) = self.model.bw_slope_proven() {
+            match self.peak_slope {
+                Some((p, _)) if s <= p => {}
+                _ => self.peak_slope = Some((s, now.micros())),
+            }
+        }
+        // Decay an unproven peak — a stale bound must not outlive the
+        // path's demonstrated capacity indefinitely.
+        if let Some((p, t)) = self.peak_slope
+            && now.micros().saturating_sub(t) > 4_000_000
+        {
+            self.peak_slope = Some((p / 2, now.micros()));
+        }
         let rtt_d = rtt.srtt.or(rs.rtt).unwrap_or(Duration::from_millis(1));
         let belief_sample;
         let rs_for_belief = if self.loss_blind {
@@ -974,24 +773,59 @@ impl CongestionController for EdgeCc {
             rtt_d,
         );
 
-        // Round bookkeeping: base_rtt floor re-confirmation.
-        if let Some(base) = self.model.base_rtt()
-            && let Some(r) = rs.rtt
-            && r <= base + base / 8
-        {
-            self.base_rtt_confirmed_at = now.micros();
-        }
-        if self.base_rtt_confirmed_at == 0 {
-            self.base_rtt_confirmed_at = now.micros();
-        }
+        // Fresh CE this round feeds the guardrail at the boundary.
+        self.round_ce |= rs.delivered_ce > 0;
+
         let round_done = self.maybe_advance_round(rs);
         if round_done {
+            // The guardrail is the only congestion signal left: queue
+            // delay above the tier threshold or a fresh CE mark.
+            // Recomputed every round, never sticky (upstream
+            // `queue_clamped`) — the round after the queue drains the
+            // cruise gains apply again.
+            self.queue_clamped = self.model.qdelay()
+                > self.tier.guardrail_thresh(self.model.base_rtt())
+                || self.round_ce
+                || self.now_us < self.loss_clamp_until_us;
+            self.round_ce = false;
+            if self.queue_clamped {
+                self.reason = reasons::GUARDRAIL;
+            }
+
             self.envelope.on_round(self.infer.belief_milli());
             if self.envelope.reason_code() == reasons::ENVELOPE_REFILL {
                 self.reason = reasons::ENVELOPE_REFILL;
             }
+
+            // Startup plateau bookkeeping (upstream): bandwidth growth
+            // below STARTUP_GROWTH_RATIO for STARTUP_PLATEAU_ROUNDS
+            // consecutive rounds means the pipe is full; a tripped
+            // guardrail exits immediately. The estimate is compared at
+            // round granularity — per-ACK max-filter spikes would
+            // otherwise reset the counter forever on lossy paths.
+            if matches!(self.mode, modes::STARTUP | modes::PACED_START) {
+                let bw = self.work_rate_bps().unwrap_or(0);
+                if self.prior_round_bw > 0
+                    && (bw as f64) < self.prior_round_bw as f64 * (1.0 + STARTUP_GROWTH_RATIO)
+                {
+                    self.plateau_rounds = self.plateau_rounds.saturating_add(1);
+                } else {
+                    self.plateau_rounds = 0;
+                }
+                self.prior_round_bw = bw;
+                if self.plateau_rounds >= STARTUP_PLATEAU_ROUNDS || self.queue_clamped {
+                    self.mode = modes::CRUISE;
+                    self.reason = if self.queue_clamped {
+                        reasons::GUARDRAIL
+                    } else {
+                        reasons::PLATEAU_EXIT
+                    };
+                    self.prior_inflight_cap = None; // prior validated
+                }
+            }
+
             // Per-round member report to the aggregate (§2.6): RFC 8382
-            // correlation inputs + allocation fields + probe intent.
+            // correlation inputs + allocation fields.
             if let Some(agg) = self.agg.as_ref() {
                 agg.push_stats(crate::aggregate::MemberStats {
                     loss_times_us: self.infer.sbd.loss_times_us,
@@ -1001,40 +835,35 @@ impl CongestionController for EdgeCc {
                     rate_bps: self.model.bw_last_sample(),
                     tier: self.tier as u8,
                     progress_ctr: self.rounds as u64,
-                    wants_probe: self.probe_want,
+                    wants_probe: false,
                 });
             }
         }
 
-        // ---- single action committer, strict priority ----
+        // ---- single action committer ----
 
-        // 1. Recovery: PRR window law while active.
+        // Safety ceiling: strong-CE envelope set + policer pin. Neither
+        // consumes the round's action — the committer assigns below.
+        self.envelope_check(rs, in_flight);
+
+        // PRR bookkeeping advances so recovery exit is observable; its
+        // cwnd output is ignored — the BDP assignment owns the window
+        // in every state, recovery included.
         if self.prr.active {
-            if let Some(cwnd) = self.prr.on_ack(
+            let _ = self.prr.on_ack(
                 rs.delivered,
                 rs.cum_ack,
                 in_flight,
                 self.effective_target(),
                 self.mss,
                 now,
-            ) {
-                self.inflight_target = cwnd;
-                if !self.prr.active {
-                    self.mode = modes::DRAIN;
-                    self.reason = reasons::DRAIN_DONE;
-                    self.saved = None;
-                }
+            );
+            if !self.prr.active && self.mode == modes::RECOVERY {
+                self.mode = modes::CRUISE;
+                self.reason = reasons::RECOVERY_DONE;
             }
-            return;
         }
 
-        // Envelope set + belief response are safety actions — they
-        // adjust caps but don't consume the round's committer slot;
-        // the committer only picks mode/target below.
-        self.envelope_check(rs, in_flight);
-        self.belief_response(in_flight, round_done);
-
-        // 2. Startup / paced start.
         match self.mode {
             modes::STARTUP | modes::PACED_START => {
                 if self.hystart.baseline_min().is_none()
@@ -1042,108 +871,102 @@ impl CongestionController for EdgeCc {
                 {
                     self.hystart.seed_baseline(b, self.sent_total);
                 }
-                match self.hystart.on_ack(rs.rtt, rs.cum_ack, self.sent_total) {
-                    HystartVerdict::Exit => {
-                        self.mode = modes::DRAIN;
-                        self.reason = reasons::HYSTART_EXIT;
-                        return;
-                    }
-                    HystartVerdict::ElevatedRound => {}
-                    HystartVerdict::Continue => {}
-                }
-                // Exponential-ish start: grow inflight by the delivered
-                // bytes (ABC) while pacing at the startup gain.
-                self.inflight_target = self
-                    .inflight_target
-                    .saturating_add(rs.acked_sacked)
-                    .min(self.prior_inflight_cap.unwrap_or(MAX_INFLIGHT));
-                // Cap = STARTUP_BDP_CAP × work_rate × base_rtt. base_rtt
-                // (not srtt) — a growing queue inflates srtt and would
-                // raise the cap with the very overshoot it bounds.
-                if let (Some(bw), Some(base)) =
-                    (self.work_rate_bps(), self.model.base_rtt())
+                if self.hystart.on_ack(rs.rtt, rs.cum_ack, self.sent_total) == HystartVerdict::Exit
                 {
-                    let bdp = bw as f64 * base.as_secs_f64();
-                    let capped = ((bdp * STARTUP_BDP_CAP) as u64)
-                        .max(MIN_INFLIGHT_MSS * self.mss);
-                    self.inflight_target = self.inflight_target.min(capped);
-                }
-                // Pacing must never collapse when the sampler has no
-                // interval yet (delivery_rate_bps()==0): fall back to
-                // inflight_target/rtt — the rate a full window implies.
-                let bw = rs.delivery_rate_bps().max(
-                    (self.inflight_target as u128 * 1_000_000
-                        / rtt_d.as_micros().max(1)) as u64,
-                );
-                self.pacing_bps = (bw as f64 * STARTUP_PACING_GAIN) as u64;
-                // Full-bandwidth exit: delivery stops growing.
-                if round_done && !rs.is_app_limited {
-                    let rate = rs.delivery_rate_bps();
-                    if rate >= self.startup_full_bw
-                        && rate <= self.startup_full_bw + self.startup_full_bw / 4
-                    {
-                        self.startup_full_cnt += 1;
-                    } else if rate as f64
-                        > self.startup_full_bw as f64 * (1.0 + FULL_BW_MARGIN)
-                    {
-                        self.startup_full_cnt = 0;
-                        self.startup_full_bw = rate;
-                    }
-                    if self.startup_full_cnt >= FULL_BW_ROUNDS {
-                        self.mode = modes::DRAIN;
-                        self.reason = reasons::PLATEAU_EXIT;
-                        self.prior_inflight_cap = None; // prior validated
-                        return;
-                    }
-                }
-                // Loss/CE exit from startup (§2.4: 丢包与 CE 负责退出).
-                if rs.lost >= self.mss || (rs.delivered_ce > 0 && rs.delivered > 0) {
-                    self.mode = modes::DRAIN;
-                    self.reason = if rs.lost > 0 {
-                        reasons::LOSS_EXIT
-                    } else {
-                        reasons::CE_EXIT
-                    };
+                    self.mode = modes::CRUISE;
+                    self.reason = reasons::HYSTART_EXIT;
+                    self.prior_inflight_cap = None;
                     return;
                 }
-                return;
-            }
-            modes::DRAIN => {
-                // Drain to BDP, then steady state.
-                if let Some(bdp) = self.model.bdp_est() {
+                let gain = if self.queue_clamped {
+                    GUARDRAIL_GAIN
+                } else {
+                    STARTUP_GAIN
+                };
+                // Direct BDP assignment once the model has estimates —
+                // before that, ACK-clocked growth (TCP slow start).
+                // A seeded prior stands in until fresh samples land.
+                let prior_bw = self.prior.map(|p| {
+                    (p.bw_bps as f64 * PRIOR_BW_GAIN * p.confidence.clamp(0.0, 1.0)) as u64
+                });
+                if self.work_rate_bps().is_none() && prior_bw.is_some() {
+                    let bw = prior_bw.unwrap_or(0).max(1);
+                    let base = self.prior.map(|p| p.base_rtt).unwrap_or_else(|| rtt_d);
+                    let infl = self.loss_inflation();
+                    let bdp = bw as f64 * base.as_secs_f64();
+                    self.inflight_target = ((bdp * gain * infl) as u64)
+                        .max(MIN_INFLIGHT_MSS * self.mss)
+                        .min(self.prior_inflight_cap.unwrap_or(MAX_INFLIGHT));
+                    // Same rule as `assign_bdp_target`: inflation
+                    // grants window headroom, never burst rate — a
+                    // poisoned prior p_rand must not loosen pacing.
+                    self.pacing_bps = ((bw as f64 * gain) as u64).max(1);
+                    return;
+                }
+                if !self.assign_bdp_target(gain, gain) {
                     self.inflight_target = self
                         .inflight_target
-                        .min(bdp.max(MIN_INFLIGHT_MSS * self.mss));
-                    self.pick_steady_mode();
-                    return;
+                        .saturating_add(rs.acked_sacked)
+                        .min(self.prior_inflight_cap.unwrap_or(MAX_INFLIGHT));
+                    // Pacing must never collapse when the sampler has no
+                    // interval yet (delivery_rate_bps()==0): fall back to
+                    // inflight_target/rtt — the rate a full window implies.
+                    // The raw delivery rate is ACK-compression-inflated on
+                    // exactly the retx-heavy paths that land here (Karn
+                    // starves base_rtt → BDP assignment unavailable), so it
+                    // passes through the same slope bound as work_rate —
+                    // and so does the window-implied rate: its `rtt_d` can
+                    // be a starved sub-ms srtt, which unbounded would
+                    // price a full window far above the link.
+                    let bound = self.slope_bound();
+                    let delivery = bound.map_or_else(|| rs.delivery_rate_bps(), |b| {
+                        rs.delivery_rate_bps().min(b)
+                    });
+                    let floor_rtt = rtt_d.max(Duration::from_millis(1));
+                    let implied = (self.inflight_target as u128 * 1_000_000
+                        / floor_rtt.as_micros() as u128)
+                        .min(u64::MAX as u128) as u64;
+                    // Blind paths pace at min(delivery, window-implied):
+                    // before any slope exists the delivery sample is the
+                    // most compression-inflated value on the path, and a
+                    // window-bounded flow cannot sustain more than
+                    // inflight/rtt anyway. WAN paths keep max() — the
+                    // post-RTO catch-up burst is legitimate rate there
+                    // and the queue guardrail watches the buffer. The
+                    // split is on the path's blindness, not on whether a
+                    // slope happens to exist yet: a blind path with no
+                    // slope sample still bursts through max().
+                    let persistent = self
+                        .model
+                        .base_rtt()
+                        .is_none_or(|b| b < self.tier.guardrail_thresh(Some(b)));
+                    let bw = if persistent {
+                        delivery.min(implied).min(bound.unwrap_or(u64::MAX))
+                    } else {
+                        delivery.max(implied)
+                    };
+                    self.pacing_bps = (bw as f64 * gain) as u64;
                 }
-                self.inflight_target =
-                    (self.inflight_target as f64 * 0.9) as u64;
-                if self.inflight_target <= MIN_INFLIGHT_MSS * self.mss * 2 {
-                    self.pick_steady_mode();
+                if let Some(cap) = self.prior_inflight_cap {
+                    self.inflight_target = self.inflight_target.min(cap);
                 }
-                return;
             }
-            _ => {}
+            _ => {
+                // Cruise — and recovery, which shares the same law: the
+                // window is the BDP assignment regardless of loss state.
+                let cwnd_gain = if self.queue_clamped {
+                    GUARDRAIL_GAIN
+                } else {
+                    CRUISE_INFLIGHT_GAIN
+                };
+                let pacing_gain = if self.queue_clamped {
+                    GUARDRAIL_GAIN
+                } else {
+                    CRUISE_PACING_GAIN
+                };
+                self.assign_bdp_target(cwnd_gain, pacing_gain);
+            }
         }
-
-        // 3. base_rtt refresh (bounded down-probe).
-        if self.maybe_base_rtt_probe(now) {
-            return;
-        }
-
-        // 4/5. Probe / utility (never concurrent — same coordinator).
-        self.maybe_probe(rs);
-        if self.probe.active {
-            return;
-        }
-        self.maybe_utility(rs);
-        if self.utility.phase != 0 && self.utility.cooldown == 0 {
-            return;
-        }
-
-        // 6. Steady state.
-        self.steady_work_point();
     }
 
     fn on_loss_event(
@@ -1162,114 +985,116 @@ impl CongestionController for EdgeCc {
             self.on_rto(now, in_flight);
             return;
         }
+        // Self-inflicted-loss test (shallow-buffer guardrail): drops
+        // while inflight exceeds 1.5× the slope-proven window are
+        // buffer-overflow evidence — the only congestion signal a
+        // short-RTT path can produce, since its queue drains before
+        // the delay guardrail could ever measure it. Engage the clamp
+        // for ~2 srtt; a loss landing while clamped proves the loss
+        // was not ours, so the test then disables itself for ~8 srtt
+        // rather than throttle an honestly random-loss path.
+        let now_us = now.micros();
+        self.now_us = self.now_us.max(now_us);
+        let srtt_us = self
+            .last_srtt
+            .or_else(|| self.model.base_rtt())
+            .unwrap_or(Duration::from_millis(50))
+            .as_micros() as u64;
+        let pre_loss_inflight = in_flight.saturating_add(lost_bytes) as u128;
+        if now_us < self.loss_clamp_until_us && now_us >= self.loss_clamp_judge_us {
+            // Loss persisted past the judge point — but the drain
+            // backlog sheds self-inflicted drops while inflight is
+            // still above the proven window, so only a loss taken at
+            // or below ~1.2× that window proves the loss was external.
+            if pre_loss_inflight <= self.loss_clamp_bdp as u128 * 6 / 5 {
+                self.loss_clamp_until_us = 0;
+                let off = (8 * srtt_us).saturating_mul(1 << self.loss_clamp_off_shift.min(3));
+                self.loss_clamp_off_until_us = now_us.saturating_add(off);
+                self.loss_clamp_off_shift = (self.loss_clamp_off_shift + 1).min(3);
+            }
+        } else if now_us >= self.loss_clamp_until_us && now_us >= self.loss_clamp_off_until_us {
+            // No slope estimate → nothing proven → cannot tell our
+            // overflow from the path's; stay loss-blind.
+            let proven = [
+                self.model.bw_slope_windowed(),
+                self.peak_slope.map(|(v, _)| v),
+                self.model.bw_slope_lifetime(),
+            ]
+            .into_iter()
+            .flatten()
+            .max()
+            .zip(self.model.base_rtt().or(self.last_srtt))
+            .map(|(s, b)| s as u128 * b.as_micros().max(1) as u128 / 1_000_000);
+            if proven.is_some_and(|p| pre_loss_inflight > p.saturating_mul(3) / 2) {
+                self.loss_clamp_until_us = now_us.saturating_add(2 * srtt_us);
+                self.loss_clamp_judge_us = now_us.saturating_add(srtt_us);
+                self.loss_clamp_bdp = proven.unwrap_or(0).min(u64::MAX as u128) as u64;
+                // Engage now — recomputation at the next round
+                // boundary keeps it while the timestamp is live.
+                self.queue_clamped = true;
+                self.reason = reasons::GUARDRAIL;
+            }
+        }
+        // Fast-recovery bookkeeping only: the window is the BDP
+        // assignment in every state, so a loss event never cuts it.
+        // The RECOVERY display mode marks the episode for /status;
+        // startup is exempt — a loss there does not exit startup
+        // (upstream: CA state never changes the M2 mode).
         if !self.prr.active {
-            self.saved = self
-                .saved
-                .or(Some((self.inflight_target, self.mode)));
-            self.recovery_entry_rate = self.model.bw_est().unwrap_or(0);
-            // Envelope: loss is strong evidence only with a real queue
-            // behind it (§2.5) — occupancy test, not the stall-inflated
-            // RTT-derived qdelay.
-            if self.model.loss_congested(in_flight) {
-                let floor = self.envelope_floor();
-                self.envelope
-                    .set_default_floored(in_flight.max(self.mss), floor, reasons::ENVELOPE_SET);
-            }
-            // Belief-proportional inflight_lo (single cut, no stacking)
-            // — but only when there is congestion evidence behind this
-            // loss. On a quiet path (no queue occupancy, belief below
-            // the respond gate) the loss is random; cutting the window
-            // on every random drop keeps the flight so small that the
-            // next tail loss is guaranteed → RTO loop at minimum
-            // throughput. PRR still tracks retransmission either way.
-            if !self.ablations.no_belief {
-                let evidenced = self.model.loss_congested(in_flight)
-                    || self.infer.belief_milli() >= BELIEF_RESPOND_MILLI;
-                self.inflight_lo = if evidenced {
-                    let keep = 1.0 - BELIEF_BETA * self.infer.belief();
-                    Some(((in_flight as f64 * keep) as u64).max(RESPOND_FLOOR_MSS * self.mss))
-                } else {
-                    None
-                };
-            }
             self.prr.enter(in_flight, self.sent_total + 1);
-            self.mode = modes::RECOVERY;
-            self.reason = reasons::LOSS_EXIT;
-            self.release_probe_permit();
-            self.probe = Probe::default();
-            self.utility.phase = 0;
+            if !matches!(self.mode, modes::STARTUP | modes::PACED_START) {
+                self.mode = modes::RECOVERY;
+            }
         }
     }
 
     fn on_ecn_ce(&mut self, now: TransportInstant, ce_bytes: u64, delivered: u64, in_flight: u64) {
-        // Classic-ECN once-per-window event: the model's per-ACK EWMA
-        // sees byte-grain fractions; a classic event is coarser — feed
-        // belief through the inference path only (already done in
-        // on_rate_sample via delivered_ce), and respond here at
-        // event granularity (§2.4: CE 比例充分 → alpha 型响应).
+        // Classic-ECN once-per-window event: a CE mark is guardrail
+        // evidence — engage the clamp now (it is recomputed each round,
+        // so this can only hold for the remainder of the round) and
+        // record it for the boundary evaluation. A CE-majority window
+        // is unambiguous congestion: pin the envelope too (§2.5).
         let _ = now;
+        self.round_ce = true;
+        self.queue_clamped = true;
         if delivered > 0 && ce_bytes * 2 >= delivered {
             let floor = self.envelope_floor();
-            self.envelope
-                .set_default_floored(in_flight.max(self.mss), floor, reasons::ENVELOPE_SET);
+            self.envelope.set_default_floored(
+                in_flight.max(self.mss),
+                floor,
+                reasons::ENVELOPE_SET,
+            );
             self.reason = reasons::CE_RESPONSE;
         }
     }
 
-    fn on_rto(&mut self, now: TransportInstant, in_flight: u64) {
+    fn on_rto(&mut self, now: TransportInstant, _in_flight: u64) {
         let _ = now;
-        // RTO is strong evidence only with congestion corroboration
-        // (§2.5: 强证据 → envelope). A timeout on a quiet path is tail
-        // or random loss — pinning the ceiling to the drained inflight
-        // would ratchet high-p_rand paths to the floor on every
-        // retransmit timer. With an elevated queue or accumulated
-        // belief the RTO still sets the envelope as before.
-        if self.model.loss_congested(in_flight)
-            || self.infer.belief_milli() >= BELIEF_RESPOND_MILLI
-        {
-            let floor = self.envelope_floor();
-            self.envelope
-                .set_default_floored(in_flight.max(self.mss), floor, reasons::ENVELOPE_SET);
-            self.inflight_lo = Some(MIN_INFLIGHT_MSS * self.mss);
-            self.inflight_target = MIN_INFLIGHT_MSS * self.mss;
-            self.pacing_bps = 0;
-        } else {
-            // Quiet-path timeout: no queue behind the loss and no
-            // accumulated belief — the RTO is a tail/random-loss
-            // artifact, not a capacity signal. Collapsing the target
-            // to the floor here would restart the whole growth climb
-            // on every retransmit timer on high-p_rand paths; hold
-            // the proven work point instead (still bounded by the
-            // envelope, still paced so the retransmit burst is
-            // spread rather than line-rate).
-            self.inflight_lo = None;
-            self.inflight_target = self.inflight_target.max(MIN_INFLIGHT_MSS * self.mss);
-            if self.pacing_bps == 0 {
-                self.pacing_bps = self.model.bw_est().unwrap_or(0);
-            }
-        }
+        // A timeout is loss evidence, and loss never shrinks the
+        // window: the retransmit timer already paces the retry, and
+        // collapsing the target on every RTO is what livelocked
+        // high-p_rand paths. Keep the BDP-assigned work point (still
+        // bounded by the envelope); reset the recovery bookkeeping.
         self.prr = Prr::default();
-        self.probe = Probe::default();
-        self.release_probe_permit();
-        self.utility.phase = 0;
-        self.mode = modes::STARTUP;
+        if self.mode == modes::RECOVERY {
+            self.mode = modes::CRUISE;
+        }
+        if self.pacing_bps == 0 {
+            self.pacing_bps = self.work_rate_bps().unwrap_or(0);
+        }
         self.reason = reasons::RTO_RECOVER;
-        self.startup_full_bw = 0;
-        self.startup_full_cnt = 0;
     }
 
     fn on_loss_undo(&mut self, now: TransportInstant) {
-        // Eifel/DSACK: restore the checkpointed target and mode; the
-        // model's spurious accounting adjusts belief separately.
+        // Eifel/DSACK: the window was never reduced, so there is
+        // nothing to restore — only the model's spurious accounting.
         self.model.note_spurious_retx(self.mss);
         self.infer.note_spurious_retx();
-        if let Some((target, mode)) = self.saved.take() {
-            self.inflight_target = target;
-            self.inflight_lo = None;
-            self.mode = mode;
-            self.reason = reasons::BASE_RTT_REFRESH; // closest audit token
-            self.prr = Prr::default();
+        self.prr = Prr::default();
+        if self.mode == modes::RECOVERY {
+            self.mode = modes::CRUISE;
         }
+        self.reason = reasons::LOSS_UNDO;
         let _ = now;
     }
 
@@ -1283,8 +1108,9 @@ impl CongestionController for EdgeCc {
             restart /= 2;
             idle = idle.saturating_sub(rtt);
         }
-        self.inflight_target = restart.max(MIN_INFLIGHT_MSS * self.mss).min(self.inflight_target);
-        self.inflight_lo = None;
+        self.inflight_target = restart
+            .max(MIN_INFLIGHT_MSS * self.mss)
+            .min(self.inflight_target);
         self.reason = reasons::IDLE_RESTART;
     }
 
@@ -1314,7 +1140,7 @@ impl CongestionController for EdgeCc {
             bandwidth_hi_bps: self.model.bw_hi(),
             bandwidth_lo_bps: self.model.bw_lo(),
             inflight_hi_bytes: self.envelope.ceiling(),
-            inflight_lo_bytes: self.inflight_lo,
+            inflight_lo_bytes: None,
             extra_acked_bytes: Some(self.model.extra_acked()),
             ecn_alpha_milli: self.model.alpha().map(|a| (a * 1000.0) as u32),
             belief_milli: Some(self.infer.belief_milli()),

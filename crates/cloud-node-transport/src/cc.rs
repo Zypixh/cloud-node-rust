@@ -31,16 +31,13 @@ pub use reference::{Bbr3Ref, CubicRef, LossBlindRef, NewRenoRef};
 /// `mode` value sets:
 /// - reference controllers: "slow_start", "slow_start_css",
 ///   "congestion_avoidance", "recovery".
-/// - EdgeCC (T5): "paced_start", "startup", "delay_target",
-///   "plateau_probe", "probe", "utility_tune", "recovery",
-///   "base_rtt_probe".
+/// - EdgeCC (T5): "paced_start", "startup", "cruise", "recovery".
 ///
 /// `reason_code` EdgeCC set (T5, stable tokens): "init", "prior_start",
-/// "plateau_exit", "hystart_exit", "loss_exit", "ce_exit",
-/// "probe_start", "probe_accept", "probe_reject", "mode_delay",
-/// "mode_plateau", "belief_response", "ce_response",
-/// "rto_model_recover", "envelope_set", "envelope_refill",
-/// "base_rtt_refresh", "idle_restart", "mss_update".
+/// "plateau_exit", "hystart_exit", "guardrail", "recovery_done",
+/// "ce_response", "rto_model_recover", "envelope_set",
+/// "envelope_refill", "idle_restart", "mss_update", "loss_undo",
+/// "migrate_restore".
 #[derive(Clone, Debug, PartialEq)]
 pub struct CcSnapshot {
     /// Algorithm name: "newreno_ref", "cubic_ref", "edgecc".

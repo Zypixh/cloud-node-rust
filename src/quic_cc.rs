@@ -381,8 +381,12 @@ mod tests {
         let before = c.inner.snapshot();
         c.on_congestion_event(now + Duration::from_millis(300), now, false, u64::from(MSS));
         let after = c.inner.snapshot();
-        assert_eq!(after.reason_code, "loss_exit");
-        assert!(after.cwnd_bytes <= before.cwnd_bytes);
+        // BDP-assignment law: loss enters recovery bookkeeping but
+        // never shrinks the window — the retransmit timer paces the
+        // retry, and collapsing cwnd on random loss is what livelocked
+        // high-loss paths.
+        assert_eq!(after.mode, "recovery");
+        assert_eq!(after.cwnd_bytes, before.cwnd_bytes);
     }
 
     #[test]
@@ -419,10 +423,11 @@ mod tests {
         let migrated = adapter(c.clone_box());
         let after = migrated.inner.snapshot();
         // §5 迁移保留CC状态: window and pacing carry; the episode
-        // machinery restarts in DELAY_TARGET, not a fresh startup.
+        // machinery restarts at the cruise work point, not a fresh
+        // startup.
         assert_eq!(after.cwnd_bytes, before.cwnd_bytes);
         assert_eq!(after.reason_code, "migrate_restore");
-        assert_eq!(after.mode, "delay_target");
+        assert_eq!(after.mode, "cruise");
     }
 
     #[test]

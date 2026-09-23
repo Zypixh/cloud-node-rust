@@ -208,6 +208,27 @@ pub struct PathModel {
     /// decision layer sets them from probe/response outcomes.
     bw_hi: Option<u64>,
     bw_lo: Option<u64>,
+    /// Delivery slope window — (time_us, delivered_total) samples
+    /// kept over ~2 srtt. Per-ACK rate samples can be inflated
+    /// arbitrarily by ACK compression and post-stall drains (delivered
+    /// spans a whole catch-up burst over a microsecond interval), and
+    /// the `4×flight/base_rtt` cap above cannot catch that because the
+    /// catch-up flight is itself huge. The counter is cumulative
+    /// confirmed-delivered (SACKs count at SACK arrival, not when the
+    /// cumulative edge covers them — `cum_ack` is unfit here: a
+    /// hole-fill registers a whole sacked backlog as instant
+    /// delivery). Confirmed bytes over a real time window cannot
+    /// exceed the bottleneck — and the span deliberately includes
+    /// stall time, which makes the slope a *conservative* bound
+    /// (diluted by stalls, never inflated by them).
+    ack_slope: std::collections::VecDeque<(u64, u64)>,
+    /// First delivered sample's (time_us, delivered_total) — the
+    /// lifetime slope `delivered/elapsed` is the same honest quantity
+    /// as the windowed slope and remains computable while the window
+    /// is too young (startup) or starved by a long stall
+    /// (RTO/recovery). It lags a ramping flow, so it serves as a
+    /// bound only.
+    slope_origin: Option<(u64, u64)>,
 
     // --- RTT / queueing delay ---
     /// `base_rtt` — long-window minimum (BBR `min_rtt`) plus drift
@@ -300,6 +321,8 @@ impl PathModel {
             bw_last_sample: 0.0,
             bw_hi: None,
             bw_lo: None,
+            ack_slope: std::collections::VecDeque::new(),
+            slope_origin: None,
             base_rtt: WinFilter::new_min(BASE_RTT_WINDOW),
             recent_min: WinFilter::new_min(RECENT_MIN_WINDOW),
             base_floor_seen_us: 0,
@@ -462,6 +485,27 @@ impl PathModel {
                 self.extra_acked
                     .add(EWMA_GAIN, (rs.acked_sacked as f64 - expected).max(0.0));
             }
+
+            // Maintain the ACK-slope window over ~2 srtt (bounded so a
+            // stalled connection cannot hold a stale span forever —
+            // 4s matches the bw_max filter's outer horizon). Stalls
+            // stay in the span on purpose: the slope is a bound, and
+            // a stall-diluted value is conservative, never inflated.
+            if self.slope_origin.is_none() {
+                self.slope_origin = Some((now_us, self.delivered_total));
+            }
+            self.ack_slope.push_back((now_us, self.delivered_total));
+            let horizon = self
+                .cached_srtt_us
+                .map(|s| (s as u64).saturating_mul(2))
+                .unwrap_or(4_000_000)
+                .clamp(200_000, 4_000_000);
+            while let Some(&(t, _)) = self.ack_slope.front() {
+                if now_us.saturating_sub(t) <= horizon {
+                    break;
+                }
+                self.ack_slope.pop_front();
+            }
         }
 
         // --- lt_bw round close (BBRv1): close any overdue round BEFORE
@@ -612,9 +656,70 @@ impl PathModel {
         self.bw_est.get().map(|v| v as u64)
     }
 
+    /// `bw_slope` — confirmed-delivery rate over the slope window,
+    /// bytes/s. Immune to per-sample ACK-compression inflation: the
+    /// window spans stalls, and confirmed-delivered cannot advance
+    /// faster than the bottleneck delivers. `None` until the window
+    /// covers a meaningful span — the absolute floor is small (2 ms)
+    /// because on short-RTT paths the damage from an unbounded
+    /// estimate is done within a few ms.
+    pub fn bw_slope(&self) -> Option<u64> {
+        self.bw_slope_windowed().or_else(|| self.bw_slope_lifetime())
+    }
+
+    /// Windowed confirmed-delivered slope only — `None` while the
+    /// window is too young or has been starved by a stall. The span
+    /// includes stall time on purpose: the slope is a *bound*, and a
+    /// stall-diluted value is conservative (never inflated).
+    pub fn bw_slope_windowed(&self) -> Option<u64> {
+        self.bw_slope_min_span(
+            self.cached_srtt_us
+                .map(|s| (s as u64 / 2).clamp(2_000, 50_000))
+                .unwrap_or(50_000),
+        )
+    }
+
+    /// Slope over a span of at least one srtt — "proven rate" grade
+    /// evidence: a full RTT of contiguous delivery, long enough that
+    /// a single catch-up burst cannot pass for capacity.
+    pub fn bw_slope_proven(&self) -> Option<u64> {
+        self.bw_slope_min_span(self.cached_srtt_us? as u64)
+    }
+
+    fn bw_slope_min_span(&self, min_span: u64) -> Option<u64> {
+        let (t0, c0) = *self.ack_slope.front()?;
+        let (t1, c1) = *self.ack_slope.back()?;
+        let span = t1.saturating_sub(t0);
+        if span < min_span {
+            return None;
+        }
+        Some(c1.saturating_sub(c0).saturating_mul(1_000_000) / span)
+    }
+
+    /// Lifetime confirmed-delivered slope — `delivered / elapsed`
+    /// since the first delivered sample. Honest (compression cannot
+    /// inflate it) but it lags ramps and dilutes during stalls, so it
+    /// is strictly a last-resort bound.
+    pub fn bw_slope_lifetime(&self) -> Option<u64> {
+        let (o_t, o_c) = self.slope_origin?;
+        let (t1, c1) = *self.ack_slope.back()?;
+        let lspan = t1.saturating_sub(o_t);
+        if lspan < 2_000 {
+            return None;
+        }
+        Some(c1.saturating_sub(o_c).saturating_mul(1_000_000) / lspan)
+    }
+
     /// Most recent delivery-rate sample (B/s) as fed to the filters.
     pub fn bw_last_sample(&self) -> u64 {
         self.bw_last_sample as u64
+    }
+
+    /// Debug: raw ACK-slope deque contents `(t_us, delivered_total)`
+    /// for harnesses investigating slope inflation.
+    #[doc(hidden)]
+    pub fn ack_slope_dump(&self) -> Vec<(u64, u64)> {
+        self.ack_slope.iter().copied().collect()
     }
 
     /// `bw_sigma` — mean-deviation EWMA scaled to a σ estimate (√(π/2)

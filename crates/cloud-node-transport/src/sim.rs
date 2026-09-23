@@ -965,7 +965,13 @@ impl<'a> Sim<'a> {
         let prior_in_flight = f.in_flight;
         // Newly cumulatively-acked records leave the scoreboard; records
         // already sacked/lost were already out of the pipe count.
-        let mut newly_acked = Vec::new();
+        // `confirmed` holds records whose delivery is first reported by
+        // THIS ack — Linux `tp->delivered` semantics: a SACKed segment
+        // counts when the SACK lands, not when the cumulative edge later
+        // covers it. Feeding the drain set instead would let a hole-fill
+        // register an entire sacked backlog as instant delivery, which
+        // is exactly how a loss-heavy path's rate samples inflate.
+        let mut confirmed = Vec::new();
         while let Some(&seq) = f.scoreboard.keys().next() {
             let e = &f.scoreboard[&seq];
             if e.rec.end_seq > cum {
@@ -989,7 +995,10 @@ impl<'a> Sim<'a> {
                 // `now − first_tx_at` here would be the recovery delay.
                 rec.is_retransmit = true;
             }
-            newly_acked.push(rec);
+            if !e.sacked {
+                // Never SACKed → cum coverage is the first confirmation.
+                confirmed.push(rec);
+            }
         }
         let progressed = cum > f.cum_acked;
         f.cum_acked = f.cum_acked.max(cum);
@@ -1022,6 +1031,7 @@ impl<'a> Sim<'a> {
                     e.rtt_taken = true;
                 }
                 newly_sacked += e.rec.len();
+                confirmed.push(e.rec);
             }
         }
         for r in sack_rtts {
@@ -1076,7 +1086,7 @@ impl<'a> Sim<'a> {
         f.ce_bytes_reported = ce_total;
         let rs =
             f.sampler
-                .on_ack(now, &newly_acked, lost_now, ce_now, prior_in_flight, cum);
+                .on_ack(now, &confirmed, lost_now, ce_now, prior_in_flight, cum);
         if let Some(r) = rs.rtt {
             f.rtt.sample(r);
             f.result.rtt_samples_us.push(r.as_micros() as u64);
