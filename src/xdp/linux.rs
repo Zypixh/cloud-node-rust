@@ -1279,10 +1279,16 @@ pub async fn attach(
             &dispatch_prev,
         )?;
     } else {
+        // A pinned link outlives the process that created it: a daemon
+        // that exits without detaching (SIGKILL, OOM, a too-fast SIGINT)
+        // leaves the previous program attached, and bpf_link_create then
+        // fails EBUSY forever ("Can't replace active BPF XDP link").
+        // Reclaim links whose owner is gone before attaching fresh.
+        reclaim_orphaned_xdp_links()?;
         for interface in &config.interfaces {
-            // The commit-phase detach just released the previous link; kernel
-            // link teardown can lag the pin removal by an RCU grace period, so
-            // retry EBUSY briefly rather than racing bpf_link_create once.
+            // Kernel link teardown can lag the pin removal by an RCU
+            // grace period, so retry EBUSY briefly rather than racing
+            // bpf_link_create once.
             let mut attach_err = None;
             let mut link_id = None;
             for _ in 0..20 {
@@ -1308,9 +1314,14 @@ pub async fn attach(
             }
             let link_id = link_id.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "attach XDP to {} after bounded EBUSY wait: {}",
+                    "attach XDP to {} after bounded EBUSY wait: {}; an unpinned or \
+                     foreign XDP link may still hold the interface — inspect with \
+                     `ip link show dev {}` and reclaim with `xdp detach` or \
+                     `ip link set dev {} xdp off`",
                     interface.name,
-                    attach_err.map(|e| e.to_string()).unwrap_or_default()
+                    attach_err.map(|e| e.to_string()).unwrap_or_default(),
+                    interface.name,
+                    interface.name
                 )
             })?;
             let link = program.take_link(link_id)?;
@@ -1540,6 +1551,94 @@ fn atomic_link_swap(
          {tag_adopted} adopted via dispatch-table swap (kernel lacks XDP link update)",
         swapped.len()
     );
+    Ok(())
+}
+
+/// Detect a live cloud-node daemon that still owns the pinned
+/// dataplane. The daemon holds an exclusive flock on its pidfile for
+/// its entire lifetime, so a lock held by a different live pid means a
+/// predecessor is mid-handover. This process's own lock is excluded —
+/// the daemon calls attach while holding it.
+fn xdp_owner_alive() -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    for path in crate::paths::NodePaths::current().pid_file_candidates() {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            continue;
+        }
+        // Locked — resolve who holds it. An unreadable or unparsable
+        // pidfile stays conservative: claim "alive" rather than rip a
+        // dataplane out from under a possibly-running daemon.
+        let pid = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|body| body.trim().parse::<u32>().ok());
+        match pid {
+            Some(pid) if pid == std::process::id() => {}
+            Some(pid) if unsafe { libc::kill(pid as i32, 0) } == 0 => return Some(pid),
+            Some(_) => {}
+            None => return Some(0),
+        }
+    }
+    None
+}
+
+/// Reclaim pinned `link-*` objects left behind by a generation that
+/// exited without detaching. A pinned link survives its owner process —
+/// the kernel keeps the program attached until the bpffs pin is
+/// removed — and would block `bpf_link_create` with EBUSY forever.
+/// Refuse when a different live daemon still owns the dataplane: a
+/// cold attach must never tear down links a running predecessor
+/// depends on (hot handover goes through `atomic_link_swap` instead).
+fn reclaim_orphaned_xdp_links() -> anyhow::Result<()> {
+    let pin_dir = PathBuf::from(xdp_bpf_pin_dir());
+    let mut pins: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&pin_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_link_pin = path
+                .file_name()
+                .map(|name| name.to_string_lossy().starts_with("link-"))
+                .unwrap_or(false);
+            if is_link_pin && path.is_file() {
+                pins.push(path);
+            }
+        }
+    }
+    if pins.is_empty() {
+        return Ok(());
+    }
+    if let Some(owner) = xdp_owner_alive() {
+        anyhow::bail!(
+            "pinned XDP links {pins:?} are owned by a running cloud-node daemon \
+             (pid {owner}); refusing to tear down a live dataplane — use the \
+             daemon's reload path or run `xdp detach` first"
+        );
+    }
+    for pin in pins {
+        match PinnedLink::from_pin(&pin) {
+            // unpin() hands back the live link; dropping it here closes
+            // the fd and destroys the link — the interface is freed for
+            // the fresh attach below.
+            Ok(pinned) => match pinned.unpin() {
+                Ok(_link) => {
+                    tracing::warn!(
+                        "reclaimed stale XDP link {} left by a generation that \
+                         exited without detaching",
+                        pin.display()
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!("failed to unpin stale XDP link {}: {err}", pin.display());
+                }
+            },
+            Err(err) => {
+                tracing::warn!("failed to open pinned XDP link {}: {err}", pin.display());
+            }
+        }
+    }
     Ok(())
 }
 

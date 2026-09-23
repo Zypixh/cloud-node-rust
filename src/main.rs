@@ -3280,6 +3280,55 @@ fn xdp_health_fallback_reason(status: &cloud_node_rust::xdp::XdpStatusSnapshot) 
     None
 }
 
+/// Detaches the XDP dataplane when the server shuts down. A pinned BPF
+/// link survives process exit — without teardown the dead generation's
+/// program keeps redirecting into dead AF_XDP sockets (connection
+/// refusals) and blocks the next attach with EBUSY. Pingora broadcasts
+/// shutdown to services during the graceful window, which is what lets
+/// this run before the process exits. A graceful upgrade (SIGQUIT) is
+/// deliberately skipped: the successor adopts the pinned dataplane.
+struct XdpShutdownService {
+    phase: parking_lot::Mutex<
+        tokio::sync::broadcast::Receiver<pingora_core::server::ExecutionPhase>,
+    >,
+}
+
+#[async_trait::async_trait]
+impl pingora_core::services::background::BackgroundService for XdpShutdownService {
+    async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+        let mut phase = None;
+        {
+            let mut rx = self.phase.lock();
+            while let Ok(latest) = rx.try_recv() {
+                phase = Some(latest);
+            }
+        }
+        if matches!(
+            phase,
+            Some(
+                pingora_core::server::ExecutionPhase::GracefulUpgradeTransferringFds
+                    | pingora_core::server::ExecutionPhase::GracefulUpgradeCloseTimeout
+            )
+        ) {
+            info!("graceful upgrade in progress — XDP dataplane left for the successor");
+            return;
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            cloud_node_rust::xdp::detach(false),
+        )
+        .await
+        {
+            Ok(Ok(())) => info!("XDP dataplane detached during shutdown"),
+            Ok(Err(err)) => warn!("XDP detach during shutdown failed: {err}"),
+            Err(_) => warn!("XDP detach during shutdown exceeded its 3s budget"),
+        }
+    }
+}
+
 fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()> {
     let node_paths = cloud_node_rust::paths::NodePaths::current();
     node_paths.ensure_runtime_dirs().ok();
@@ -3741,6 +3790,33 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     spawn_staggered(&rt, Duration::from_secs(2), async move {
         tcp_manager.start_listeners().await;
     });
+
+    my_server.add_service(
+        pingora_core::services::background::background_service(
+            "xdp-shutdown",
+            XdpShutdownService {
+                phase: parking_lot::Mutex::new(my_server.watch_execution_phase()),
+            },
+        ),
+    );
+
+    // SIGINT takes Pingora's fast-shutdown path: the shutdown broadcast
+    // never reaches services, so a dedicated listener runs a bounded
+    // best-effort detach before the process exits.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut sigint) = signal(SignalKind::interrupt()) {
+            rt.spawn(async move {
+                sigint.recv().await;
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(1500),
+                    cloud_node_rust::xdp::detach(false),
+                )
+                .await;
+            });
+        }
+    }
 
     info!("CloudNode (PID {}) is ready.", std::process::id());
     my_server.run_forever();
