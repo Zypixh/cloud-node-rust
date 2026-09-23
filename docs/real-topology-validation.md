@@ -120,3 +120,21 @@ kernel 臂说明：该机器为共享主机，另一租户节点通过 SO_REUSEP
 - `memgov-snapshot` 空闲期仍以 4Hz 刷新（~8% CPU 于 480MB RSS）——可考虑无消费者时降频；
 - 单客户端 IP 的流量全 hash 到 queue-0——多队列扩展依赖 RSS 分流，同源高压场景 queue-0 是单点；
 - CLOSING 态收割期限 60s 期间 zombie 仍占 ~1MiB/会话——预算压力下可考虑压力自适应缩短期限。
+
+## RSS 单队列热点排查结论（2026-10，kernel 6.12.95）
+
+现象：同源 IP 流量全部落在 `afxdp-ens17-0`，其余 7 个 worker 空闲。
+
+排查结论——**平台限制，非软件 bug**：
+
+- `ethtool -k ens17`：`receive-hashing: off [fixed]`——virtio_net 网卡未协商 RSS，
+  队列分发由宿主机 vhost 侧决定，客户机不可控；
+- `ethtool -n ens17 rx-flow-hash tcp4` 显示 hash 字段为 `None`，尝试 `sdfn`/`sd`/`fn` 等
+  组合均返回 `Invalid argument`——不支持配置 L4 hash 字段；
+- `ethtool -x`（indirection table）`Operation not supported`——无法重映射队列；
+- eBPF 侧不可绕行：XSKMAP redirect 只对**当前队列**的 XSK 有效，跨队列 redirect 被内核
+  静默丢弃（F7 注释既有说明）；跨队列 TCP 交付需要破坏会话亲和性（reactor 各自持有
+  smoltcp socket 状态），属架构级变更，未做。
+
+缓解方向（如需）：换支持 RSS 的 NIC 类型（非 virtio）、多队列 virtio + 宿主机开启
+RSS steering，或在宿主机侧配置流分流。单一源 IP 的吞吐上限 = 单 worker 容量。
