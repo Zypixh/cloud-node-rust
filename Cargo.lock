@@ -829,6 +829,7 @@ dependencies = [
  "libc",
  "libinjectionrs",
  "libmimalloc-sys",
+ "libxdp-sys",
  "local-ip-address",
  "lru 0.18.2",
  "mace-kv",

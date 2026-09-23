@@ -98,6 +98,10 @@ aya = "0.14.0"
 neli = "0.7.4"
 smoltcp = { version = "0.14.0", default-features = false, features = ["std", "async", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "socket-udp"] }
 xsk-rs = "0.9.0"
+# Feature-unification pin: use_cc_build compiles libxdp via the cc crate
+# instead of xdp-tools' configure/make, which is what makes cross-compiling
+# from non-Linux hosts viable (still honors CLANG/LD/OBJCOPY env vars).
+libxdp-sys = { version = "0.2.4", features = ["use_cc_build"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
