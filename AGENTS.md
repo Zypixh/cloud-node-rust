@@ -89,11 +89,18 @@ they exist.
 | Lint (CI gate) | `cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious` |
 | Vendored pingora | `cargo check --manifest-path pingora-main/Cargo.toml -p pingora-core -p pingora-http -p pingora-cache -p pingora-proxy --all-targets` |
 | Project tooling | `cargo xtask <subcommand>` |
+| macOS → Linux release | `bash scripts/build-release-local.sh [--all-bins]` |
 
 **Local and CI use different CPU baselines.** `.cargo/config.toml` sets
 `rustflags = ["-C", "target-cpu=native"]`; CI overrides with
 `RUSTFLAGS="-C target-cpu=x86-64-v2"`. A passing local build does not imply a passing CI
 build — re-verify against the CI baseline when build config or dependencies change.
+
+**macOS cross-compile** uses `cargo zigbuild` to `x86_64-unknown-linux-gnu.2.36` via
+`scripts/build-release-local.sh`, which wires the Debian-amd64 sysroot and LLVM wrappers
+under `~/.local/share/cross-sysroot` (libelf/zlib, kernel UAPI headers, BPF-capable clang,
+`ld.lld` for libxdp-sys' GNU-ld embed step). The fleet floor is **x86-64-v2** — Ivy Bridge
+test nodes lack AVX2 and SIGILL on v3 builds (`CLOUD_NODE_TARGET_CPU` overrides).
 
 ## How to work
 
