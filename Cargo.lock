@@ -826,7 +826,6 @@ dependencies = [
  "http",
  "image",
  "ipnet",
- "libbpf-sys",
  "libc",
  "libinjectionrs",
  "libmimalloc-sys",
