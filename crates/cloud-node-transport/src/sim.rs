@@ -71,7 +71,15 @@ pub struct SimConfig {
     pub policer: Option<Policer>,
     /// Independent uniform drop probability on the forward link —
     /// stacks with queue/policer drops (congestion + random overlay).
+    /// Equivalent to `loss_model = Uniform { p }` when `loss_model`
+    /// is `None`.
     pub random_loss: f64,
+    /// Loss-process shape for the random overlay. `None` keeps the
+    /// legacy `random_loss` Bernoulli draw. Real WAN loss is rarely
+    /// i.i.d. — `GilbertElliott` produces correlated burst loss (the
+    /// `tc netem loss gemodel` model), `NormalVarying` a slowly
+    /// fluctuating loss rate.
+    pub loss_model: Option<LossModel>,
     /// Probability a packet takes `reorder_extra` longer.
     pub reorder_prob: f64,
     pub reorder_extra: Duration,
@@ -110,6 +118,7 @@ impl Default for SimConfig {
             aqm: Aqm::None,
             policer: None,
             random_loss: 0.0,
+            loss_model: None,
             reorder_prob: 0.0,
             reorder_extra: Duration::ZERO,
             ack_delay_prop: Duration::from_millis(50),
@@ -293,6 +302,14 @@ impl SplitMix64 {
         }
         ((self.f64() * 2.0 - 1.0) * j as f64) as i64
     }
+
+    /// Standard normal via Box-Muller. Deterministic — consumes two
+    /// uniforms from the stream.
+    fn gauss(&mut self) -> f64 {
+        let u1 = self.f64().max(f64::MIN_POSITIVE);
+        let u2 = self.f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
 }
 
 struct QueueEntry {
@@ -343,6 +360,32 @@ pub fn run_multi<'a>(cfg: &'a SimConfig, flows: Vec<FlowSpec<'a>>) -> MultiSimRe
     }
 }
 
+/// Loss-process shape for the forward link's random-drop overlay.
+/// All variants draw from the sim's deterministic SplitMix64 stream,
+/// so a (cell, replica) seed still reproduces a run bit-for-bit.
+#[derive(Clone, Copy, Debug)]
+pub enum LossModel {
+    /// Independent Bernoulli(p) per packet — fully uncorrelated loss.
+    Uniform { p: f64 },
+    /// Gilbert-Elliott two-state Markov (the `tc netem loss gemodel`
+    /// model): per packet in the good state drop with `p_good` and
+    /// transition to bad with `p_gb`; in the bad state drop with
+    /// `p_bad` and recover with `p_bg`. Produces correlated loss
+    /// bursts — the dominant real-WAN loss shape (buffer collapse,
+    /// fading, link flaps).
+    GilbertElliott {
+        p_gb: f64,
+        p_bg: f64,
+        p_good: f64,
+        p_bad: f64,
+    },
+    /// Slowly-varying loss rate: every `period` the link draws a fresh
+    /// p ~ max(0, N(mean, sd)) (Box-Muller over the deterministic rng);
+    /// within a period packets still drop independently. Models a
+    /// link whose quality drifts rather than per-packet loss bursts.
+    NormalVarying { mean: f64, sd: f64, period: Duration },
+}
+
 /// Shared forward-link state (all flows compete here).
 struct Link {
     link_free_us: u64,
@@ -350,6 +393,48 @@ struct Link {
     queued_bytes: u64,
     policer_tokens: f64,
     policer_last_us: u64,
+    /// Gilbert-Elliott state: true while in the bad (lossy) state.
+    loss_bad_state: bool,
+    /// NormalVarying state: current period's drawn loss rate and the
+    /// instant the next period begins.
+    loss_nv_p: f64,
+    loss_nv_next_us: u64,
+}
+
+/// Random-overlay drop decision for one admitted packet. Draws from
+/// the sim rng so runs stay seed-deterministic; takes the link's loss
+/// state by reference so it can evolve Markov/period state.
+fn loss_drop(rng: &mut SplitMix64, link: &mut Link, cfg: &SimConfig, now_us: u64) -> bool {
+    match cfg.loss_model {
+        None => cfg.random_loss > 0.0 && rng.f64() < cfg.random_loss,
+        Some(LossModel::Uniform { p }) => p > 0.0 && rng.f64() < p,
+        Some(LossModel::GilbertElliott {
+            p_gb,
+            p_bg,
+            p_good,
+            p_bad,
+        }) => {
+            let (p_loss, p_trans) = if link.loss_bad_state {
+                (p_bad, p_bg)
+            } else {
+                (p_good, p_gb)
+            };
+            // netem semantics: drop draw first, then state transition —
+            // the transition applies to the NEXT packet.
+            let drop = p_loss > 0.0 && rng.f64() < p_loss;
+            if rng.f64() < p_trans {
+                link.loss_bad_state = !link.loss_bad_state;
+            }
+            drop
+        }
+        Some(LossModel::NormalVarying { mean, sd, period }) => {
+            if now_us >= link.loss_nv_next_us {
+                link.loss_nv_p = (mean + sd * rng.gauss()).clamp(0.0, 1.0);
+                link.loss_nv_next_us = now_us + period.as_micros() as u64;
+            }
+            link.loss_nv_p > 0.0 && rng.f64() < link.loss_nv_p
+        }
+    }
 }
 
 /// Outcome of one link admission.
@@ -523,6 +608,9 @@ impl<'a> Sim<'a> {
                     .map(|p| p.burst_bytes as f64)
                     .unwrap_or(0.0),
                 policer_last_us: 0,
+                loss_bad_state: false,
+                loss_nv_p: 0.0,
+                loss_nv_next_us: 0,
             },
             flows: specs
                 .into_iter()
@@ -618,7 +706,7 @@ impl<'a> Sim<'a> {
                 arrive_us: 0,
             };
         }
-        if cfg.random_loss > 0.0 && self.rng.f64() < cfg.random_loss {
+        if loss_drop(&mut self.rng, link, cfg, now_us) {
             return Admit {
                 admitted: false,
                 ce: false,
