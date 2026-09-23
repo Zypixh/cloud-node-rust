@@ -93,6 +93,35 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
         self.window() == 0
     }
 
+    /// smoltcp-edge (T9): resize the ring in place — the logical contents
+    /// are copied in read order into a fresh owned allocation, `length`
+    /// is preserved and `read_at` is re-based at 0. Refuses (returns
+    /// false, buffer untouched) when the new capacity equals the current
+    /// one or cannot hold the queued elements. Borrowed storage is
+    /// promoted to owned on success — there is no way to grow a caller's
+    /// slice, and an owned replacement keeps every other API unchanged.
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    pub fn resize(&mut self, new_capacity: usize) -> bool
+    where
+        T: Copy + Default,
+    {
+        if new_capacity == self.capacity() || new_capacity < self.length {
+            return false;
+        }
+        let mut storage = alloc::vec::Vec::with_capacity(new_capacity);
+        storage.resize(new_capacity, T::default());
+        let first_run = self.length.min(self.capacity() - self.read_at);
+        storage[..first_run]
+            .copy_from_slice(&self.storage[self.read_at..self.read_at + first_run]);
+        let second_run = self.length - first_run;
+        if second_run > 0 {
+            storage[first_run..self.length].copy_from_slice(&self.storage[..second_run]);
+        }
+        self.storage = storage.into();
+        self.read_at = 0;
+        true
+    }
+
     /// Shorthand for `(self.read + idx) % self.capacity()` with an
     /// additional check to ensure that the capacity is not zero.
     fn get_idx(&self, idx: usize) -> usize {

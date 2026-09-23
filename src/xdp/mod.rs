@@ -87,6 +87,11 @@ pub struct XdpQueueStatus {
     /// T9/D-AQM: CE marks applied to ECT-capable deferred units (RFC 3168).
     #[serde(default)]
     pub aqm_ce_marks: u64,
+    /// TX descriptors currently held by the kernel (produced minus
+    /// completed), bounded by the in-flight cap — observability for
+    /// bufferbloat at the xsk TX ring.
+    #[serde(default)]
+    pub tx_inflight: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1476,7 +1481,9 @@ impl XdpManager {
             tcp_congestion_control: if xdp_proxy_has_tcp_like_ports(&self.config)
                 && xdp_tcp_dataplane_supported()
             {
-                "cubic".to_string()
+                crate::runtime_mode::XdpTransportController::Edgecc
+                    .as_str()
+                    .to_string()
             } else {
                 String::new()
             },
@@ -2942,19 +2949,20 @@ pub(crate) fn afxdp_upstream_selected() -> bool {
 }
 
 /// T5: resolved transport policy for QUIC endpoints that are AF_XDP
-/// scoped (demux-fed H3 server, AF_XDP H3 upstream). Returns `None`
-/// when the selection is the cubic default — the caller keeps quinn's
-/// stock controller and the non-XDP contract is unchanged.
+/// scoped (demux-fed H3 server, AF_XDP H3 upstream). The controller is
+/// pinned to EdgeCC like the TCP dataplane; callers keep quinn's stock
+/// controller only on non-XDP-scoped endpoints (§A.4 contract).
 #[cfg(target_os = "linux")]
 pub(crate) fn xdp_quic_cc_factory(
 ) -> Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>> {
     let settings = RuntimeConfig::current()
         .and_then(|runtime| runtime.xdp.transport.clone())
-        .unwrap_or_default();
-    (settings.controller != crate::runtime_mode::XdpTransportController::Cubic).then(|| {
+        .unwrap_or_default()
+        .production_pinned();
+    Some(
         Arc::new(crate::quic_cc::XdpTransportControllerFactory::new(settings))
-            as Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>
-    })
+            as Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
+    )
 }
 
 /// T4-6: node-originated TCP connect through the AF_XDP dataplane.

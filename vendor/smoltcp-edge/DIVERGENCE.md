@@ -53,6 +53,11 @@ tests at the end of `socket::tcp::test`.
   `set_transport_controller`, `has_transport_controller`,
   `transport_snapshot` (`Option<CcSnapshot>`), `transport_pacing_rate`,
   `transport_next_send_due`, `set_rx_window_cap`.
+- Read-only observability getters (additive, non-behavioural):
+  `remote_window` (`remote_win_len` after scaling), `unacked_bytes`
+  (`flight_size` — whole unacked range), `transport_pipe` (scoreboard
+  pipe under an external controller), `timer_state` (retransmit /
+  zero-window-probe / idle timer name for remote diagnostics).
 - `rx_window_cap: Option<usize>` — `scaled_window()` applies the cap
   before window scaling (dynamic advertised-window control, D-R1 hook).
 - PAWS (RFC 7323 §5.3): after ACK acceptability, segments with
@@ -117,6 +122,30 @@ tests at the end of `socket::tcp::test`.
   `test_set_path_mtu_floors_bogus_small_values`,
   `test_pmtu_report_disarms_blackhole_probe`,
   `test_rto_blackhole_probe_arms_and_ack_disarms`.
+
+### T9 additions (in-session buffer autotune)
+
+- `src/storage/ring_buffer.rs`: `RingBuffer::resize(new_capacity)`
+  (alloc-gated) — copies the logical contents in read order into a
+  fresh owned allocation, preserving `length` and re-basing `read_at`.
+  Refuses `new_capacity == capacity` or `< length`; borrowed storage is
+  promoted to owned on success.
+- `src/socket/tcp.rs`: public APIs
+  `grow_recv_buffer`/`grow_send_buffer` (ring resize passthrough),
+  `rx_window_wire_cap` (`u16::MAX << remote_win_shift` — the largest
+  window encodable under the negotiated scale, 64 KiB when the peer
+  offered no RFC 1323 scaling), and
+  `set_rx_window_shift_for_ceiling` — raises `remote_win_shift` as if
+  the buffer were already the ceiling size, so in-session growth stays
+  encodable. Must be called before the socket emits SYN/SYN-ACK (the
+  shift is negotiated there); a peer without window-scaling support
+  still zeroes it at handshake.
+- New field `rx_win_shift_floor: u8` — persists the configured ceiling
+  shift across `reset()` (which otherwise re-derives the shift from
+  current capacity and would silently drop a pre-handshake ceiling).
+  `reset()` now computes `max(capacity-derived shift, floor)`; with
+  the floor at its default 0 the computation is byte-for-byte
+  upstream.
 
 ## `src/socket/tcp/congestion.rs`
 

@@ -27,6 +27,15 @@ use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem};
 const AF_XDP_FRAME_COUNT: u32 = 4096;
 const AF_XDP_RING_SIZE: u32 = 2048;
 const AF_XDP_RX_BATCH: usize = 64;
+/// Bound on TX descriptors held by the kernel (produced to the TX ring but
+/// not yet completed). The NIC's own transmit queue already provides the
+/// pipeline — descriptors beyond it only sit in the xsk ring adding delay
+/// (observed: virtio_net virtqueue depth is 256 while this ring is 2048,
+/// so a saturated ring queued ~1.6s of bufferbloat, pushed RTT over RTO,
+/// and collapsed peer congestion windows). Spill-over goes to the bridge's
+/// bounded defer queue where CoDel applies real AQM backpressure instead
+/// of unobserved queueing.
+const AF_XDP_TX_INFLIGHT_CAP: usize = 256;
 const AF_XDP_MAX_SOCKETS: usize = 4096;
 const AF_XDP_SOCKET_CREATE_ATTEMPTS: usize = 80;
 const AF_XDP_SOCKET_CREATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
@@ -371,6 +380,9 @@ pub(crate) struct AfXdpQueueHandle {
     rx_batch: Vec<FrameDesc>,
     tx_completion_batch: Vec<FrameDesc>,
     tx_scratch: Vec<u8>,
+    /// TX descriptors produced to the ring but not yet completed —
+    /// the in-flight depth capped by `AF_XDP_TX_INFLIGHT_CAP`.
+    tx_inflight: usize,
 }
 
 impl AfXdpQueueHandle {
@@ -461,6 +473,7 @@ impl AfXdpQueueHandle {
         let completed = unsafe { comp.consume(&mut self.tx_completion_batch) };
         self.free_frames
             .extend_from_slice(&self.tx_completion_batch[..completed]);
+        self.tx_inflight = self.tx_inflight.saturating_sub(completed);
         completed
     }
 
@@ -473,6 +486,9 @@ impl AfXdpQueueHandle {
         ecn: Option<u8>,
     ) -> anyhow::Result<bool> {
         self.reclaim_tx_completions();
+        if self.tx_inflight >= AF_XDP_TX_INFLIGHT_CAP {
+            return Ok(false);
+        }
         let Some(mut desc) = self.free_frames.pop() else {
             return Ok(false);
         };
@@ -498,10 +514,20 @@ impl AfXdpQueueHandle {
 
     pub(super) fn send_raw_frame(&mut self, frame: &[u8]) -> anyhow::Result<bool> {
         self.reclaim_tx_completions();
+        if self.tx_inflight >= AF_XDP_TX_INFLIGHT_CAP {
+            return Ok(false);
+        }
         let Some(desc) = self.free_frames.pop() else {
             return Ok(false);
         };
         self.submit_raw_frame(desc, frame)
+    }
+
+    /// TX descriptors currently held by the kernel (produced minus
+    /// completed) — observability for the in-flight cap.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn tx_inflight(&self) -> usize {
+        self.tx_inflight
     }
 
     fn submit_raw_frame(&mut self, mut desc: FrameDesc, frame: &[u8]) -> anyhow::Result<bool> {
@@ -521,7 +547,10 @@ impl AfXdpQueueHandle {
         // SAFETY: `desc` describes a frame from this queue's UMEM. After successful
         // submission it is not reused until returned by the completion queue.
         match unsafe { self.tx.produce_one_and_wakeup(&desc) } {
-            Ok(1) => Ok(true),
+            Ok(1) => {
+                self.tx_inflight += 1;
+                Ok(true)
+            }
             Ok(_) => {
                 self.free_frames.push(desc);
                 Ok(false)
@@ -832,6 +861,7 @@ fn create_af_xdp_queue(
         admission_refusals: 0,
         aqm_drops: 0,
         aqm_ce_marks: 0,
+        tx_inflight: 0,
     };
     Ok((
         AfXdpQueueHandle {
@@ -846,6 +876,7 @@ fn create_af_xdp_queue(
             rx_batch: vec![FrameDesc::default(); AF_XDP_RX_BATCH],
             tx_completion_batch: vec![FrameDesc::default(); AF_XDP_RX_BATCH],
             tx_scratch: Vec::with_capacity(interface.frame_size as usize),
+            tx_inflight: 0,
         },
         status,
     ))

@@ -467,14 +467,17 @@ pub struct XdpUpstreamSettings {
 }
 
 /// T5: congestion-controller selection for AF_XDP-terminated TCP.
-/// `cubic` is the validated production default; `edgecc` is the
-/// decision-layer controller under acceptance; `bbr3`, `new-reno` and
-/// `loss-blind` exist only for deterministic validation/ablation.
+/// `edgecc` is the production transport controller — pinned by policy
+/// (the `xdp.transport.controller` key stays parseable for config
+/// compat but production wiring always resolves EdgeCC). `cubic`,
+/// `bbr3`, `new-reno` and `loss-blind` remain only as reference
+/// controllers for deterministic validation/ablation via
+/// `set_transport_policy` in tests and bench tooling.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum XdpTransportController {
-    #[default]
     Cubic,
+    #[default]
     Edgecc,
     Bbr3,
     NewReno,
@@ -496,6 +499,9 @@ impl XdpTransportController {
 /// T5: transport policy for AF_XDP-terminated TCP flows.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct XdpTransportSettings {
+    /// Parsed for config compatibility only — production always pins
+    /// EdgeCC (see enum docs); validation code selects ablation
+    /// controllers through `set_transport_policy`, never this field.
     #[serde(rename = "controller", default)]
     pub controller: XdpTransportController,
     /// D-D2 controlled-link flag: on own-infrastructure paths CE marks
@@ -511,6 +517,17 @@ pub struct XdpTransportSettings {
 }
 
 impl XdpTransportSettings {
+    /// Resolved production policy: EdgeCC is pinned — the parsed
+    /// `controller` value cannot select ablation controllers on
+    /// production wiring; `trustedEcn`/`aggregation` stay
+    /// operator-configurable.
+    pub fn production_pinned(&self) -> Self {
+        Self {
+            controller: XdpTransportController::Edgecc,
+            ..*self
+        }
+    }
+
     /// Resolved aggregation flag — only meaningful under EdgeCC.
     pub fn aggregation_enabled(&self) -> bool {
         self.controller == XdpTransportController::Edgecc && self.aggregation

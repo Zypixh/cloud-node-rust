@@ -30,6 +30,25 @@ fn tcp_queue_budget_test_lock() -> &'static std::sync::Mutex<()> {
     &LOCK
 }
 
+/// Reserve all *currently available* TCP queue bytes, retrying while a
+/// parallel session holds a transient buffer charge — sessions now keep
+/// their 2×buf capacity committed for their lifetime, so the budget may
+/// be partially held even under the test lock.
+#[cfg(any(test, target_os = "linux"))]
+fn reserve_remaining_queue_budget(
+    governor: &'static crate::memory_governor::MemoryGovernor,
+) -> crate::memory_governor::StaticTcpQueueBytePermit {
+    loop {
+        let remaining = governor
+            .tcp_queue_bytes_budget()
+            .saturating_sub(governor.tcp_queue_bytes());
+        assert!(remaining > 0, "test needs TCP queue budget headroom");
+        if let Some(permit) = governor.try_reserve_tcp_queue_bytes(remaining as usize) {
+            return permit;
+        }
+    }
+}
+
 fn test_dataplane_lease(
     manager: &std::sync::Arc<XdpManager>,
 ) -> std::sync::Arc<crate::xdp::AfXdpDataplaneLease> {
@@ -1267,6 +1286,69 @@ fn af_xdp_tcp_reactor_answers_syn_with_syn_ack() {
 
 #[cfg(any(test, target_os = "linux"))]
 #[test]
+fn af_xdp_tcp_stalled_session_reaped_at_deadline_despite_traffic() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    use std::time::Duration;
+    // T9 production regression: a session parked on the queue ledger
+    // kept receiving client retransmissions, each one refreshing
+    // last_activity — the idle timeout could never fire and its buffer
+    // permits pinned the ledger for every other session. The stall
+    // deadline must reap it even while packets keep arriving.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
+    let clock = reactor.install_manual_clock_for_test();
+    let t0 = smoltcp::time::Instant::from_micros(clock.now_micros());
+    let frame = ipv4_tcp_syn_frame_with_source_port(false, 53400);
+    let af_xdp::AfXdpProxyFrame::Tcp { route, flow, .. } =
+        af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    assert!(reactor.ensure_session_at(
+        route.clone(),
+        flow,
+        af_xdp::AfXdpTcpProxyClass::TcpPlain,
+        t0
+    ));
+    reactor.force_stalled_since_for_test(&flow, t0);
+
+    // Retransmissions keep arriving on the stalled session — each one
+    // refreshes last_activity. Advance past the stall deadline; the
+    // sweep must still reap it. A fresh session created after the
+    // deadline proves the sweep is selective.
+    clock.advance(af_xdp::AF_XDP_TCP_BUDGET_STALL_DEADLINE + Duration::from_millis(1));
+    let now = smoltcp::time::Instant::from_micros(clock.now_micros());
+    assert!(reactor.ensure_session_at(
+        route,
+        flow,
+        af_xdp::AfXdpTcpProxyClass::TcpPlain,
+        now
+    ));
+    let healthy_frame = ipv4_tcp_syn_frame_with_source_port(false, 53401);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route: healthy_route,
+        flow: healthy_flow,
+        ..
+    } = af_xdp::parse_proxy_frame("eth0", 0, &healthy_frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    assert!(reactor.ensure_session_at(
+        healthy_route,
+        healthy_flow,
+        af_xdp::AfXdpTcpProxyClass::TcpPlain,
+        now
+    ));
+    reactor.poll();
+
+    assert!(!reactor.has_session(&flow));
+    assert!(reactor.has_session(&healthy_flow));
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
 fn af_xdp_tcp_reactor_ignores_unknown_non_syn_flow() {
     let _budget_guard = tcp_queue_budget_test_lock()
         .lock()
@@ -1405,6 +1487,12 @@ fn af_xdp_occupancy_maps_to_pressure_ladder() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_pre_proxy_budget_scales_with_limit() {
+    // Session creation charges the global TCP queue ledger — serialize
+    // against budget tests.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     // floor: small tables still admit handshakes
     assert_eq!(
         af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 512)
@@ -1428,6 +1516,12 @@ fn af_xdp_tcp_pre_proxy_budget_scales_with_limit() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_full_table_evicts_oldest_pre_proxy() {
+    // Session creation charges the global TCP queue ledger — serialize
+    // against budget tests.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     // A full table of unverified sessions must still admit: the oldest
     // unverified flow is sacrificed, never a verified one. Distinct
     // created_at instants make the "oldest" choice deterministic.
@@ -1456,6 +1550,12 @@ fn af_xdp_tcp_full_table_evicts_oldest_pre_proxy() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_verified_sessions_are_never_evicted() {
+    // Session creation charges the global TCP queue ledger — serialize
+    // against budget tests.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     // test_auto_start sessions graduate immediately (proxy_started) — a
     // table full of verified work refuses new admissions instead of
     // killing real flows.
@@ -1485,6 +1585,12 @@ fn af_xdp_tcp_verified_sessions_are_never_evicted() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_per_ip_pre_proxy_cap_churns_oldest() {
+    // Session creation charges the global TCP queue ledger — serialize
+    // against budget tests.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     // One source IP may hold at most PRE_PROXY_PER_IP_LIMIT unverified
     // sessions — its own oldest churns, other IPs are unaffected.
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 4096);
@@ -1787,6 +1893,12 @@ fn af_xdp_tcp_reactor_dial_fails_explicitly_on_rst() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_dial_times_out_past_deadline() {
+    // Session creation charges the global TCP queue ledger — serialize
+    // against budget tests.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
     let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
     let local: std::net::SocketAddr = "198.51.100.5:39000".parse().unwrap();
@@ -1816,6 +1928,12 @@ fn af_xdp_tcp_reactor_dial_times_out_past_deadline() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_dial_refuses_duplicate_flow() {
+    // Session creation charges the global TCP queue ledger — serialize
+    // against budget tests.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
     let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
     let local: std::net::SocketAddr = "198.51.100.5:39000".parse().unwrap();
@@ -2719,6 +2837,12 @@ fn af_xdp_tcp_reactor_ingress_queue_overflow_is_explicit_refusal() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_unstarted_sessions_go_cold_until_reaped() {
+    // Session creation charges the global TCP queue ledger — serialize
+    // against budget tests.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     // Without proxy managers a session can never start — but a pre-proxy
     // session awaiting its peer's next packet has no observable work after
     // the SYN-ACK is emitted. It must leave the hot set so the reactor
@@ -2828,6 +2952,12 @@ fn af_xdp_tcp_reactor_pre_proxy_wakes_on_completing_ack() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_sweep_is_batched_not_unbounded() {
+    // Session creation charges the global TCP queue ledger — serialize
+    // against budget tests.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     // More sessions than one sweep batch: a sweep cycle must advance the
     // cursor by at most AF_XDP_TCP_SWEEP_BATCH_BUDGET entries per round.
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 4096);
@@ -2874,6 +3004,12 @@ fn af_xdp_tcp_reactor_sweep_is_batched_not_unbounded() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_sweep_keeps_cadence_under_fast_polling() {
+    // Session creation charges the global TCP queue ledger — serialize
+    // against budget tests.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     use std::time::Duration;
     // F4 regression on the injected T1 transport clock: `poll()` driven by
     // a manual clock advanced 1ms per round must not keep deferring the
@@ -3053,6 +3189,12 @@ async fn af_xdp_tcp_wake_set_stays_bounded_under_write_storm() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_stale_wake_mark_is_a_noop() {
+    // Session creation charges the global TCP queue ledger — serialize
+    // against budget tests.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     // A wake mark for a flow with no session (e.g. worker exit, reaped
     // tuple) must drain without creating work or sessions.
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
@@ -3090,22 +3232,26 @@ fn af_xdp_tcp_ingress_byte_budget_refusal_is_explicit() {
     let governor = &*crate::memory_governor::MEMORY_GOVERNOR;
     // Saturate the ledger with a single blocking reservation; released at
     // scope end so other parallel tests are unaffected.
-    let budget = governor.tcp_queue_bytes_budget();
-    let _block = governor
-        .try_reserve_tcp_queue_bytes(budget as usize)
-        .expect("test must be able to hold the whole TCP queue budget");
+    let _block = reserve_remaining_queue_budget(governor);
+    // With the budget exhausted the session cannot even reserve its
+    // socket buffers — the refusal surfaces at admission (capacity),
+    // before the frame ever reaches the ingress queue.
     assert_eq!(
         reactor.ingest(route, flow, ip_packet),
-        af_xdp::AfXdpTcpIngestStatus::IngressQueueFull
+        af_xdp::AfXdpTcpIngestStatus::RefusedAtCapacity
     );
     assert_eq!(reactor.queued_ingress_count(), 0);
 }
 
 #[cfg(any(test, target_os = "linux"))]
 #[test]
-fn af_xdp_tcp_ingress_frame_holds_queue_charge_until_consumed() {
-    // F3: a queued ingress packet must be charged to the byte ledger for
-    // its full residency — the charge releases when smoltcp consumes it.
+fn af_xdp_tcp_ingress_enqueue_ignores_ledger_saturation() {
+    // T9: queued packets carry no ledger charge — a saturated ledger must
+    // not starve the front door. An established session's packet still
+    // enqueues (the 512-entry bound is the only gate); without this,
+    // ledger saturation dropped established sessions' data and every new
+    // SYN at the door — measured live as a full node outage after one
+    // speed test.
     let _budget_guard = tcp_queue_budget_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -3119,18 +3265,493 @@ fn af_xdp_tcp_ingress_frame_holds_queue_charge_until_consumed() {
     else {
         panic!("expected TCP proxy frame");
     };
-    let packet_len = ip_packet.len() as u64;
-    let governor = &*crate::memory_governor::MEMORY_GOVERNOR;
-    let before = governor.tcp_queue_bytes();
     assert_eq!(
         reactor.ingest(route, flow, ip_packet),
         af_xdp::AfXdpTcpIngestStatus::Accepted
     );
-    // Concurrent tests may charge too — assert at least this packet landed.
-    assert!(governor.tcp_queue_bytes() >= before + packet_len);
+    let governor = &*crate::memory_governor::MEMORY_GOVERNOR;
+    // Saturate the ledger AFTER the session exists; released at scope
+    // end so other parallel tests are unaffected.
+    let _block = reserve_remaining_queue_budget(governor);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &ipv4_tcp_payload_frame(false, 2, 1, &[0u8; 64]))
+        .expect("valid TCP data frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    assert_eq!(
+        reactor.ingest(route, flow, ip_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+    assert_eq!(reactor.queued_ingress_count(), 2);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn ipv4_tcp_syn_frame_wscale(vlan: bool, wscale: u8) -> Vec<u8> {
+    let mut frame = ethernet_header(0x0800, vlan);
+    // TCP header is 24 bytes here: the 4-byte option area carries
+    // kind=3 (wscale), len=3, shift, plus one NOP pad.
+    let total_len = 20 + 24;
+    frame.extend_from_slice(&[
+        0x45, 0, (total_len >> 8) as u8, total_len as u8, 0, 1, 0, 0, 64, 6, 0, 0, 192, 0, 2,
+        10, 198, 51, 100, 5,
+    ]);
+    frame.extend_from_slice(&[
+        0xcf, 0x08, 0x01, 0xbb, 0, 0, 0, 1, 0, 0, 0, 0, 0x60, 0x02, 0xff, 0xff, 0, 0, 0, 0, 3,
+        3, wscale, 1,
+    ]);
+    write_ipv4_checksum(&mut frame, ethernet_header_len(vlan));
+    write_tcp4_checksum(&mut frame, ethernet_header_len(vlan));
+    frame
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn ipv4_tcp_payload_frame(vlan: bool, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = ethernet_header(0x0800, vlan);
+    let total_len = 20 + 20 + payload.len();
+    frame.extend_from_slice(&[
+        0x45, 0, (total_len >> 8) as u8, total_len as u8, 0, 1, 0, 0, 64, 6, 0, 0, 192, 0, 2,
+        10, 198, 51, 100, 5,
+    ]);
+    frame.extend_from_slice(&[
+        0xcf,
+        0x08,
+        0x01,
+        0xbb,
+        (seq >> 24) as u8,
+        (seq >> 16) as u8,
+        (seq >> 8) as u8,
+        seq as u8,
+        (ack >> 24) as u8,
+        (ack >> 16) as u8,
+        (ack >> 8) as u8,
+        ack as u8,
+        0x50,
+        0x18,
+        0xff,
+        0xff,
+        0,
+        0,
+        0,
+        0,
+    ]);
+    frame.extend_from_slice(payload);
+    write_ipv4_checksum(&mut frame, ethernet_header_len(vlan));
+    write_tcp4_checksum(&mut frame, ethernet_header_len(vlan));
+    frame
+}
+
+/// T9 test aid: pull our sequence number out of the reactor's SYN-ACK —
+/// the client's ACK/data segments must acknowledge it for smoltcp to
+/// accept them into the receive buffer.
+#[cfg(any(test, target_os = "linux"))]
+fn synack_seq(egress: &[(af_xdp::AfXdpRouteMeta, Vec<u8>)]) -> u32 {
+    let (_, ip_packet) = egress
+        .first()
+        .expect("reactor emitted no SYN-ACK frame");
+    let tcp_off = ((ip_packet[0] & 0x0f) as usize) * 4;
+    u32::from_be_bytes([
+        ip_packet[tcp_off + 4],
+        ip_packet[tcp_off + 5],
+        ip_packet[tcp_off + 6],
+        ip_packet[tcp_off + 7],
+    ])
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn af_xdp_ingest_frame(
+    reactor: &mut af_xdp::AfXdpTcpReactor,
+    frame: &[u8],
+) -> af_xdp::AfXdpTcpFlowKey {
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, frame).expect("valid TCP frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    reactor.ingest(route, flow, ip_packet);
+    flow
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_buffer_grows_to_ceiling_on_fill() {
+    // T9: a peer that keeps our advertised window ≥50% full is window-
+    // limited by us — the buffer must jump to its negotiated ceiling in
+    // one charged step. The SYN offers wscale, so the pre-negotiated
+    // ceiling shift survives the handshake.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let flow = af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_syn_frame_wscale(false, 3));
+    let egress = reactor.poll();
+    let initial_cap = reactor
+        .session_recv_capacity(&flow)
+        .expect("session missing");
+    assert!((4 * 1024..=64 * 1024).contains(&initial_cap));
+    let charge0 = reactor
+        .session_socket_buf_charge(&flow)
+        .expect("session missing");
+
+    // Complete the handshake and push >50% of the initial window.
+    let our_ack = synack_seq(&egress).wrapping_add(1);
+    let payload = vec![0x5au8; (initial_cap / 2) + 1460];
+    af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_payload_frame(false, 2, our_ack, &payload));
     reactor.poll();
-    // After consumption the frame's charge must be released.
-    assert!(governor.tcp_queue_bytes() < before + packet_len);
+
+    let grown_cap = reactor
+        .session_recv_capacity(&flow)
+        .expect("session missing");
+    // wscale was negotiated, so the ceiling shift must survive the
+    // handshake: growth lands well past the 64 KiB no-scale wire cap.
+    assert!(
+        grown_cap >= 256 * 1024,
+        "rx buffer must grow toward the 1 MiB ceiling on window fill: {grown_cap}"
+    );
+    let charge1 = reactor
+        .session_socket_buf_charge(&flow)
+        .expect("session missing");
+    assert_eq!(
+        charge1 - charge0,
+        (grown_cap - initial_cap) as u64,
+        "every grown byte must be charged to the queue ledger"
+    );
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_buffer_grows_on_paced_demand() {
+    // T9: a kernel-paced peer spreads sends below the 50% occupancy
+    // threshold — the queue never looks "full" at pump start, yet the
+    // transfer is window-limited. Cumulative drained bytes ≥ half the
+    // window must still trigger growth (drain-volume demand signal).
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let flow = af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_syn_frame_wscale(false, 3));
+    let egress = reactor.poll();
+    let initial_cap = reactor
+        .session_recv_capacity(&flow)
+        .expect("session missing");
+
+    let our_ack = synack_seq(&egress).wrapping_add(1);
+    // Three chunks of cap/4 each: every pump samples occupancy <50%
+    // (queue drained between rounds), but cumulative drain crosses
+    // cap/2 on the second round → demand → grow to the ceiling.
+    let chunk = vec![0x5au8; initial_cap / 4];
+    let mut seq = 2u32;
+    for _ in 0..3 {
+        af_xdp_ingest_frame(
+            &mut reactor,
+            &ipv4_tcp_payload_frame(false, seq, our_ack, &chunk),
+        );
+        reactor.poll();
+        seq = seq.wrapping_add(chunk.len() as u32);
+    }
+
+    let grown_cap = reactor
+        .session_recv_capacity(&flow)
+        .expect("session missing");
+    assert!(
+        grown_cap >= 256 * 1024,
+        "paced window-limited flow must grow toward the 1 MiB ceiling: {grown_cap}"
+    );
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_buffer_pool_reserves_inflight_headroom() {
+    // T9: grown socket buffers may aim at only ⅞ of the queue budget —
+    // the rest is standing headroom for in-flight byte charges and
+    // new-session minimums. Production failure that motivated this: a
+    // 104-session burst let Σ buffers equal the whole budget, stalling
+    // the drain (queueBudgetStalls) and refusing admissions.
+    let budget = crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes_budget();
+    assert_eq!(af_xdp::tcp_buffer_pool_budget(), budget * 7 / 8);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_quiet_session_keeps_small_buffers() {
+    // T9 balance: a session that never demonstrates demand (handshake
+    // only, or a sub-threshold trickle) must keep its initial buffers —
+    // quiet flows don't allocate.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let flow = af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_syn_frame_wscale(false, 3));
+    let egress = reactor.poll();
+    let initial_cap = reactor
+        .session_recv_capacity(&flow)
+        .expect("session missing");
+
+    let our_ack = synack_seq(&egress).wrapping_add(1);
+    // A single sub-threshold chunk (< cap/2 drained) must not grow.
+    let chunk = vec![0x5au8; initial_cap / 4];
+    af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_payload_frame(false, 2, our_ack, &chunk));
+    reactor.poll();
+
+    let cap = reactor
+        .session_recv_capacity(&flow)
+        .expect("session missing");
+    assert_eq!(
+        cap, initial_cap,
+        "quiet flow must keep its initial buffer: {cap} vs {initial_cap}"
+    );
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_stuck_pending_egress_goes_cold() {
+    // Regression (observed live): a session whose pending_egress cannot
+    // enter a full send buffer must NOT stay in the hot set — re-pumping
+    // it is guaranteed zero progress, and a few hundred such sessions
+    // pinned the single-vCPU reactor at 100% CPU while the wire saw only
+    // ~100pps. Blocked sessions wait for the next ACK (marks hot), a
+    // stream wake, or the sweep backstop.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let flow = af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_syn_frame_wscale(false, 3));
+    let egress = reactor.poll();
+    let our_ack = synack_seq(&egress).wrapping_add(1);
+    // Complete the handshake: seq 2 acknowledges our SYN-ACK.
+    af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_ack_frame(false, 2, our_ack));
+    reactor.poll();
+
+    // Stage an app-egress chunk far larger than the send buffer ceiling
+    // (1 MiB), then deliver a peer ACK so the flow is pumped once:
+    // `send_slice` fills the buffer and the remainder stays pending.
+    reactor.force_pending_egress_for_test(&flow, bytes::Bytes::from(vec![7u8; 2 * 1024 * 1024]));
+    af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_ack_frame(false, 2, our_ack));
+    reactor.poll();
+
+    let (queue, cap) = reactor
+        .session_send_buffer_fill(&flow)
+        .expect("session missing");
+    assert!(queue >= cap, "send buffer must be saturated: {queue}/{cap}");
+    assert!(
+        reactor.session_pending_egress_bytes(&flow).unwrap_or(0) > 0,
+        "unsent remainder must stay pending, not be dropped"
+    );
+    assert_eq!(
+        reactor.hot_session_count(),
+        0,
+        "a session blocked on a full send buffer must leave the hot set"
+    );
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_path_prior_cannot_inflate_initial_buffers() {
+    // Regression (observed live): a poisoned path prior (bw_bps × rtt × 2
+    // → tens of MB) sized a fresh session's buffers at ~19MB — charged
+    // to the ledger AND really allocated — so a handful of sessions
+    // saturated the whole queue budget. The socket ceiling bounds the
+    // initial sizing: growth past it is impossible anyway.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let peer = std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 5));
+    let local = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10));
+    let now = cloud_node_transport::TransportInstant::from_micros(
+        reactor.clock_now_micros().max(0) as u64,
+    );
+    reactor.path_table().borrow_mut().record(
+        cloud_node_transport::PathKey {
+            egress_ifindex: 0,
+            local_ip: local,
+            dst_prefix: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 0)),
+            prefix_len: 24,
+        },
+        cloud_node_transport::PathSample {
+            bw_bps: 50_000_000_000, // absurd: ~400 Gbit/s
+            base_rtt: std::time::Duration::from_secs(3),
+            p_rand: 0.0,
+            alpha: 0.0,
+            reorder: 0.0,
+            connect_rtt: None,
+            failed: false,
+        },
+        now,
+    );
+    let want = reactor.socket_buffer_bytes(peer, local);
+    assert!(
+        want <= af_xdp::AF_XDP_TCP_SOCKET_BUFFER_MAX,
+        "prior-inflated estimate must be clamped to the socket ceiling: {want}"
+    );
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_buffer_growth_capped_without_wscale() {
+    // T9: a peer without RFC 1323 pins the wire window to 64 KiB —
+    // growth must stop at the negotiated wire cap instead of allocating
+    // unreachable headroom.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let flow = af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_syn_frame(false));
+    let egress = reactor.poll();
+    let initial_cap = reactor
+        .session_recv_capacity(&flow)
+        .expect("session missing");
+
+    let our_ack = synack_seq(&egress).wrapping_add(1);
+    let payload = vec![0x5au8; (initial_cap / 2) + 1460];
+    af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_payload_frame(false, 2, our_ack, &payload));
+    reactor.poll();
+
+    let grown_cap = reactor
+        .session_recv_capacity(&flow)
+        .expect("session missing");
+    assert!(
+        grown_cap > initial_cap && grown_cap <= u16::MAX as usize,
+        "no-wscale peer caps growth at the 64 KiB wire window: {grown_cap}"
+    );
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_cap_parked_session_survives_stall_deadline() {
+    // T9 production regression: a session parked on its fair-share drain
+    // cap (channel backlog, consumer-bound) shared `stalled_since` with
+    // ledger stalls — the 10s zombie deadline reaped healthy transfers
+    // whose reader was merely slow, observed on-node as uploads dying
+    // mid-test while the ledger still had room. Cap parks must survive
+    // BUDGET_STALL_DEADLINE and only die at the longer CAP_PARK_DEADLINE
+    // (zero consumer progress for 30s = dead reader).
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use std::time::Duration;
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let clock = reactor.install_manual_clock_for_test();
+    let t0 = smoltcp::time::Instant::from_micros(clock.now_micros());
+    let frame = ipv4_tcp_syn_frame_with_source_port(false, 53500);
+    let af_xdp::AfXdpProxyFrame::Tcp { route, flow, .. } =
+        af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    assert!(reactor.ensure_session_at(
+        route,
+        flow,
+        af_xdp::AfXdpTcpProxyClass::TcpPlain,
+        t0
+    ));
+    reactor.force_cap_parked_since_for_test(&flow, t0);
+
+    // Past the ledger-stall deadline a cap-parked session must still be
+    // alive — the socket never completed handshake so can_recv() keeps
+    // the park marker from clearing.
+    clock.advance(af_xdp::AF_XDP_TCP_BUDGET_STALL_DEADLINE + Duration::from_millis(1));
+    reactor.poll();
+    assert!(
+        reactor.has_session(&flow),
+        "cap-parked session must survive the ledger-stall deadline"
+    );
+
+    // With zero consumer progress the cap deadline reaps it instead.
+    clock.advance(af_xdp::AF_XDP_TCP_CAP_PARK_DEADLINE);
+    reactor.poll();
+    assert!(
+        !reactor.has_session(&flow),
+        "cap-parked session with a dead reader must be reaped at the cap deadline"
+    );
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_idle_session_returns_grown_buffers() {
+    // T9: a session that grew its buffers on demand must hand the grown
+    // capacity back once it goes quiet — the ledger charge follows the
+    // allocation, so an idle session holding peak-size buffers pins the
+    // budget for every other session until reap. Idle ≥ SHRINK_AFTER
+    // with all queues empty → resize to the admission floor and unwind
+    // the growth-permit stack exactly.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use std::time::Duration;
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let clock = reactor.install_manual_clock_for_test();
+    let flow = af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_syn_frame_wscale(false, 3));
+    let egress = reactor.poll();
+    let initial_cap = reactor
+        .session_recv_capacity(&flow)
+        .expect("session missing");
+    let charge0 = reactor
+        .session_socket_buf_charge(&flow)
+        .expect("session missing");
+
+    let our_ack = synack_seq(&egress).wrapping_add(1);
+    let payload = vec![0x5au8; (initial_cap / 2) + 1460];
+    af_xdp_ingest_frame(&mut reactor, &ipv4_tcp_payload_frame(false, 2, our_ack, &payload));
+    reactor.poll();
+    let grown_cap = reactor
+        .session_recv_capacity(&flow)
+        .expect("session missing");
+    assert!(grown_cap > initial_cap, "precondition: buffers grew");
+
+    // Quiet for longer than the shrink threshold — queues are empty
+    // (auto-start sessions have no channel, so drained bytes are
+    // consumed immediately) and the sweep must return the growth.
+    clock.advance(af_xdp::AF_XDP_TCP_IDLE_SHRINK_AFTER + Duration::from_secs(1));
+    reactor.poll();
+
+    let shrunk_cap = reactor
+        .session_recv_capacity(&flow)
+        .expect("session missing");
+    let charge1 = reactor
+        .session_socket_buf_charge(&flow)
+        .expect("session missing");
+    assert_eq!(
+        shrunk_cap, initial_cap,
+        "idle session must return grown buffer capacity: {shrunk_cap} vs {initial_cap}"
+    );
+    assert_eq!(
+        charge1, charge0,
+        "idle shrink must unwind the growth-permit stack exactly"
+    );
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn smoltcp_ring_buffer_resize_preserves_wrapped_data() {
+    // T9 fork API: resize must linearize wrapped ring contents — data
+    // queued around the buffer end lands intact and in order.
+    let mut ring = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; 8]);
+    assert_eq!(ring.enqueue_slice(&[1, 2, 3, 4, 5, 6]), 6);
+    let mut out = [0u8; 4];
+    assert_eq!(ring.dequeue_slice(&mut out), 4);
+    assert_eq!(out, [1, 2, 3, 4]);
+    // read_at is now 4 with len 2; enqueueing 5 wraps the tail past the
+    // buffer end — the non-contiguous case resize must linearize.
+    assert_eq!(ring.enqueue_slice(&[7, 8, 9, 10, 11]), 5);
+    assert!(ring.resize(16));
+    assert_eq!(ring.capacity(), 16);
+    assert_eq!(ring.len(), 7);
+    let mut drained = [0u8; 7];
+    assert_eq!(ring.dequeue_slice(&mut drained), 7);
+    assert_eq!(drained, [5, 6, 7, 8, 9, 10, 11]);
+    // Refusals: shrinking below queued length, or a no-op size.
+    let mut ring2 = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; 8]);
+    assert_eq!(ring2.enqueue_slice(&[1, 2, 3, 4, 5]), 5);
+    assert!(!ring2.resize(4));
+    assert!(!ring2.resize(8));
+    assert_eq!(ring2.len(), 5);
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -3165,9 +3786,7 @@ async fn af_xdp_tcp_write_budget_stall_wakes_on_release() {
         reactor.budget_stall.clone(),
     );
     let governor = &*crate::memory_governor::MEMORY_GOVERNOR;
-    let block = governor
-        .try_reserve_tcp_queue_bytes(governor.tcp_queue_bytes_budget() as usize)
-        .expect("test must be able to hold the whole TCP queue budget");
+    let block = reserve_remaining_queue_budget(governor);
 
     let mut write = Box::pin(stream.write_all(b"abc"));
     assert!(write.as_mut().now_or_never().is_none());
@@ -5258,6 +5877,12 @@ fn xdp_transport_path_prior_round_trip() {
 
 #[test]
 fn xdp_socket_buffer_sizing_uses_bdp_prior_and_budget_cap() {
+    // Session creation charges the global TCP queue ledger — serialize
+    // against budget tests.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     let peer: IpAddr = "203.0.113.7".parse().unwrap();
     let local: IpAddr = "192.0.2.10".parse().unwrap();
     let reactor =
@@ -5297,10 +5922,12 @@ fn xdp_socket_buffer_sizing_uses_bdp_prior_and_budget_cap() {
         &snap,
         false,
     );
-    // 2 × 10MB/s × 50ms = 1MB — bounded by the per-conn budget share.
+    // 2 × 10MB/s × 50ms = 1MB — bounded by the live-session share of the
+    // queue budget: the reactor holds zero sessions, so the incoming
+    // socket may claim up to budget/(0+1)/2 per direction.
     let budget_share = (crate::memory_governor::MEMORY_GOVERNOR
         .tcp_queue_bytes_budget()
-        / (64 * 2))
+        / 2)
     .min(usize::MAX as u64) as usize;
     let expect = (1_000_000usize).min(budget_share.max(4 * 1024));
     assert_eq!(reactor.socket_buffer_bytes(peer, local), expect);

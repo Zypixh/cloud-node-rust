@@ -76,6 +76,16 @@ const AF_XDP_TCP_MAX_SESSION_LIMIT: usize = 16_384;
 const AF_XDP_TCP_IDLE_PROFILE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_RECV_SCRATCH_BYTES: usize = 16 * 1024;
+/// T9: in-session buffer growth ceiling per direction. The advertised
+/// window shift is negotiated for this size at socket creation
+/// (`set_rx_window_shift_for_ceiling`), so buffers can grow into it
+/// without re-handshaking. 1 MiB ≈ 74 Mbps per leg at 113 ms RTT.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_SOCKET_BUFFER_MAX: usize = 1024 * 1024;
+/// T9: smallest worthwhile charged growth step — below this the
+/// allocation churn outweighs the window gain.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_BUFFER_GROW_MIN_DELTA: usize = 16 * 1024;
 /// EN-17: bound on sessions pumped per poll round — a large session table
 /// cannot starve TX/timers under RX flood.
 #[cfg(any(test, target_os = "linux"))]
@@ -110,6 +120,35 @@ pub(crate) const AF_XDP_TCP_BUDGET_STALL_MAX: usize = 2 * AF_XDP_TCP_MAX_SESSION
 pub(crate) const AF_XDP_TCP_SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// T9: a session parked on the queue-ledger budget dies after this long
+/// regardless of arriving packets. Without it the stall is an immortal
+/// zombie: client retransmissions keep refreshing `last_activity`, idle
+/// reap never fires, and the session's buffer permits pin the ledger
+/// for every other session — measured on-node as a permanent refusal
+/// state after one saturation event ("断网").
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_BUDGET_STALL_DEADLINE: Duration = Duration::from_secs(10);
+/// T9: a session parked on its fair-share *drain cap* (bounded channel
+/// backlog, not the ledger) is reaped after this long with zero consumer
+/// progress — the reader died but peer traffic keeps `last_activity`
+/// fresh. Deliberately longer than BUDGET_STALL_DEADLINE: the parked
+/// bytes are already bounded so this is zombie GC, not memory pressure.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_CAP_PARK_DEADLINE: Duration = Duration::from_secs(30);
+/// T9: an established session whose socket queues, channel backlog and
+/// pending chunks have all been empty for this long returns its grown
+/// buffers to the ledger (capacity resize + growth-permit release).
+/// Growth is demand-proven again on the next burst, so the shrink only
+/// costs one window's worth of ramp-up — while idle holdings were
+/// measured pinning the whole queue budget long after traffic stopped.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_IDLE_SHRINK_AFTER: Duration = Duration::from_secs(2);
+/// T9: after a refused growth charge, wait this long before trying
+/// again. Per-pump retries against a full ledger were measured at
+/// ~11M CAS attempts/min — enough to starve the single reactor thread
+/// by themselves.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_GROWTH_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// Unverified (pre-proxy) sessions hold a bounded share of the session
 /// table: a peer that has not completed handshake + first payload is the
 /// cheapest class to churn under pressure — scanners and SYN floods must
@@ -159,14 +198,16 @@ static AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// EN-17: egress wake signals received from proxy tasks.
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_WAKE_SIGNALS: AtomicU64 = AtomicU64::new(0);
-/// EN-17/F3: ingress packets refused because the node TCP queue byte
-/// budget was exhausted (distinct from the per-reactor frame queue).
-#[cfg(target_os = "linux")]
-static AF_XDP_TCP_DIAG_INGRESS_BUDGET_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// EN-17/F3: queue-byte-budget backpressure events — a recv drain parked
-/// or a stream write suspended.
+/// on the ledger (or a session drain cap).
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_BUDGET_STALLS: AtomicU64 = AtomicU64::new(0);
+/// T9: stream `poll_write` suspensions on the queue ledger — counted
+/// separately from drain stalls because an upload direction stalls here
+/// while downloads stall there; parked writers wake on
+/// `release_budget_backpressure`.
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_WRITE_STALLS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_SESSIONS_CURRENT: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
@@ -177,6 +218,38 @@ static AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED: AtomicU64 = AtomicU64::new(0);
 static AF_XDP_TCP_DIAG_PER_IP_EVICTED: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Sessions refused because the TCP queue ledger could not reserve even a
+/// minimal socket-buffer pair — capacity is charged, so this is the
+/// fail-closed edge of honest accounting, not a silent fallback.
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_BUFFER_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// T9: successful in-session buffer growth steps (rx or tx) — each one
+/// was charged to the queue ledger before the allocation grew.
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_BUFFER_GROWTH: AtomicU64 = AtomicU64::new(0);
+/// T9: growth attempts refused by the ledger even at the minimum step —
+/// the session keeps its current window; this is observable backpressure,
+/// not a failure.
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_BUFFER_GROW_STALL: AtomicU64 = AtomicU64::new(0);
+/// T9: sessions reaped by the budget-stall deadline while still parked on
+/// the queue ledger — each one is a zombie whose retransmissions would
+/// otherwise have kept `last_activity` fresh forever and pinned its
+/// buffer permits permanently.
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_STALL_REAPED: AtomicU64 = AtomicU64::new(0);
+/// T9: drain-cap parks — the session hit its fair share of drained-but-
+/// unconsumed bytes (consumer-bound backpressure, distinct from ledger
+/// stalls which mean the account itself was full).
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_CAP_PARKS: AtomicU64 = AtomicU64::new(0);
+/// T9: sessions reaped after parking on the drain cap with zero consumer
+/// progress for AF_XDP_TCP_CAP_PARK_DEADLINE — a dead reader.
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_CAP_REAPED: AtomicU64 = AtomicU64::new(0);
+/// T9: idle sessions that returned grown socket buffers to the ledger.
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_BUFFER_SHRINKS: AtomicU64 = AtomicU64::new(0);
 
 /// T1: live per-session transport snapshots surfaced through /status.
 /// Queue workers refresh their rows during each amortized sweep; rows are
@@ -226,13 +299,20 @@ pub(crate) fn reset_tcp_diag() {
     AF_XDP_TCP_DIAG_EGRESS_FRAMES.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_WAKE_SIGNALS.store(0, Ordering::Relaxed);
-    AF_XDP_TCP_DIAG_INGRESS_BUDGET_DROPPED.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_BUDGET_STALLS.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_WRITE_STALLS.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_SESSIONS_CURRENT.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_PER_IP_EVICTED.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_BUFFER_REFUSED.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_BUFFER_GROWTH.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_BUFFER_GROW_STALL.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_STALL_REAPED.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_CAP_PARKS.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_CAP_REAPED.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_BUFFER_SHRINKS.store(0, Ordering::Relaxed);
 }
 
 /// Compact scalar-only diag line for periodic journal visibility —
@@ -248,10 +328,117 @@ pub fn tcp_diag_scalars() -> serde_json::Value {
         "preProxyEvicted": AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED.load(Ordering::Relaxed),
         "perIpPreProxyEvicted": AF_XDP_TCP_DIAG_PER_IP_EVICTED.load(Ordering::Relaxed),
         "preProxyRefused": AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED.load(Ordering::Relaxed),
+        "bufferRefused": AF_XDP_TCP_DIAG_BUFFER_REFUSED.load(Ordering::Relaxed),
+        "bufferGrowth": AF_XDP_TCP_DIAG_BUFFER_GROWTH.load(Ordering::Relaxed),
+        "bufferGrowStall": AF_XDP_TCP_DIAG_BUFFER_GROW_STALL.load(Ordering::Relaxed),
+        "budgetStallReaped": AF_XDP_TCP_DIAG_STALL_REAPED.load(Ordering::Relaxed),
         "proxyStarted": AF_XDP_TCP_DIAG_PROXY_STARTED.load(Ordering::Relaxed),
+        "egressFrames": AF_XDP_TCP_DIAG_EGRESS_FRAMES.load(Ordering::Relaxed),
         "ingressQueueDropped": AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED.load(Ordering::Relaxed),
         "queueBudgetStalls": AF_XDP_TCP_DIAG_BUDGET_STALLS.load(Ordering::Relaxed),
+        "writeBudgetStalls": AF_XDP_TCP_DIAG_WRITE_STALLS.load(Ordering::Relaxed),
+        "drainCapParks": AF_XDP_TCP_DIAG_CAP_PARKS.load(Ordering::Relaxed),
+        "drainCapReaped": AF_XDP_TCP_DIAG_CAP_REAPED.load(Ordering::Relaxed),
+        "bufferShrinks": AF_XDP_TCP_DIAG_BUFFER_SHRINKS.load(Ordering::Relaxed),
+        "tcpQueueBytes": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes(),
+        "tcpQueueBytesBudget": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes_budget(),
+        "accountGrantable": crate::memory_governor::MEMORY_GOVERNOR.account_view().grantable_bytes,
+        "accountUnconfirmed": crate::memory_governor::MEMORY_GOVERNOR.account_view().committed_unconfirmed_bytes,
+        "accountRejects": crate::memory_governor::MEMORY_GOVERNOR.account_view().rejects_total,
+        // T9: top ledger holders — distinguishes "ledger full from many
+        // sessions" vs "one runaway" without the monitor endpoint. Capped
+        // at 3 rows; each row is a trimmed copy of the full snapshot.
+        "topHeld": tcp_top_held_json(3),
+        "topActive": tcp_top_active_json(3),
     })
+}
+
+/// T9: compact top-N holder rows for the journal diag line. `heldBytes`
+/// sums the per-session ledger-visible residency (socket buffer charge +
+/// pending chunks); queue/CC fields let a single row explain *why* the
+/// bytes sit (send backlog vs recv backlog vs congestion).
+#[cfg(target_os = "linux")]
+fn tcp_top_held_json(n: usize) -> serde_json::Value {
+    let mut scored: Vec<(u64, serde_json::Value)> = AF_XDP_TCP_SESSION_SNAPSHOTS
+        .iter()
+        .map(|entry| {
+            let row = entry.value();
+            // socket occupancy (sendQ/recvQ) lives inside the charged
+            // buffer capacity — counting it again would double-book.
+            let held = row["socketBufChargeBytes"].as_u64().unwrap_or(0)
+                + row["pendingIngressBytes"].as_u64().unwrap_or(0)
+                + row["pendingEgressBytes"].as_u64().unwrap_or(0);
+            (held, row.clone())
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    serde_json::json!(scored
+        .into_iter()
+        .take(n)
+        .map(|(held, row)| serde_json::json!({
+            "peer": row["peer"],
+            "local": row["local"],
+            "class": row["class"],
+            "state": row["state"],
+            "heldBytes": held,
+            "cwnd": row["cwndBytes"],
+            "rttUs": row["minRttMicros"],
+            "sendQ": row["sendQueueBytes"],
+            "recvQ": row["recvQueueBytes"],
+            "pendIn": row["pendingIngressBytes"],
+            "pendEg": row["pendingEgressBytes"],
+            // EdgeCC observability — why the window/rate sits where it
+            // does (mode + reason + model outputs), not just its size.
+            "ccMode": row["ccMode"],
+            "ccReason": row["reasonCode"],
+            "paceBps": row["pacingRateBps"],
+            "beliefMilli": row["beliefMilli"],
+            "envelopeBytes": row["envelopeBytes"],
+            "bwSigmaBps": row["bwSigmaBps"],
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// Throughput-facing view of live sessions: rank by real queue pressure
+/// (socket queues + pending chunks) rather than charged capacity, so
+/// actively-moving flows don't hide behind idle big-buffered sessions.
+#[cfg(target_os = "linux")]
+fn tcp_top_active_json(n: usize) -> serde_json::Value {
+    let mut scored: Vec<(u64, serde_json::Value)> = AF_XDP_TCP_SESSION_SNAPSHOTS
+        .iter()
+        .map(|entry| {
+            let row = entry.value();
+            let active = row["sendQueueBytes"].as_u64().unwrap_or(0)
+                + row["recvQueueBytes"].as_u64().unwrap_or(0)
+                + row["pendingIngressBytes"].as_u64().unwrap_or(0)
+                + row["pendingEgressBytes"].as_u64().unwrap_or(0);
+            (active, row.clone())
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    serde_json::json!(scored
+        .into_iter()
+        .take(n)
+        .map(|(active, row)| serde_json::json!({
+            "peer": row["peer"],
+            "local": row["local"],
+            "class": row["class"],
+            "state": row["state"],
+            "activeBytes": active,
+            "cwnd": row["cwndBytes"],
+            "rttUs": row["minRttMicros"],
+            "sendQ": row["sendQueueBytes"],
+            "pendIn": row["pendingIngressBytes"],
+            "pendEg": row["pendingEgressBytes"],
+            "ccMode": row["ccMode"],
+            "ccReason": row["reasonCode"],
+            "paceBps": row["pacingRateBps"],
+            "remoteWin": row["remoteWinBytes"],
+            "unacked": row["unackedBytes"],
+            "pipe": row["pipeBytes"],
+            "timer": row["timerState"],
+        }))
+        .collect::<Vec<_>>())
 }
 
 #[cfg(target_os = "linux")]
@@ -268,13 +455,20 @@ pub(crate) fn tcp_diag_snapshot() -> serde_json::Value {
         "egressFrames": AF_XDP_TCP_DIAG_EGRESS_FRAMES.load(Ordering::Relaxed),
         "ingressQueueDropped": AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED.load(Ordering::Relaxed),
         "wakeSignals": AF_XDP_TCP_DIAG_WAKE_SIGNALS.load(Ordering::Relaxed),
-        "ingressBudgetDropped": AF_XDP_TCP_DIAG_INGRESS_BUDGET_DROPPED.load(Ordering::Relaxed),
         "queueBudgetStalls": AF_XDP_TCP_DIAG_BUDGET_STALLS.load(Ordering::Relaxed),
+        "writeBudgetStalls": AF_XDP_TCP_DIAG_WRITE_STALLS.load(Ordering::Relaxed),
+        "drainCapParks": AF_XDP_TCP_DIAG_CAP_PARKS.load(Ordering::Relaxed),
+        "drainCapReaped": AF_XDP_TCP_DIAG_CAP_REAPED.load(Ordering::Relaxed),
+        "bufferShrinks": AF_XDP_TCP_DIAG_BUFFER_SHRINKS.load(Ordering::Relaxed),
         "sessionsCurrent": AF_XDP_TCP_DIAG_SESSIONS_CURRENT.load(Ordering::Relaxed),
         "preProxyCurrent": AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT.load(Ordering::Relaxed),
         "preProxyEvicted": AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED.load(Ordering::Relaxed),
         "perIpPreProxyEvicted": AF_XDP_TCP_DIAG_PER_IP_EVICTED.load(Ordering::Relaxed),
         "preProxyRefused": AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED.load(Ordering::Relaxed),
+        "bufferRefused": AF_XDP_TCP_DIAG_BUFFER_REFUSED.load(Ordering::Relaxed),
+        "bufferGrowth": AF_XDP_TCP_DIAG_BUFFER_GROWTH.load(Ordering::Relaxed),
+        "bufferGrowStall": AF_XDP_TCP_DIAG_BUFFER_GROW_STALL.load(Ordering::Relaxed),
+        "budgetStallReaped": AF_XDP_TCP_DIAG_STALL_REAPED.load(Ordering::Relaxed),
         "tcpQueueBytes": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes(),
         "tcpQueueBytesBudget": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes_budget(),
         "sessions": tcp_session_snapshots_json(),

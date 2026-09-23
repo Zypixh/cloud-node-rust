@@ -114,10 +114,13 @@ impl PendingTx {
     }
 }
 
-/// T8: per-worker TX retry capacity — 64 × ≤2KiB ≈ 128KiB worst case,
-/// worker-local, never cross-thread.
+/// T8: per-worker deferred-TX queue depth — 256 × ≤2KiB ≈ 512KiB worst
+/// case, worker-local, never cross-thread. This is the real congestion
+/// queue once the xsk ring's in-flight cap (see linux.rs) keeps the ring
+/// shallow: bursts beyond what the NIC drains sit here under CoDel's
+/// 5ms-sojourn AQM — bounded memory, bounded delay, explicit drops.
 #[cfg(target_os = "linux")]
-const AF_XDP_TX_RETRY_CAP: usize = 64;
+const AF_XDP_TX_RETRY_CAP: usize = 256;
 
 /// CAKE-style per-frame overhead charged to the egress token bucket
 /// (Ethernet preamble+IFG+header+FCS ≈ 38B).
@@ -370,6 +373,13 @@ pub(crate) struct AfXdpQueueCtx {
     /// T8 (D-G2): this worker's share of `xdp.egressRateBps`. `None` =
     /// no shaping (configured budget split evenly across workers).
     pub(crate) egress_rate_bps: Option<u64>,
+    /// Per-session proxy tasks (TLS handshake, L7 protocol work, upstream
+    /// kernel-socket I/O) must not run on this queue's current-thread
+    /// reactor — on a single-core box a handshake's synchronous crypto
+    /// stalls `poll_egress` and every other session's timers behind it.
+    /// They spawn on the process-wide multi-thread runtime instead; the
+    /// reactor only ever owns the dataplane (XSK, smoltcp, channels).
+    pub(crate) proxy_rt: tokio::runtime::Handle,
 }
 
 pub fn runtime() -> AfXdpRuntime {
@@ -682,6 +692,7 @@ pub(crate) async fn spawn_queue_reactors(
             iface_fwd: Arc::new(HashMap::new()),
             lease: lease.clone(),
             egress_rate_bps: None,
+            proxy_rt: tokio::runtime::Handle::current(),
         });
     }
     // Publish only after every queue is registered — and only when the
@@ -1004,6 +1015,7 @@ pub(crate) async fn run_queue_bridge_loop(
         iface_fwd,
         lease,
         egress_rate_bps,
+        proxy_rt,
     } = ctx;
     let own_interface: Arc<str> = Arc::from(queue_handle.interface.as_str());
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1013,6 +1025,9 @@ pub(crate) async fn run_queue_bridge_loop(
     // T1: label the reactor so per-session /status snapshots are keyed by
     // the owning queue (the same 4-tuple may exist on multiple queues).
     tcp_reactor.set_label(format!("{own_interface}:{}", queue_handle.queue));
+    // Per-session L7 work (TLS, HTTP parse, upstream I/O) runs on the
+    // process runtime — the reactor thread keeps dataplane cadence.
+    tcp_reactor.set_proxy_runtime(proxy_rt);
     // T4: the reactor releases demux/CT/port state itself when a dialed
     // session reaps — never leave it to the caller.
     tcp_reactor.set_dial_registry(dial_registry.clone());
@@ -1040,10 +1055,17 @@ pub(crate) async fn run_queue_bridge_loop(
         std::collections::VecDeque::new();
     // T5/T6: transport policy comes from the lease owner — on an adopted
     // reload that is the live manager's config (the compatibility gate
-    // already rejected any transport change, so old == new here).
-    if let Some(policy) = lease.owner().config.transport.as_ref() {
-        tcp_reactor.set_transport_policy(policy);
-    }
+    // already rejected any transport change, so old == new here). The
+    // controller is pinned to EdgeCC for production; ablation selection
+    // stays available only to validation code paths.
+    let policy = lease
+        .owner()
+        .config
+        .transport
+        .as_ref()
+        .map(|settings| settings.production_pinned())
+        .unwrap_or_default();
+    tcp_reactor.set_transport_policy(&policy);
     let mut consecutive_poll_errors = 0u32;
     let mut tx_failures = AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TX_FAILURES);
     let mut udp_ingress_failures =
@@ -1252,6 +1274,7 @@ pub(crate) async fn run_queue_bridge_loop(
                     status.admission_refusals = admission_refusals;
                     status.aqm_drops = aqm_drops;
                     status.aqm_ce_marks = aqm_ce_marks;
+                    status.tx_inflight = queue_handle.tx_inflight() as u64;
                 },
             );
         }

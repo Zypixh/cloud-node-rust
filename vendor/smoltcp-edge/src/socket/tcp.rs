@@ -532,6 +532,10 @@ pub struct Socket<'a> {
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
+    /// smoltcp-edge (T9): floor for `remote_win_shift` that survives
+    /// `reset()` — lets the advertised scale cover a growth ceiling
+    /// larger than the initial receive buffer. 0 = upstream behavior.
+    rx_win_shift_floor: u8,
     /// The remote window size, relative to local_seq_no
     /// I.e. we're allowed to send octets until local_seq_no+remote_win_len
     remote_win_len: usize,
@@ -716,6 +720,7 @@ impl<'a> Socket<'a> {
             remote_last_win: 0,
             remote_win_len: 0,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
+            rx_win_shift_floor: 0,
             remote_win_scale: None,
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
@@ -812,6 +817,43 @@ impl<'a> Socket<'a> {
     /// a new-data segment. `None` when unpaced or no controller is set.
     pub fn transport_next_send_due(&self) -> Option<Instant> {
         self.ext_transport.as_ref().and_then(|e| e.next_send_due)
+    }
+
+    /// smoltcp-edge (observability): peer-advertised send window in
+    /// bytes — `remote_win_len` after window-scale is applied. Zero is
+    /// the zero-window-probe regime (sender cannot emit data).
+    pub fn remote_window(&self) -> usize {
+        self.remote_win_len
+    }
+
+    /// smoltcp-edge (observability): bytes transmitted but not yet
+    /// cumulatively ACKed (`flight_size`, whole unacked range —
+    /// including records the scoreboard already marked lost).
+    pub fn unacked_bytes(&self) -> usize {
+        self.flight_size()
+    }
+
+    /// smoltcp-edge (observability): scoreboard pipe — records counted
+    /// in flight by Linux `tcp_packets_in_flight` semantics (SACKed and
+    /// lost-marked records excluded). `None` without an external
+    /// controller.
+    pub fn transport_pipe(&self) -> Option<usize> {
+        self.ext_transport.as_ref().map(|e| e.pipe)
+    }
+
+    /// smoltcp-edge (observability): retransmit/zero-window/idle timer
+    /// state name — distinguishes "waiting on RTO" from "timer disarmed"
+    /// in remote diagnostics.
+    pub fn timer_state(&self) -> &'static str {
+        match self.timer {
+            Timer::Idle { keep_alive_at } => {
+                if keep_alive_at.is_some() { "keepalive" } else { "idle" }
+            }
+            Timer::Retransmit { .. } => "retransmit",
+            Timer::FastRetransmit => "fast_retransmit",
+            Timer::ZeroWindowProbe { .. } => "zero_window_probe",
+            Timer::Close { .. } => "close",
+        }
     }
 
     /// smoltcp-edge (T3): dynamic advertised-window cap. `Some(cap)`
@@ -1246,7 +1288,12 @@ impl<'a> Socket<'a> {
         self.remote_last_win = 0;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
-        self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
+        // smoltcp-edge (T9): `rx_win_shift_floor` survives reset — a
+        // ceiling configured via `set_rx_window_shift_for_ceiling` keeps
+        // the negotiated scale reachable across re-listen.
+        self.remote_win_shift = rx_cap_log2
+            .saturating_sub(16)
+            .max(self.rx_win_shift_floor as usize) as u8;
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
         // smoltcp-edge (T7): reset returns the socket to responder
@@ -1565,6 +1612,53 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn send_capacity(&self) -> usize {
         self.tx_buffer.capacity()
+    }
+
+    /// smoltcp-edge (T9): grow the receive buffer in place, preserving
+    /// queued data in ring order. The advertised window can only make
+    /// use of capacity up to `rx_window_wire_cap()` — anything past the
+    /// negotiated scale is heap without wire effect. Returns false (and
+    /// leaves the buffer untouched) when the new capacity cannot hold
+    /// queued data.
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    pub fn grow_recv_buffer(&mut self, new_capacity: usize) -> bool {
+        self.rx_buffer.resize(new_capacity)
+    }
+
+    /// smoltcp-edge (T9): grow the transmit buffer in place — no wire
+    /// negotiation is involved, the buffer is purely local queuing.
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    pub fn grow_send_buffer(&mut self, new_capacity: usize) -> bool {
+        self.tx_buffer.resize(new_capacity)
+    }
+
+    /// smoltcp-edge (T9): the largest receive window encodable on the
+    /// wire under the currently effective scale — `u16::MAX` shifted by
+    /// `remote_win_shift`. Before the handshake completes this reflects
+    /// the pre-negotiation value; a peer without RFC 1323 support pins
+    /// the shift to 0 (64 KiB wire cap) during the handshake.
+    #[inline]
+    pub fn rx_window_wire_cap(&self) -> usize {
+        (u16::MAX as usize) << self.remote_win_shift
+    }
+
+    /// smoltcp-edge (T9): raise the advertised window shift as if the
+    /// receive buffer were `ceiling_capacity` bytes, so later
+    /// `grow_recv_buffer` calls stay encodable on the wire. Must be
+    /// called before the socket emits SYN/SYN-ACK — the shift is
+    /// negotiated there and fixed for the connection. Only ever raises
+    /// the shift; a peer that does not offer window scaling zeroes it
+    /// at handshake anyway. The configured floor survives `reset()` so
+    /// a re-listen keeps the ceiling reachable.
+    pub fn set_rx_window_shift_for_ceiling(&mut self, ceiling_capacity: usize) {
+        let log2 = mem::size_of::<usize>() * 8
+            - (ceiling_capacity | 1).leading_zeros() as usize;
+        // RFC 1323 caps the shift at 14 (2 GiB windows).
+        let shift = (log2.saturating_sub(16) as u8).min(14);
+        self.rx_win_shift_floor = self.rx_win_shift_floor.max(shift);
+        if shift > self.remote_win_shift {
+            self.remote_win_shift = shift;
+        }
     }
 
     /// Check whether the receive buffer is not empty.
