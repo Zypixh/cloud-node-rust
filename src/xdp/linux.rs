@@ -390,6 +390,13 @@ impl AfXdpQueueHandle {
     where
         F: FnMut(&str, u32, Vec<u8>),
     {
+        // Drain TX completions unconditionally — reclaiming only inside the
+        // send path leaves the last sent frames' completions parked in the
+        // CQ once traffic stops, which keeps the xsk fd permanently readable
+        // and turns the reactor's idle wait into a hot loop (observed live:
+        // afxdp worker pinned at ~20% CPU on an idle queue, POLLIN re-arming
+        // every round).
+        self.reclaim_tx_completions();
         let mut stats = AfXdpPollStats {
             refilled: self.replenish_fill()?,
             ..AfXdpPollStats::default()
