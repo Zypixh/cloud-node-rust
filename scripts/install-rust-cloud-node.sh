@@ -35,9 +35,20 @@ DRY_RUN=0
 # XDP dataplane is enabled by default (bidirectional: inbound proxy +
 # outbound AF_XDP upstream). --no-xdp / ENABLE_XDP=no opts out explicitly.
 # When XDP is enabled the dataplane is always bidirectional — there is no
-# kernel-outbound mode to select.
+# kernel-outbound mode to select. XDP_EXPLICIT records whether the
+# operator actually asked for XDP (flag or env) — it decides whether a
+# degraded kernel may keep the default or must flip it to disabled.
+XDP_EXPLICIT=0
+if [ -n "${ENABLE_XDP+x}" ]; then
+    XDP_EXPLICIT=1
+fi
 ENABLE_XDP="${ENABLE_XDP:-yes}"
 XDP_IFACE="${XDP_IFACE:-}"
+# --upgrade-kernel / UPGRADE_KERNEL=yes lets the installer install a newer
+# distribution kernel when the running one cannot host the AF_XDP
+# dataplane. A kernel upgrade always needs a reboot, so XDP stays disabled
+# for that run either way.
+UPGRADE_KERNEL="${UPGRADE_KERNEL:-no}"
 
 # Backwards-compatible environment mappings from the previous installer.
 case "${START_MODE:-}" in
@@ -103,6 +114,14 @@ Options / 选项:
   --xdp-iface NAME       Bind XDP to interface NAME. Default: auto-detect the
                          default-route interface.
                          XDP 绑定的网卡名；默认自动探测默认路由网卡。
+  --upgrade-kernel       If the running kernel cannot host the AF_XDP
+                         dataplane, install a newer distribution kernel
+                         (Debian backports / Ubuntu HWE / ELRepo kernel-ml).
+                         A reboot is required afterwards; XDP stays disabled
+                         until the host runs the new kernel.
+                         运行内核无法承载 AF_XDP 数据面时，安装发行版更新内核
+                         （Debian backports / Ubuntu HWE / ELRepo kernel-ml）。
+                         升级后需要重启；重启前 XDP 保持禁用。
   --no-start             Do not start/restart the service after install.
                          安装后不启动/重启服务。
   --dry-run              Print actions without changing files.
@@ -115,7 +134,7 @@ Options / 选项:
 Environment variables with the same names are also supported:
   REPO, VERSION, SERVICE_NAME, INSTALL_DIR, INSTALL_BINARY, BACKUP_ROOT,
   AUTO_START, GEOIP_DIR, GEOIP_BASE_URL, RESTORE_BACKUP, API_ENDPOINTS,
-  NODE_ID, NODE_SECRET, TIMEZONE, ENABLE_XDP, XDP_IFACE.
+  NODE_ID, NODE_SECRET, TIMEZONE, ENABLE_XDP, XDP_IFACE, UPGRADE_KERNEL.
 USAGE
 }
 
@@ -452,15 +471,21 @@ while [ "$#" -gt 0 ]; do
             ;;
         --xdp)
             ENABLE_XDP="yes"
+            XDP_EXPLICIT=1
             shift
             ;;
         --no-xdp)
             ENABLE_XDP="no"
+            XDP_EXPLICIT=1
             shift
             ;;
         --xdp-iface)
             XDP_IFACE="${2:?missing interface name}"
             shift 2
+            ;;
+        --upgrade-kernel)
+            UPGRADE_KERNEL="yes"
+            shift
             ;;
         --xdp-upstream)
             die "--xdp-upstream was removed: enabled XDP is always bidirectional (AF_XDP upstream); disable XDP entirely with --no-xdp" \
@@ -1575,6 +1600,14 @@ report_nic_xdp() {
     if [ -n "$default_iface" ]; then
         kv "default route iface" "$default_iface"
     fi
+    if [ "$XDP_KERNEL_VERDICT" != "ok" ] && [ -n "$XDP_KERNEL_REASON" ]; then
+        warn "XDP kernel gate: $XDP_KERNEL_VERDICT — $XDP_KERNEL_REASON" \
+            "XDP 内核门控：$XDP_KERNEL_VERDICT——$XDP_KERNEL_REASON"
+    fi
+    if [ "$KERNEL_UPGRADED" -eq 1 ]; then
+        warn "a newer kernel was installed; XDP stays disabled until reboot — re-run this installer after rebooting" \
+            "已安装新内核；重启前 XDP 保持禁用——重启后请重新运行本安装脚本"
+    fi
 }
 
 download_geoip_files() {
@@ -1652,22 +1685,213 @@ collect_api_config() {
     [ -n "$NODE_SECRET" ] || die "no existing api_node.yaml found; fresh install requires --secret" "未找到可迁移的 api_node.yaml；全新安装需要 --secret"
 }
 
+# --- Kernel/XDP support gate ---
+# The AF_XDP dataplane needs AF_XDP sockets (>= 4.18 minimum, >= 5.4 in
+# practice for the bidirectional path) plus CONFIG_XDP_SOCKETS. The probe
+# is advisory-free: the verdict below actually gates xdp.enabled.
+XDP_KERNEL_VERDICT="unknown"   # ok | degraded | unsupported
+XDP_KERNEL_REASON=""
+KERNEL_UPGRADED=0
+
+kernel_version_ge() {
+    local want_major="$1" want_minor="$2" release maj min
+    release="$(uname -r 2>/dev/null || true)"
+    maj="$(printf '%s' "$release" | cut -d. -f1)"
+    min="$(printf '%s' "$release" | cut -d. -f2)"
+    case "$maj" in ''|*[!0-9]*) maj=0 ;; esac
+    case "$min" in ''|*[!0-9]*) min=0 ;; esac
+    [ "$maj" -gt "$want_major" ] || { [ "$maj" -eq "$want_major" ] && [ "$min" -ge "$want_minor" ]; }
+}
+
+kernel_xdp_sockets_enabled() {
+    # 0 = enabled, 1 = verifiably disabled, 2 = unknown (no readable config).
+    local cfg="/boot/config-$(uname -r 2>/dev/null)"
+    if [ -r "$cfg" ]; then
+        grep -q '^CONFIG_XDP_SOCKETS=y' "$cfg" 2>/dev/null && return 0
+        grep -q '^CONFIG_XDP_SOCKETS=' "$cfg" 2>/dev/null && return 1
+        return 2
+    fi
+    if [ -r /proc/config.gz ]; then
+        if zcat /proc/config.gz 2>/dev/null | grep -q '^CONFIG_XDP_SOCKETS=y'; then
+            return 0
+        fi
+        if zcat /proc/config.gz 2>/dev/null | grep -q '^CONFIG_XDP_SOCKETS='; then
+            return 1
+        fi
+    fi
+    return 2
+}
+
+probe_xdp_kernel() {
+    local kver sockets_rc
+    kver="$(uname -r 2>/dev/null || printf 'unknown')"
+    XDP_KERNEL_VERDICT="ok"
+    XDP_KERNEL_REASON=""
+    if ! kernel_version_ge 4 18; then
+        XDP_KERNEL_VERDICT="unsupported"
+        XDP_KERNEL_REASON="kernel $kver < 4.18: AF_XDP sockets do not exist"
+        return
+    fi
+    kernel_xdp_sockets_enabled
+    sockets_rc=$?
+    if [ "$sockets_rc" -eq 1 ]; then
+        XDP_KERNEL_VERDICT="unsupported"
+        XDP_KERNEL_REASON="kernel $kver was built without CONFIG_XDP_SOCKETS"
+        return
+    fi
+    if ! kernel_version_ge 5 4; then
+        XDP_KERNEL_VERDICT="degraded"
+        XDP_KERNEL_REASON="kernel $kver < 5.4: the bidirectional AF_XDP dataplane needs >= 5.4"
+        return
+    fi
+    if [ "$sockets_rc" -eq 2 ]; then
+        XDP_KERNEL_REASON="kernel $kver meets the version floor; CONFIG_XDP_SOCKETS unreadable — the runtime attach path verifies it"
+    fi
+}
+
+# Distribution-aware kernel install. Only invoked when the running kernel
+# failed the XDP gate AND the operator passed --upgrade-kernel. Success
+# still leaves XDP disabled for this run — the new kernel is not running
+# until the host reboots.
+maybe_upgrade_kernel() {
+    [ "$UPGRADE_KERNEL" = "yes" ] || return 1
+    [ "$XDP_KERNEL_VERDICT" != "ok" ] || return 1
+    section "内核升级 / Kernel Upgrade"
+    local id="" codename="" version_id="" major="" list=""
+    if [ -r /etc/os-release ]; then
+        id="$(. /etc/os-release; printf '%s' "${ID:-}")"
+        codename="$(. /etc/os-release; printf '%s' "${VERSION_CODENAME:-}")"
+        version_id="$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")"
+        major="$(printf '%s' "$version_id" | cut -d. -f1)"
+    fi
+    if [ "$DRY_RUN" -ne 0 ]; then
+        log "+ kernel upgrade would run for distro '${id:-unknown}' (dry-run)"
+        return 1
+    fi
+    case "$id" in
+        debian)
+            if [ -z "$codename" ]; then
+                warn "cannot identify the Debian codename; upgrade the kernel manually" "无法识别 Debian 代号；请手动升级内核"
+                return 1
+            fi
+            list="/etc/apt/sources.list.d/${codename}-backports.list"
+            if ! grep -rqs "${codename}-backports" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+                printf 'deb http://deb.debian.org/debian %s-backports main\n' "$codename" > "$list"
+                log "enabled ${codename}-backports" "已启用 ${codename}-backports 源"
+            fi
+            apt-get update -qq || warn "apt-get update failed" "apt-get update 失败"
+            if DEBIAN_FRONTEND=noninteractive apt-get install -y -t "${codename}-backports" linux-image-amd64; then
+                KERNEL_UPGRADED=1
+            else
+                warn "backports kernel install failed" "backports 内核安装失败"
+                return 1
+            fi
+            ;;
+        ubuntu)
+            apt-get update -qq || warn "apt-get update failed" "apt-get update 失败"
+            if DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-generic-hwe-${version_id}"; then
+                KERNEL_UPGRADED=1
+            else
+                warn "HWE kernel install failed (HWE only exists on Ubuntu LTS)" "HWE 内核安装失败（HWE 仅适用于 Ubuntu LTS）"
+                return 1
+            fi
+            ;;
+        rhel|centos|rocky|almalinux|ol|fedora)
+            if [ "$id" = "fedora" ]; then
+                warn "Fedora already ships recent kernels; upgrade with 'dnf upgrade kernel'" "Fedora 内核已较新；请用 'dnf upgrade kernel' 升级"
+                return 1
+            fi
+            [ -n "$major" ] || { warn "cannot identify the EL major version" "无法识别 EL 主版本"; return 1; }
+            rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org 2>/dev/null || true
+            if ! rpm -q elrepo-release >/dev/null 2>&1; then
+                dnf install -y "https://www.elrepo.org/elrepo-release-${major}.el${major}.elrepo.noarch.rpm" || {
+                    warn "elrepo-release install failed" "elrepo-release 安装失败"
+                    return 1
+                }
+            fi
+            if dnf --enablerepo=elrepo-kernel install -y kernel-ml; then
+                KERNEL_UPGRADED=1
+                warn "kernel-ml installed — ensure the bootloader default selects it before rebooting" "已安装 kernel-ml——重启前请确认引导默认项选中新内核"
+            else
+                warn "kernel-ml install failed" "kernel-ml 安装失败"
+                return 1
+            fi
+            ;;
+        *)
+            warn "automatic kernel upgrade is unsupported on distro '${id:-unknown}'; install a >= 5.4 kernel manually and reboot" "发行版 '${id:-unknown}' 不支持自动内核升级；请手动安装 >= 5.4 内核并重启"
+            return 1
+            ;;
+    esac
+    if [ "$KERNEL_UPGRADED" -eq 1 ]; then
+        ok "new kernel installed — REBOOT REQUIRED, then re-run this installer to enable XDP" \
+            "新内核已安装——需要重启，重启后重新运行本安装脚本以启用 XDP"
+    fi
+    return 0
+}
+
+# Applies the kernel verdict to ENABLE_XDP. Runs after collect_xdp_choice:
+# an unsupported kernel always disables XDP (explicit --xdp cannot conjure
+# AF_XDP sockets); a degraded kernel disables the DEFAULT but honours an
+# explicit operator request with a loud warning.
+decide_xdp_kernel_gate() {
+    case "$XDP_KERNEL_VERDICT" in
+        unsupported)
+            if [ "$ENABLE_XDP" = "yes" ]; then
+                ENABLE_XDP="no"
+                warn "XDP disabled: $XDP_KERNEL_REASON" \
+                    "已禁用 XDP：$XDP_KERNEL_REASON"
+                log "  pass --upgrade-kernel to install a newer kernel, then reboot and re-run this installer" \
+                    "  可传 --upgrade-kernel 安装新内核，重启后重新运行本安装脚本"
+            fi
+            ;;
+        degraded)
+            if [ "$ENABLE_XDP" = "yes" ] && [ "$XDP_EXPLICIT" -eq 0 ]; then
+                ENABLE_XDP="no"
+                warn "XDP disabled: $XDP_KERNEL_REASON" "已禁用 XDP：$XDP_KERNEL_REASON"
+                log "  pass --upgrade-kernel for a newer kernel, or --xdp to force-enable on this kernel" \
+                    "  可传 --upgrade-kernel 升级内核，或传 --xdp 在当前内核上强制启用"
+            elif [ "$ENABLE_XDP" = "yes" ]; then
+                warn "XDP kept enabled on a degraded kernel ($XDP_KERNEL_REASON) — attach may fail; the runtime reports it" \
+                    "内核低于推荐版本仍强制启用 XDP（$XDP_KERNEL_REASON）——attach 可能失败，运行时会如实上报"
+            fi
+            ;;
+    esac
+}
+
 # Interactive XDP dataplane choice. Default is enabled (bidirectional:
 # inbound proxy + outbound AF_XDP upstream). Skipped when an existing
 # config already defines an xdp: section — that config stays authoritative.
 collect_xdp_choice() {
     if [ "$IS_FRESH" -eq 0 ] && existing_config_has_xdp; then
+        local existing_cfg=""
+        existing_cfg="$(existing_api_config_path || true)"
+        if [ "$XDP_KERNEL_VERDICT" != "ok" ] && [ -n "$existing_cfg" ] \
+            && grep -Eq '^[[:space:]]+enabled:[[:space:]]*true' "$existing_cfg" 2>/dev/null; then
+            warn "existing config enables XDP but $XDP_KERNEL_REASON — the runtime will report attach failures" \
+                "现有配置启用了 XDP，但 $XDP_KERNEL_REASON——运行时会如实上报 attach 失败"
+        fi
         return 0
     fi
+    if [ "$XDP_KERNEL_VERDICT" = "unsupported" ]; then
+        ENABLE_XDP="no"
+        warn "XDP dataplane not offered: $XDP_KERNEL_REASON" "XDP 数据面不可用：$XDP_KERNEL_REASON"
+        return 0
+    fi
+    if [ "$XDP_KERNEL_VERDICT" = "degraded" ] && [ "$XDP_EXPLICIT" -eq 0 ]; then
+        ENABLE_XDP="no"
+    fi
     if prompt_available && [ "$ASSUME_YES" -eq 0 ]; then
+        local default="yes"
+        [ "$ENABLE_XDP" = "yes" ] || default="no"
         if ask_yes_no \
             "启用 XDP 数据面？（双向：入向代理 + 出向 AF_XDP 回源）" \
             "Enable XDP dataplane? (bidirectional: inbound proxy + outbound AF_XDP upstream)" \
-            "yes"; then
+            "$default"; then
             ENABLE_XDP="yes"
         else
             ENABLE_XDP="no"
         fi
+        XDP_EXPLICIT=1
     fi
     if [ "$ENABLE_XDP" = "yes" ]; then
         log "XDP dataplane: enabled (bidirectional)" "XDP 数据面：启用（双向）"
@@ -2256,7 +2480,9 @@ if [ -z "$EXISTING_API_CONFIG_DIR" ]; then
 fi
 
 collect_api_config
+probe_xdp_kernel
 collect_xdp_choice
+decide_xdp_kernel_gate
 
 BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
 ASSET_NAME="$(detect_asset_name)"
@@ -2331,6 +2557,11 @@ elif [ "$EXISTING_RUNTIME" = "unknown" ]; then
 fi
 
 confirm_install
+# Kernel upgrade attempt — only when the operator opted in AND the running
+# kernel failed the XDP gate. A successful install still cannot enable XDP
+# this run (the new kernel needs a reboot); decide_xdp_kernel_gate already
+# forced xdp.enabled=false, which stays correct.
+maybe_upgrade_kernel || true
 # Install/verify the nftables dial-guard prerequisite before touching
 # anything — when it cannot be satisfied the install aborts here with
 # remediation, leaving the existing deployment fully intact.
