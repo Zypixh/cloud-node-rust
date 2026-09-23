@@ -94,3 +94,29 @@ kernel 臂说明：该机器为共享主机，另一租户节点通过 SO_REUSEP
   - 同臂另一次窗口部分错位的运行（FIN 段 47s 超出节点 60s 存活）：`backendConnectStart=489 / Ok=488 / Fail=0`，同样无 128 冻结。
 - **fail-closed 契约顺带实测验证**：一次 PATH 缺 `/usr/sbin` 的运行中 `nft` 不可执行 → `ensure_dial_guard` 显式失败 → dial registry 不发布 → 全部 799 次拨号显式报 "no live AF_XDP dial registry"（`backendConnectFail=799`），**未发生任何静默内核回退**——证明缺失护栏时的显式报错路径按设计工作，且该错误路径不产生 `ip` 子进程（拨号在路由解析前拒绝）。
 - 验证范围说明：veth 与真机 ens17 均已验证缺陷机制修复（128 冻结消除、relay 任务随会话终止退出、准入许可正常流转、终态会话有界回收、拨号路由缓存生效）。上述为短程缺陷复现验证，非完整性能矩阵——修复后全协议吞吐对比仍需单独一轮完整基准；churn 速率（~12/s FIN、~22/s RST @8 workers）为功能探针口径，不代表吞吐上限。
+
+## 第二轮：断流/异常断开场景深挖（kernel 6.12.95，fix4 二进制）
+
+拓扑不变（.120 client → .90 XDP → .110 origin），客户端 20 并发大文件下载 15s 后整体 `pkill`，观察 reactor 行为与账目归零。
+
+### 新发现并修复的缺陷
+
+1. **smoltcp-edge `ring_buffer.rs:374` panic（`count <= self.window()`）**：`scaled_window()` 只按 rx buffer 通告窗口，assembler 持有的乱序字节不计入；`grow_recv_buffer` 缩容只校验 buffer length 不看 assembler。断流会话残留空洞 → 空闲缩容 → 后续报文填洞撑破窗口 → `panic=abort` 整进程死亡。修复：入口裁剪到可写空间 + 缩容自守 assembler 占用，694/694 测试过（`abd924e`）。
+2. **afxdp worker 空转 ~20% CPU**：`poll_raw_once()` 只在发送路径回收 TX completion——流量停止后 CQ 残留描述符让 xsk fd 永久可读，POLLIN 每轮重武装成热循环。改为 poll 入口无条件 drain（`b432106`）。
+3. **reactor 热路径同步读 smaps**：perf 实锤 ~39% 线程 CPU 在 `smaps_rollup`（480MB RSS 下单次 23ms，流量驱动的按需刷新叠加多调用方）。进程级 governor 改为 `memgov-snapshot` 后台线程 250ms 周期刷新 + 2s 硬过期兜底同步路径（`cf9a712`）。
+4. **`sessionsCurrent` 口径错误**：单原子被 8 个 reactor 互相覆盖（last-writer-wins）——报告显示 0 会话时实际有 20 个 FIN-WAIT-2 各持 ~1MiB buffer charge。改为 per-queue map 聚合（`cf115cd`）。
+5. **FIN-WAIT-2 僵尸会话永生**：`reapable` 要求 `Closed/TimeWait`，但 FIN-WAIT-2 无协议超时——对端不发 FIN 则会话及 ~1MiB charge 永久驻留。新增 60s closing 收割期限（对齐 TCP_LINGER2），移除路径 abort socket 释放全部 permit（`cf115cd`）。
+6. **`accepted` 计数器口径**：对命中已存在会话的每个报文都 +1（70278 实为收包数），改为仅新会话计数（`cf115cd`）。
+
+### 修复后实测（fix4，同场景）
+
+- 客户端全杀后 47s：8 个 afxdp worker 中 7 个 0% CPU，queue-0 12.5% 为垂死会话退避重传的真实发包（perf 栈：`xsk_poll → __xsk_generic_xmit` + `epoll_wait`），非自旋；
+- `strace` afxdp-ens17-0 全程 **0 次 openat**——`/proc` 读取完全隔离在 `memgov-snapshot` 线程（~8% CPU，可再优化但已出热路径）；
+- 到期报告：`accepted=20`（口径修正）、`sessionsCurrent=1`（聚合正确）、`tcpQueueBytes=1,081,344` = 仅剩 1 个 CLOSING 会话的 charge——19/20 FIN-WAIT-2 僵尸已被 60s 期限收割，账目随会话归零；
+- 全程无 panic、无 "Can't replace"、无 XDP link 残留。
+
+### 遗留观察项
+
+- `memgov-snapshot` 空闲期仍以 4Hz 刷新（~8% CPU 于 480MB RSS）——可考虑无消费者时降频；
+- 单客户端 IP 的流量全 hash 到 queue-0——多队列扩展依赖 RSS 分流，同源高压场景 queue-0 是单点；
+- CLOSING 态收割期限 60s 期间 zombie 仍占 ~1MiB/会话——预算压力下可考虑压力自适应缩短期限。
