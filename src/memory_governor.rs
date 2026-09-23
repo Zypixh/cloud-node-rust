@@ -400,6 +400,7 @@ pub static MEMORY_GOVERNOR: LazyLock<MemoryGovernor> = LazyLock::new(|| {
     let _ = std::thread::Builder::new()
         .name("memgov-snapshot".to_string())
         .spawn(|| loop {
+            MEMGOV_REFRESHING.with(|f| f.set(true));
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 {
                     let _update = lock_recover(&MEMORY_GOVERNOR.snapshot_update);
@@ -411,7 +412,21 @@ pub static MEMORY_GOVERNOR: LazyLock<MemoryGovernor> = LazyLock::new(|| {
                 // inputs so `limits()` stays a pure ArcSwap load.
                 let _ = MEMORY_GOVERNOR.refresh_limits();
             }));
-            std::thread::sleep(Duration::from_millis(SNAPSHOT_TTL_MS as u64));
+            // Idle backoff: once no consumer has read the snapshot for
+            // SNAPSHOT_IDLE_AFTER_MS, drop from 4 Hz to one refresh per
+            // HARD_STALE window — a consumer that arrives mid-idle is
+            // still served (cache inside the bound) or takes one inline
+            // refresh, and its stamp re-arms the fast cadence.
+            let now = crate::utils::time::system_timestamp_millis();
+            let last = MEMORY_GOVERNOR
+                .snapshot_consumer_at_millis
+                .load(Ordering::Relaxed) as i64;
+            let idle = last <= 0 || now.saturating_sub(last) > SNAPSHOT_IDLE_AFTER_MS;
+            std::thread::sleep(Duration::from_millis(if idle {
+                SNAPSHOT_IDLE_TTL_MS
+            } else {
+                SNAPSHOT_TTL_MS as u64
+            }));
         });
     governor
 });
@@ -448,6 +463,27 @@ const SNAPSHOT_TTL_MS: i64 = 250;
 /// classification, and test governors (no refresher) never wait this
 /// long because they are not marked `refresher_owned`.
 const SNAPSHOT_HARD_STALE_MS: i64 = 2_000;
+/// With no snapshot consumer for this long the refresher drops to the
+/// idle cadence — an idle node should not spend 4 Hz walking /proc
+/// (smaps_rollup alone is ~23ms at ~480MB RSS) to publish observations
+/// nobody reads. A reader arriving mid-idle either gets a snapshot
+/// still inside HARD_STALE or takes one inline refresh; its stamp
+/// re-arms the fast cadence on the refresher's next cycle.
+const SNAPSHOT_IDLE_AFTER_MS: i64 = 2_000;
+/// Idle-cadence refresh period. Chosen to equal HARD_STALE so the
+/// published snapshot never outlives the trust bound between idle
+/// refreshes by more than one sleep quantum.
+const SNAPSHOT_IDLE_TTL_MS: u64 = SNAPSHOT_HARD_STALE_MS as u64;
+
+thread_local! {
+    /// True on the `memgov-snapshot` refresher thread for its whole
+    /// loop body. The refresher itself funnels through
+    /// `memory_snapshot()` via `refresh_limits()` — without this flag
+    /// its own reads would stamp the consumer clock and the idle
+    /// backoff could never engage.
+    static MEMGOV_REFRESHING: Cell<bool> = const { Cell::new(false) };
+}
+
 const FD_SNAPSHOT_TTL_MS: i64 = 250;
 const MIN_MEMORY_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const CONNECTION_BUDGET_PCT: u64 = 45;
@@ -797,6 +833,10 @@ pub struct MemoryGovernor {
     /// Instances constructed directly (tests) stay false and keep the
     /// inline-refresh behaviour.
     refresher_owned: AtomicBool,
+    /// Last time a *consumer* read the snapshot or the limits table
+    /// (refresher-internal reads excluded via `MEMGOV_REFRESHING`).
+    /// Drives the refresher's idle backoff.
+    snapshot_consumer_at_millis: AtomicU64,
     /// Serializes cache refreshers; readers use `cached_at_millis` as a
     /// seqlock version (0 = update in progress).
     snapshot_update: Mutex<()>,
@@ -1226,6 +1266,7 @@ impl MemoryGovernor {
             cached_fd_used_at_millis: AtomicU64::new(0),
             cached_at_millis: AtomicU64::new(0),
             refresher_owned: AtomicBool::new(false),
+            snapshot_consumer_at_millis: AtomicU64::new(0),
             snapshot_update: Mutex::new(()),
             cached_cgroup_managed: AtomicU64::new(0),
             cached_cgroup_memory_max_bytes: AtomicU64::new(0),
@@ -2886,6 +2927,7 @@ impl MemoryGovernor {
     /// it nothing would ever trigger the periodic refresh and pressure
     /// classification would freeze after the first build.
     fn limits(&self) -> arc_swap::Guard<std::sync::Arc<GovernorLimits>> {
+        self.note_snapshot_consumer();
         let generation = self.cached_generation.load(Ordering::Acquire);
         let lim = self.cached_limits.load();
         // generation 0 means no snapshot refresh has ever completed; the
@@ -3048,7 +3090,22 @@ impl MemoryGovernor {
         }
     }
 
+    /// Stamp consumer demand for the published snapshot. Called by the
+    /// two funnel readers (`limits`, `memory_snapshot`); the refresher
+    /// thread's own internal reads are excluded via MEMGOV_REFRESHING
+    /// so the idle backoff can detect "nobody is watching".
+    fn note_snapshot_consumer(&self) {
+        if MEMGOV_REFRESHING.with(|f| f.get()) {
+            return;
+        }
+        self.snapshot_consumer_at_millis.store(
+            crate::utils::time::system_timestamp_millis().max(0) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
     fn memory_snapshot(&self) -> BudgetedMemorySnapshot {
+        self.note_snapshot_consumer();
         let now = crate::utils::time::system_timestamp_millis();
         let cached_at = self.cached_at_millis.load(Ordering::Acquire) as i64;
         if self.snapshot_usable(now, cached_at) {
