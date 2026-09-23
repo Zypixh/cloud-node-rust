@@ -1619,9 +1619,22 @@ impl<'a> Socket<'a> {
     /// use of capacity up to `rx_window_wire_cap()` — anything past the
     /// negotiated scale is heap without wire effect. Returns false (and
     /// leaves the buffer untouched) when the new capacity cannot hold
-    /// queued data.
+    /// queued data, or when shrinking below space already spoken for by
+    /// the out-of-order assembler — those bytes occupy logical buffer
+    /// space that `len()` does not report, and a capacity below
+    /// `len + assembled_hi` would let the next hole-fill enqueue past
+    /// `window()` and trip the ring's invariant.
     #[cfg(any(feature = "std", feature = "alloc"))]
     pub fn grow_recv_buffer(&mut self, new_capacity: usize) -> bool {
+        let assembled_hi = self
+            .assembler
+            .iter_data()
+            .map(|(_start, end)| end)
+            .max()
+            .unwrap_or(0);
+        if new_capacity < self.rx_buffer.len() + assembled_hi {
+            return false;
+        }
         self.rx_buffer.resize(new_capacity)
     }
 
@@ -2856,6 +2869,22 @@ impl<'a> Socket<'a> {
         let payload_len = payload.len();
         if payload_len == 0 {
             return None;
+        }
+
+        // smoltcp-edge (T9): the ring is the ground truth — after a
+        // mid-session `grow_recv_buffer` shrink, a peer's in-flight burst
+        // inside the last advertised window can exceed the new capacity.
+        // Clip to the writable span so the assembler never records bytes
+        // the ring cannot hold; the clipped tail behaves as dropped data
+        // and is retransmitted once the window reopens.
+        let writable = self.rx_buffer.window().saturating_sub(payload_offset);
+        let payload_len = payload_len.min(writable);
+        let payload = &payload[..payload_len];
+        if payload_len == 0 {
+            // The segment carried data but none of it fits — answer with an
+            // immediate ACK advertising the current (smaller) window so the
+            // peer learns the new edge instead of stalling in backoff.
+            return Some(self.ack_reply(ip_repr, repr));
         }
 
         let assembler_was_empty = self.assembler.is_empty();
@@ -11585,6 +11614,100 @@ mod test {
             })
         );
         assert!(!s.cwr_pending);
+    }
+
+    #[test]
+    fn test_grow_recv_buffer_refuses_shrink_below_assembler() {
+        let mut s = socket_established();
+
+        // Park a 10-byte out-of-order tail behind a 10-byte hole:
+        // rx_buffer stays empty while the assembler owns seqs +11..+21.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 10,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"AAAAAAAAAA"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 64,
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.recv_queue(), 0);
+        assert!(!s.assembler.is_empty());
+
+        // Shrinking below the assembler's high-water mark would orphan
+        // the parked bytes — the resize must be refused.
+        assert!(!s.grow_recv_buffer(16));
+        assert_eq!(s.recv_capacity(), 64);
+        // A shrink that still covers the parked range is legal.
+        assert!(s.grow_recv_buffer(32));
+        assert_eq!(s.recv_capacity(), 32);
+
+        // Filling the hole now must not trip the ring's enqueue
+        // invariant: contig_len (20) fits within window (32).
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"BBBBBBBBBB"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 20),
+                window_len: 12,
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.recv_queue(), 20);
+    }
+
+    #[test]
+    fn test_rx_ingest_clips_to_shrunk_capacity() {
+        let mut s = socket_established();
+
+        // Idle session shrinks its rx ring mid-connection; the peer's
+        // last advertised window (64) still covers a larger burst.
+        assert!(s.grow_recv_buffer(16));
+
+        // A 40-byte segment arriving inside the stale advertised window
+        // must be clipped to the ring's writable span instead of
+        // asserting inside `enqueue_unallocated`.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[b'X'; 40][..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.recv_queue(), 16);
+
+        // A follow-up segment that fits nothing at all still earns an
+        // immediate ACK carrying the shrunken window edge.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 16,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"YY"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 16),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.recv_queue(), 16);
     }
 }
 

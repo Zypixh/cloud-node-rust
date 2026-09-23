@@ -146,6 +146,23 @@ tests at the end of `socket::tcp::test`.
   `reset()` now computes `max(capacity-derived shift, floor)`; with
   the floor at its default 0 the computation is byte-for-byte
   upstream.
+- Mid-session shrink safety (live-observed crash fix): upstream's
+  `enqueue_unallocated` invariant (`count <= window()`) assumes the
+  advertised window can never exceed ring capacity, which runtime
+  `resize` breaks two ways — bytes parked in the out-of-order
+  assembler are not counted by `rx_buffer.len()`, and the peer's last
+  advertised window (`remote_last_win`) can cover a burst larger than
+  the shrunken capacity.
+  - `grow_recv_buffer` refuses a shrink below
+    `len + assembler high-water mark` so parked out-of-order bytes can
+    never outlive the ring.
+  - The ingest path clips each wire payload to the ring's writable
+    span before the assembler records it; a fully-clipped segment gets
+    an immediate ACK carrying the shrunken window, and the clipped
+    tail is retransmitted by the peer when the window reopens — normal
+    TCP semantics for a reduced buffer, no silent corruption.
+  - New tests `test_grow_recv_buffer_refuses_shrink_below_assembler`
+    and `test_rx_ingest_clips_to_shrunk_capacity`.
 
 ## `src/socket/tcp/congestion.rs`
 
