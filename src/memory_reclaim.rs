@@ -53,16 +53,28 @@ const MI_OPTION_ABANDONED_PAGE_PURGE: libmimalloc_sys::mi_option_t = 12;
 /// this node — objects allocated on one runtime are routinely dropped on
 /// another thread.
 const MI_OPTION_ABANDONED_RECLAIM_ON_FREE: libmimalloc_sys::mi_option_t = 26;
+/// Enum slot 21: abandoned-segment reclaim cap per try, percent (=10). A
+/// 10% drain rate leaves dead-heap segments resident across many collect
+/// cycles; 50 drains the same plateau in a handful of tries without
+/// touching the allocation fast path.
+const MI_OPTION_MAX_SEGMENT_RECLAIM: libmimalloc_sys::mi_option_t = 21;
+/// Enum slot 24: arena purge delay as a multiple of `purge_delay` (=10).
+/// Arenas are the multi-MiB extents mimalloc retains for reuse; 2 keeps a
+/// 20ms reuse window instead of a 100ms tail after traffic bursts.
+const MI_OPTION_ARENA_PURGE_MULT: libmimalloc_sys::mi_option_t = 24;
 
 /// Must run before worker threads spawn. Without these options, pages freed
 /// on a dying thread's heap keep their delayed purges unexecuted and stay
 /// committed until another thread slowly reclaims the abandoned segments
 /// (capped at ~10% per attempt), which shows up as multi-ten-MiB RSS plateaus
-/// after short-lived runtimes exit.
+/// after short-lived runtimes exit. `purge_delay` itself stays at the 10ms
+/// default — immediate purging would pay decommit syscalls on the hot path.
 pub fn configure_allocator() {
     unsafe {
         libmimalloc_sys::mi_option_set(MI_OPTION_ABANDONED_PAGE_PURGE, 1);
         libmimalloc_sys::mi_option_set(MI_OPTION_ABANDONED_RECLAIM_ON_FREE, 1);
+        libmimalloc_sys::mi_option_set(MI_OPTION_MAX_SEGMENT_RECLAIM, 50);
+        libmimalloc_sys::mi_option_set(MI_OPTION_ARENA_PURGE_MULT, 2);
     }
 }
 static RECLAIM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -997,6 +1009,11 @@ mod tests {
         let reclaim =
             unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_ABANDONED_RECLAIM_ON_FREE) };
         assert_eq!(reclaim, 1, "abandoned reclaim-on-free must be enabled");
+        let seg_reclaim =
+            unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_MAX_SEGMENT_RECLAIM) };
+        assert_eq!(seg_reclaim, 50, "abandoned-segment drain rate must be raised");
+        let arena_mult = unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_ARENA_PURGE_MULT) };
+        assert_eq!(arena_mult, 2, "arena purge window must be tightened");
     }
 
     #[test]

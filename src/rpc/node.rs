@@ -1399,6 +1399,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "processRssBytes": governor_snapshot.process_rss_bytes,
             "processPssBytes": governor_snapshot.process_pss_bytes,
             "processAnonRssBytes": governor_snapshot.process_anon_rss_bytes,
+            "processFileRssBytes": governor_snapshot.process_file_rss_bytes,
             "psiMemorySomeAvg10PctX100": governor_snapshot.psi_some_avg10_x100,
             "psiMemoryFullAvg10PctX100": governor_snapshot.psi_full_avg10_x100,
             "residentUsedBytes": governor_snapshot.resident_memory.total_used_bytes,
@@ -1420,6 +1421,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         let resource_governor_extra = serde_json::json!({
             "metricsAggregatorBytes": governor_snapshot.metrics_aggregator_bytes,
             "unaccountedRssBytes": governor_snapshot.unaccounted_rss_bytes,
+            "unaccountedAnonRssBytes": governor_snapshot.unaccounted_anon_rss_bytes,
             "requestWorkspaceUsedBytes": governor_snapshot.request_workspace_used_bytes,
             "pressureEventWakeups": crate::memory_reclaim::pressure_event_wakeups(),
             "ledgerReconcileStaleOwners": crate::memory_reclaim::ledger_reconcile_stale_owners(),

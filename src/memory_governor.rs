@@ -205,6 +205,15 @@ pub struct GovernorSnapshot {
     pub process_rss_bytes: u64,
     pub process_pss_bytes: u64,
     pub process_anon_rss_bytes: u64,
+    /// RSS minus anonymous RSS — the file-backed share (mmap'd databases,
+    /// executable pages, shared libraries). Page-cache memory the kernel
+    /// reclaims under pressure; it is resident, not heap.
+    pub process_file_rss_bytes: u64,
+    /// Anonymous RSS minus all tracked byte ledgers — the heap-side
+    /// attribution gap (allocator slack, runtime state, uninstrumented
+    /// structures). Companion to `unaccounted_rss_bytes`, which counts
+    /// the file-backed share too.
+    pub unaccounted_anon_rss_bytes: u64,
     /// PSI memory stall ratios in hundredths of a percent (avg10=10.00 →
     /// 1000); 0 when PSI is unavailable.
     pub psi_some_avg10_x100: u32,
@@ -855,6 +864,13 @@ pub struct TcpQueueBytePermit<'a> {
     /// Committed shared-account credential; `shared.bytes()` is the
     /// queue charge this permit holds.
     shared: SharedPermit<'a>,
+}
+
+impl TcpQueueBytePermit<'_> {
+    /// Bytes currently charged by this permit.
+    pub fn bytes(&self) -> u64 {
+        self.shared.bytes()
+    }
 }
 
 pub type StaticTcpQueueBytePermit = TcpQueueBytePermit<'static>;
@@ -2650,6 +2666,20 @@ impl MemoryGovernor {
         stats
     }
 
+    /// Sum of every tracked byte ledger — the heap bytes the account
+    /// explains. All tracked ledgers count anonymous allocations, so the
+    /// same total also backs the anon-only attribution gap.
+    fn tracked_rss_bytes(&self, resident_used: u64) -> u64 {
+        resident_used
+            .saturating_add(self.shared_connection_used_bytes())
+            .saturating_add(self.zero_copy_relay_bytes.load(Ordering::Relaxed))
+            .saturating_add(self.udp_queued_bytes())
+            .saturating_add(self.tcp_queue_bytes())
+            .saturating_add(self.cache_read_memory_bytes.load(Ordering::Relaxed))
+            .saturating_add(self.request_workspace_bytes.load(Ordering::Relaxed))
+            .saturating_add(self.metrics_aggregator_bytes.load(Ordering::Relaxed))
+    }
+
     /// RSS minus all tracked byte ledgers — the live "attribution gap"
     /// metric. Saturates at 0 when RSS is unknown (0) or the ledgers
     /// over-count relative to RSS (estimates can exceed actuals).
@@ -2657,15 +2687,7 @@ impl MemoryGovernor {
         if process_rss_bytes == 0 {
             return 0;
         }
-        let tracked = resident_used
-            .saturating_add(self.shared_connection_used_bytes())
-            .saturating_add(self.zero_copy_relay_bytes.load(Ordering::Relaxed))
-            .saturating_add(self.udp_queued_bytes())
-            .saturating_add(self.tcp_queue_bytes())
-            .saturating_add(self.cache_read_memory_bytes.load(Ordering::Relaxed))
-            .saturating_add(self.request_workspace_bytes.load(Ordering::Relaxed))
-            .saturating_add(self.metrics_aggregator_bytes.load(Ordering::Relaxed));
-        process_rss_bytes.saturating_sub(tracked)
+        process_rss_bytes.saturating_sub(self.tracked_rss_bytes(resident_used))
     }
 
     pub fn snapshot(&self, pingora_threads: usize) -> GovernorSnapshot {
@@ -2676,6 +2698,7 @@ impl MemoryGovernor {
             mem.process_rss_bytes,
             resident.total_used_bytes,
         );
+        let tracked_rss_bytes = self.tracked_rss_bytes(resident.total_used_bytes);
         GovernorSnapshot {
             memory_total_bytes: mem.total_bytes,
             memory_used_bytes: mem.used_bytes,
@@ -2790,6 +2813,12 @@ impl MemoryGovernor {
             process_rss_bytes: mem.process_rss_bytes,
             process_pss_bytes: mem.process_pss_bytes,
             process_anon_rss_bytes: mem.process_anon_rss_bytes,
+            process_file_rss_bytes: mem
+                .process_rss_bytes
+                .saturating_sub(mem.process_anon_rss_bytes),
+            unaccounted_anon_rss_bytes: mem
+                .process_anon_rss_bytes
+                .saturating_sub(tracked_rss_bytes),
             psi_some_avg10_x100: mem.psi_some_avg10_x100,
             psi_full_avg10_x100: mem.psi_full_avg10_x100,
             account_headroom_bytes: mem.account_headroom_bytes,
@@ -4091,16 +4120,21 @@ fn udp_queued_bytes_budget(snapshot: &BudgetedMemorySnapshot) -> u64 {
         .min(snapshot.available_bytes.max(1))
 }
 
-/// EN-17/F3: node-wide budget for bytes queued inside the AF_XDP TCP
-/// dataplane (per-session stream channels + reactor pendings + device
-/// ingress frames). Sized as a fraction of the connection budget — TCP
-/// queues are the dominant dataplane allocation — and shrunk under memory
-/// pressure so queue drain pressure never exceeds the node envelope.
+/// EN-17/F3: node-wide sizing target for bytes queued inside the AF_XDP
+/// TCP dataplane (per-session stream channels + reactor pendings + device
+/// ingress frames). This is a target, not a partition — the shared
+/// account is the real fail-closed gate. Sized from CURRENT kernel
+/// availability (½ healthy, ⅛ under pressure) instead of a static
+/// connection-budget slice: queue demand tracks memory the node can
+/// actually commit, and shrinks itself as real usage fills the machine.
+/// The old `conn_budget/4` derivation capped the dataplane near ~62 MiB
+/// on a 1 GiB node and refused sessions under load while ~500 MiB sat
+/// free — an artificial partition, not a resource limit.
 fn tcp_queue_bytes_budget(snapshot: &BudgetedMemorySnapshot) -> u64 {
     let target = if memory_pressure_high(snapshot) {
-        snapshot.connection_budget_bytes / 16
+        snapshot.available_bytes / 8
     } else {
-        snapshot.connection_budget_bytes / 4
+        snapshot.available_bytes / 2
     };
     target
         .clamp(MIN_TCP_QUEUE_BYTES_BUDGET, MAX_TCP_QUEUE_BYTES_BUDGET)
