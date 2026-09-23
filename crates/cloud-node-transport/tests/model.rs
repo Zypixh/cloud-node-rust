@@ -23,6 +23,10 @@ fn rtt_state(rtt_us: u64) -> RttState {
 
 /// Build a sample: `delivered`/`acked` bytes, `rtt_us` sample,
 /// `interval_us` measurement interval, `lost`/`ce` byte increments.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper mirrors the kernel RateSample field set; grouping into a struct adds noise at 19 call sites"
+)]
 fn rs(
     now_us: u64,
     delivered: u64,

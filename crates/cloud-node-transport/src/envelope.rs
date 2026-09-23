@@ -65,6 +65,23 @@ impl Envelope {
         self.set(inflight, DEFAULT_HEADROOM_MILLI, reason);
     }
 
+    /// Set with the default headroom plus a floor: the resulting
+    /// ceiling cannot go below `floor`. The floor is the caller's
+    /// proven-work-point bound — a collapse in *measured* inflight
+    /// during recovery is not evidence of lower capacity, and without
+    /// the floor each new event ratchets the ceiling toward zero on
+    /// lossy paths (§2.5 bounds overshoot, not the proven BDP).
+    pub fn set_default_floored(&mut self, inflight: u64, floor: u64, reason: &'static str) {
+        let keep = 1000u64.saturating_sub(DEFAULT_HEADROOM_MILLI as u64);
+        let hi = (inflight.saturating_mul(keep) / 1000).max(floor);
+        self.inflight_hi = Some(match self.inflight_hi {
+            Some(prev) => prev.min(hi),
+            None => hi,
+        });
+        self.low_belief_rounds = 0;
+        self.reason = reason;
+    }
+
     /// Per-RTT-round bookkeeping. `belief_milli` below the gate for
     /// `REFILL_AFTER_ROUNDS` consecutive rounds triggers one REFILL
     /// step (BBRv3): ceiling × 5/4, saturating. High belief resets the

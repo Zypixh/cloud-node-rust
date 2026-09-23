@@ -254,6 +254,14 @@ pub struct PathModel {
     /// Quiet-column denominators for `p_rand`.
     quiet_lost: u64,
     quiet_delivered: u64,
+    /// Recent quiet-path byte counters (slow EWMA over ACKs) —
+    /// byte-ratio basis matching `p_rand`. The window must be long:
+    /// the inference compares this against `p_rand` with a
+    /// one-sided `max(0, …)` clip, so any short-window noise spikes
+    /// (burst-marked tails) accumulate strictly-positive phantom
+    /// evidence even when the mean rate is at baseline.
+    quiet_lost_ewma: Ewma,
+    quiet_delivered_ewma: Ewma,
     /// Spurious-retransmit accounting (DSACK/Eifel, §2.8 feeds this).
     spurious_bytes: u64,
     retx_bytes: u64,
@@ -314,6 +322,8 @@ impl PathModel {
             accel_until_us: 0,
             quiet_lost: 0,
             quiet_delivered: 0,
+            quiet_lost_ewma: Ewma::default(),
+            quiet_delivered_ewma: Ewma::default(),
             spurious_bytes: 0,
             retx_bytes: 0,
             alpha: Ewma::default(),
@@ -356,7 +366,12 @@ impl PathModel {
         rtt: &RttState,
     ) {
         let now_us = rs.now.micros();
-        self.delivered_total += rs.delivered;
+        // `rs.delivered` is the segment-lifetime window (overlapping
+        // across ACKs — not additive). `acked_sacked` is the per-ACK
+        // additive confirmed count; every accounting denominator
+        // below must use it or the loss columns overstate delivered
+        // by the flight-span overlap and p_rand collapses low.
+        self.delivered_total += rs.acked_sacked;
         self.lost_total += rs.lost;
         self.cached_srtt_us = rtt
             .srtt
@@ -405,7 +420,24 @@ impl PathModel {
 
         // --- bandwidth ---
         if rs.delivered > 0 {
-            let rate = rs.delivery_rate_bps() as f64;
+            // ACK-compression bound: a sample cannot confirm bytes
+            // faster than the outstanding flight drains — cap the
+            // rate at a few flights per base RTT (Little's law with
+            // transient slack). Without this, post-stall compressed
+            // ACKs report the whole flight over a microsecond
+            // interval and poison bw_est/bw_max (and everything
+            // derived: BDP, envelope floor, pacing) with GB/s
+            // phantom rates.
+            let rate = {
+                let r = rs.delivery_rate_bps() as f64;
+                match self.base_rtt.value() {
+                    Some(base_us) if base_us > 0.0 => {
+                        let flight = rs.prior_in_flight.max(rs.delivered) as f64;
+                        r.min(4.0 * flight * 1e6 / base_us)
+                    }
+                    _ => r,
+                }
+            };
             self.bw_last_sample = rate;
             if rate > 0.0 {
                 if let Some(srtt) = rtt.srtt {
@@ -460,18 +492,32 @@ impl PathModel {
 
         // --- loss process ---
         let in_accel_window = now_us <= self.accel_until_us;
-        let qd_elevated = self.qdelay_us
-            > self.qdelay_elevated_thresh().as_micros() as f64;
+        // Congestion attribution: an occupied queue means we were
+        // overfilling the pipe. The in_flight-vs-BDP test is preferred —
+        // RTT-derived qdelay inflates for RTTs after recovery stalls
+        // (ACKs span the retransmit gap, which is not queueing), which
+        // would misclassify quiet-path random loss as congestion and
+        // starve the p_rand baseline. The qdelay test stays as the
+        // pre-BDP-estimate fallback.
+        let congested = self.loss_congested(in_flight);
         if in_accel_window {
-            self.accel_delivered += rs.delivered + rs.lost;
+            self.accel_delivered += rs.acked_sacked + rs.lost;
             self.accel_lost += rs.lost;
-        } else if !qd_elevated && rs.delivered_ce == 0 {
+        } else if !congested && rs.delivered_ce == 0 {
             // Quiet path sample: only these feed the random baseline.
-            self.quiet_delivered += rs.delivered;
+            // Acceleration-window samples are excluded — p_rand is the
+            // pre-speedup baseline the causation test compares against;
+            // counting probe losses would inflate it and hide the
+            // speedup's own effect.
+            self.quiet_delivered += rs.acked_sacked;
             self.quiet_lost += rs.lost;
+            self.quiet_lost_ewma
+                .add(EWMA_GAIN * EWMA_GAIN, rs.lost as f64);
+            self.quiet_delivered_ewma
+                .add(EWMA_GAIN * EWMA_GAIN, rs.acked_sacked as f64);
         }
         if rs.lost > 0 {
-            if qd_elevated {
+            if congested {
                 self.loss_qdelay_bytes += rs.lost;
                 self.loss_qdelay_events += 1;
             } else {
@@ -520,6 +566,27 @@ impl PathModel {
         self.accel_lost = 0;
         self.accel_delivered = 0;
         self.accel_until_us = now.micros() + horizon.as_micros() as u64;
+    }
+
+    /// RTO-declared loss (§2.2): retransmit-timer sweeps never appear
+    /// in `rs.lost` (that field is dupack-marked only), so on
+    /// tail-loss-dominated paths the loss columns would otherwise see
+    /// a small fraction of the real loss process and `p_rand` could
+    /// never converge. Feed them here, split by the same congestion
+    /// test; `delivered` denominators still come from rate samples.
+    pub fn note_rto_loss(&mut self, lost: u64, congested: bool) {
+        if lost == 0 {
+            return;
+        }
+        self.lost_total += lost;
+        if congested {
+            self.loss_qdelay_bytes += lost;
+            self.loss_qdelay_events += 1;
+        } else {
+            self.loss_quiet_bytes += lost;
+            self.loss_quiet_events += 1;
+            self.quiet_lost += lost;
+        }
     }
 
     /// DSACK/Eifel judged `bytes` of retransmission spurious (§2.8).
@@ -619,6 +686,21 @@ impl PathModel {
         self.extra_acked.get().unwrap_or(0.0) as u64
     }
 
+    /// Was a loss taken now congestion-caused? Preferred test: our own
+    /// queue occupancy — `in_flight` beyond 1.25× the BDP estimate
+    /// means we were overfilling the pipe (margin covers BDP estimate
+    /// noise; below it, drop-tail overflow is not our doing). Falls
+    /// back to the RTT-derived qdelay threshold before a BDP estimate
+    /// exists.
+    pub fn loss_congested(&self, in_flight: u64) -> bool {
+        match self.bdp_est() {
+            Some(bdp) if bdp > 0 => in_flight > bdp + bdp / 4,
+            _ => {
+                self.qdelay_us > self.qdelay_elevated_thresh().as_micros() as f64
+            }
+        }
+    }
+
     /// Two-column loss split (Veno-style): bytes lost while qdelay was
     /// elevated vs quiet.
     pub fn loss_columns(&self) -> (u64, u64) {
@@ -645,6 +727,21 @@ impl PathModel {
         let accel_rate = self.accel_lost as f64 / denom as f64;
         let base = self.p_rand().unwrap_or(0.0).max(1e-6);
         Some(accel_rate / base)
+    }
+
+    /// Recent quiet-path loss byte-ratio (~64-ACK window). Same
+    /// measurement basis as `p_rand` — the excess-vs-baseline test
+    /// uses this so burst marking granularity can't bias the compare.
+    pub fn quiet_loss_rate(&self) -> Option<f64> {
+        let l = self.quiet_lost_ewma.get()?;
+        let d = self.quiet_delivered_ewma.get()?;
+        Some((l / (l + d).max(1.0)).clamp(0.0, 1.0))
+    }
+
+    /// `in_flight` beyond the BDP estimate — the occupancy test shared
+    /// by congestion attribution and plateau evidence.
+    pub fn over_bdp(&self, in_flight: u64) -> bool {
+        self.bdp_est().map(|b| in_flight > b).unwrap_or(false)
     }
 
     /// `p_rand` — random-loss baseline ∈ [0,1]: loss rate on samples

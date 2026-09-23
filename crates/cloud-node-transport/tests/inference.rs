@@ -24,6 +24,7 @@ fn rtt_state(rtt_us: u64) -> RttState {
 fn rs(now_us: u64, delivered: u64, rtt_us: u64, lost: u64, ce: u64) -> RateSample {
     RateSample {
         delivered,
+        acked_sacked: delivered,
         lost,
         delivered_ce: ce,
         interval: Duration::from_micros(1_000),
@@ -51,7 +52,7 @@ fn accecn_ce_raises_belief_proportionally() {
     // 20% CE fraction.
     let s = rs(300_000, 10 * MSS, 10_000, 0, 2 * MSS);
     m.on_rate_sample(&s, 8 * MSS, &rtt);
-    let b = inf.on_rate_sample(&s, &m, 0, Duration::from_millis(5), Duration::from_millis(10));
+    let b = inf.on_rate_sample(&s, &m, 8 * MSS, 0, Duration::from_millis(5), Duration::from_millis(10));
     assert!(b > 0.5, "CE evidence should push belief up, got {b}");
 }
 
@@ -64,7 +65,7 @@ fn public_ce_contribution_is_capped() {
     for i in 0..10u64 {
         let s = rs(300_000 + i * 1_000, 10 * MSS, 10_000, 0, 10 * MSS);
         m.on_rate_sample(&s, 8 * MSS, &rtt);
-        inf.on_rate_sample(&s, &m, 0, Duration::from_secs(60), Duration::from_millis(10));
+        inf.on_rate_sample(&s, &m, 8 * MSS, 0, Duration::from_secs(60), Duration::from_millis(10));
     }
     assert!(
         inf.log_odds() <= PUBLIC_CE_LO_CAP + 1e-9,
@@ -82,8 +83,8 @@ fn trusted_link_ce_gets_full_weight() {
     for i in 0..10u64 {
         let s = rs(300_000 + i * 1_000, 10 * MSS, 10_000, 0, 10 * MSS);
         m.on_rate_sample(&s, 8 * MSS, &rtt);
-        pub_inf.on_rate_sample(&s, &m, 0, Duration::from_secs(60), Duration::from_millis(10));
-        tru_inf.on_rate_sample(&s, &m, 0, Duration::from_secs(60), Duration::from_millis(10));
+        pub_inf.on_rate_sample(&s, &m, 8 * MSS, 0, Duration::from_secs(60), Duration::from_millis(10));
+        tru_inf.on_rate_sample(&s, &m, 8 * MSS, 0, Duration::from_secs(60), Duration::from_millis(10));
     }
     assert!(
         tru_inf.log_odds() > pub_inf.log_odds(),
@@ -104,7 +105,7 @@ fn loss_with_qdelay_outweighs_quiet_loss() {
     for i in 0..4u64 {
         let s = rs(300_000 + i * 15_000, 9 * MSS, 15_000, MSS, 0);
         m.on_rate_sample(&s, 8 * MSS, &rtt15);
-        inf.on_rate_sample(&s, &m, 0, budget, Duration::from_millis(15));
+        inf.on_rate_sample(&s, &m, 24 * MSS, 0, budget, Duration::from_millis(15));
     }
     let congested = inf.log_odds();
 
@@ -114,7 +115,7 @@ fn loss_with_qdelay_outweighs_quiet_loss() {
     for i in 0..4u64 {
         let s = rs(300_000 + i * 10_000, 19 * MSS, 10_000, MSS, 0);
         m2.on_rate_sample(&s, 0, &rtt2);
-        inf2.on_rate_sample(&s, &m2, 0, budget, Duration::from_millis(10));
+        inf2.on_rate_sample(&s, &m2, 0, 0, budget, Duration::from_millis(10));
     }
     assert!(
         congested > inf2.log_odds(),
@@ -130,11 +131,11 @@ fn belief_decays_toward_zero_per_rtt() {
     let mut inf = Inference::new(true);
     let s = rs(300_000, 10 * MSS, 10_000, 0, 5 * MSS);
     m.on_rate_sample(&s, 0, &rtt);
-    let b0 = inf.on_rate_sample(&s, &m, 0, Duration::from_secs(60), Duration::from_millis(10));
+    let b0 = inf.on_rate_sample(&s, &m, 8 * MSS, 0, Duration::from_secs(60), Duration::from_millis(10));
     // 10 RTTs of silence.
     let s2 = rs(400_000, 0, 10_000, 0, 0);
     m.on_rate_sample(&s2, 0, &rtt);
-    let b1 = inf.on_rate_sample(&s2, &m, 0, Duration::from_secs(60), Duration::from_millis(10));
+    let b1 = inf.on_rate_sample(&s2, &m, 0, 0, Duration::from_secs(60), Duration::from_millis(10));
     assert!(b1 < b0, "belief must decay: {b0} -> {b1}");
 }
 
@@ -144,7 +145,7 @@ fn spurious_retx_is_negative_evidence() {
     let mut inf = Inference::new(true);
     let s = rs(300_000, 10 * MSS, 10_000, 0, 5 * MSS);
     m.on_rate_sample(&s, 0, &rtt);
-    let before = inf.on_rate_sample(&s, &m, 0, Duration::from_secs(60), Duration::from_millis(10));
+    let before = inf.on_rate_sample(&s, &m, 8 * MSS, 0, Duration::from_secs(60), Duration::from_millis(10));
     inf.note_spurious_retx();
     assert!(inf.log_odds() < 0.0 || inf.belief() < before);
 }
@@ -161,30 +162,44 @@ fn quiet_loss_above_p_rand_adds_bounded_evidence() {
     }
     assert!(m.p_rand().unwrap() < 0.02);
     let mut inf = Inference::new(true);
-    // A burst of quiet loss at ~10% — evidence = (rate − p_rand)+ × scale.
-    let s = rs(300_000, 9 * MSS, 10_000, MSS, 0);
-    m.on_rate_sample(&s, 0, &rtt);
-    inf.on_rate_sample(&s, &m, 0, Duration::from_secs(60), Duration::from_millis(10));
-    let expected_max = weights::LOSS_QUIET_SCALE * 0.1 + 1e-9;
+    // Sustained quiet loss at ~10%: the slow EWMA has to converge
+    // above the baseline before excess evidence appears (burst-marked
+    // ACKs must not count).
+    let mut belief = 0.0;
+    for i in 0..400u64 {
+        let s = rs(300_000 + i * 1_000, 9 * MSS, 10_000, MSS, 0);
+        m.on_rate_sample(&s, 0, &rtt);
+        belief = inf.on_rate_sample(
+            &s,
+            &m,
+            8 * MSS,
+            0,
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+        );
+    }
+    assert!(belief > 0.0, "sustained excess quiet loss → evidence");
+    let expected_max = 400.0 * weights::LOSS_QUIET_SCALE * 0.1 + 1e-6;
     assert!(
-        inf.log_odds() <= expected_max,
-        "quiet-loss weight {} must be ≤ (rate−p_rand)×scale {}",
-        inf.log_odds(),
+        inf.w_quiet_total <= expected_max,
+        "quiet-loss weight {} must be ≤ N×(rate−p_rand)×scale {}",
+        inf.w_quiet_total,
         expected_max
     );
-    assert!(inf.log_odds() > 0.0);
 }
 
 #[test]
 fn plateau_evidence_requires_rising_inflight() {
     let (mut m, rtt) = seeded_model();
-    // Build bw_est then feed plateau samples.
+    // Build bw_est then feed plateau samples. inflight must sit above
+    // the seeded BDP (~10·MSS at 1.46MB/s×10ms) — below BDP a flat
+    // delivery rate is growth, not plateau evidence.
     let mut inf = Inference::new(true);
     let mut prev_belief = inf.belief();
     for i in 0..6u64 {
         let s = rs(300_000 + i * 1_000, MSS, 10_000, 0, 0);
-        m.on_rate_sample(&s, 8 * MSS, &rtt);
-        let b = inf.on_rate_sample(&s, &m, MSS as i64, Duration::from_secs(60), Duration::from_millis(10));
+        m.on_rate_sample(&s, 20 * MSS, &rtt);
+        let b = inf.on_rate_sample(&s, &m, 20 * MSS, MSS as i64, Duration::from_secs(60), Duration::from_millis(10));
         prev_belief = b;
     }
     // Same samples with inflight *not* rising → no plateau evidence.
@@ -192,8 +207,8 @@ fn plateau_evidence_requires_rising_inflight() {
     let mut inf2 = Inference::new(true);
     for i in 0..6u64 {
         let s = rs(300_000 + i * 1_000, MSS, 10_000, 0, 0);
-        m2.on_rate_sample(&s, 8 * MSS, &rtt2);
-        inf2.on_rate_sample(&s, &m2, 0, Duration::from_secs(60), Duration::from_millis(10));
+        m2.on_rate_sample(&s, 20 * MSS, &rtt2);
+        inf2.on_rate_sample(&s, &m2, 20 * MSS, 0, Duration::from_secs(60), Duration::from_millis(10));
     }
     assert!(
         prev_belief > inf2.belief(),

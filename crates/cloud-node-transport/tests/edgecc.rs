@@ -77,6 +77,63 @@ fn edgecc_survives_random_loss_paths() {
     }
 }
 
+/// §7.1 extreme WAN cells: long-RTT + heavy independent loss. The
+/// controller must keep making progress (no RTO livelock) and finish —
+/// 20-30% random loss on a 200-300ms path is the harsh corner of the
+/// acceptance grid that loss-reactive controllers historically
+/// collapse on.
+#[test]
+fn edgecc_survives_high_rtt_extreme_loss() {
+    for &(rtt_ms, loss) in &[(200u64, 0.10f64), (250, 0.20), (300, 0.30)] {
+        let mut cfg = base(Duration::from_millis(rtt_ms), 12_500_000);
+        cfg.buffer_bytes = bdp(&cfg);
+        cfg.random_loss = loss;
+        cfg.total_bytes = 1024 * 1024;
+        cfg.duration = Duration::from_secs(300);
+        let (res, cc) = edgecc_run(&cfg);
+        assert!(
+            res.completed,
+            "edgecc failed rtt={rtt_ms}ms loss={loss}: delivered={}/{} drops={} rtos={} mode={}",
+            res.delivered_bytes,
+            cfg.total_bytes,
+            res.drops,
+            res.rto_events,
+            cc.snapshot().mode,
+        );
+    }
+}
+
+/// Same harsh cell for every controller: EdgeCC must finish strictly
+/// faster than the loss-reactive references — random loss is not
+/// congestion evidence, and a controller that treats it as such pays
+/// for every phantom backoff on a 250ms path.
+#[test]
+fn edgecc_outperforms_loss_reactive_refs_under_random_loss() {
+    use cloud_node_transport::cc::reference::{CubicRef, NewRenoRef};
+    let mut cfg = base(Duration::from_millis(250), 12_500_000);
+    cfg.buffer_bytes = bdp(&cfg);
+    cfg.random_loss = 0.20;
+    cfg.total_bytes = 1024 * 1024;
+    cfg.duration = Duration::from_secs(300);
+
+    let (edge_res, _) = edgecc_run(&cfg);
+    let mut cubic = CubicRef::new(cfg.mss);
+    let cubic_res = run(&mut cubic, &cfg);
+    let mut reno = NewRenoRef::new(cfg.mss);
+    let reno_res = run(&mut reno, &cfg);
+
+    assert!(edge_res.completed, "edgecc did not finish the harsh cell");
+    // FCT is wall-clock-independent sim time — a strict-less comparison
+    // on identical seeds/queues is a real ordering, not a flake source.
+    assert!(
+        edge_res.fct_us < cubic_res.fct_us.max(reno_res.fct_us),
+        "edgecc fct={}us not below refs cubic={}us reno={}us",
+        edge_res.fct_us,
+        cubic_res.fct_us,
+        reno_res.fct_us,
+    );
+}
+
 #[test]
 fn edgecc_prior_seeded_start() {
     let mut cfg = base(Duration::from_millis(50), 50_000_000);

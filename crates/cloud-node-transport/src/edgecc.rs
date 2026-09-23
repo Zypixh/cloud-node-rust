@@ -568,10 +568,30 @@ impl EdgeCc {
         }
     }
 
+    /// The rate the work point paces at. `bw_est` is the honest EWMA
+    /// point estimate; on random-loss paths the delivered stream sags
+    /// while the windowed `bw_max` keeps the last proven rate — the gap
+    /// is itself the loss-vs-capacity signal (a congested link cannot
+    /// deliver bursts above its serialization rate). The max is bounded
+    /// by the probed `bw_hi` so a stale peak cannot overshoot a measured
+    /// dose-response ceiling.
+    fn work_rate_bps(&self) -> Option<u64> {
+        let est = self.model.bw_est();
+        let max = self
+            .model
+            .bw_max()
+            .map(|m| self.model.bw_hi().map_or(m, |hi| m.min(hi)));
+        match (est, max) {
+            (Some(e), Some(m)) => Some(e.max(m)),
+            (Some(e), None) => Some(e),
+            (None, m) => m,
+        }
+    }
+
     /// Steady-state work point (§2.4 工作点):
-    /// `inflight = bw_est·base_rtt + Q_budget(tier)`, `pacing = bw_est·g`.
+    /// `inflight = bw·base_rtt + Q_budget(tier)`, `pacing = bw·g`.
     fn steady_work_point(&mut self) {
-        let bw = self.model.bw_est().or_else(|| self.model.bw_max());
+        let bw = self.work_rate_bps();
         let base = self.model.base_rtt();
         let (bw, base) = match (bw, base) {
             (Some(b), Some(r)) if b > 0 => (b, r),
@@ -601,6 +621,20 @@ impl EdgeCc {
             self.inflight_target = work;
             self.pacing_bps = (bw as f64 * STEADY_PACING_GAIN) as u64;
         }
+    }
+
+    /// Envelope floor (§2.5): the ceiling never drops below the path's
+    /// proven work point — the inflight the link demonstrably carried
+    /// (work-rate × base_rtt) — nor below the response floor. Without
+    /// it, strong-evidence sets taken mid-recovery ratchet the ceiling
+    /// toward one MSS on lossy paths.
+    fn envelope_floor(&self) -> u64 {
+        let proven = self
+            .work_rate_bps()
+            .zip(self.model.base_rtt())
+            .map(|(bw, base)| (bw as f64 * base.as_secs_f64()) as u64)
+            .unwrap_or(0);
+        proven.max(RESPOND_FLOOR_MSS * self.mss)
     }
 
     /// Belief-proportional response (§2.4): one bounded cut per round,
@@ -670,14 +704,20 @@ impl EdgeCc {
                 } else {
                     // Reject: restore; the refusal is dose-response
                     // evidence — record bw_hi at the attempted rate.
+                    // The bound can never fall below a rate the path
+                    // already proved (bw_max/bw_lo): a rejection caused
+                    // by random loss cannot disprove delivered rates.
                     self.inflight_target = self.probe.base_inflight;
                     let attempted = (self.probe.delta as f64
                         / self.last_srtt.unwrap_or(Duration::from_millis(1)).as_secs_f64())
                         as u64
                         + self.probe.base_rate;
                     let (hi, lo) = (self.model.bw_hi(), self.model.bw_lo());
-                    self.model
-                        .set_bw_bounds(Some(hi.map_or(attempted, |h| h.min(attempted))), lo);
+                    let proven = self.model.bw_max().unwrap_or(0).max(lo.unwrap_or(0));
+                    self.model.set_bw_bounds(
+                        Some(hi.map_or(attempted, |h| h.min(attempted)).max(proven)),
+                        lo,
+                    );
                     self.reason = reasons::PROBE_REJECT;
                 }
                 self.probe = Probe::default();
@@ -875,11 +915,12 @@ impl EdgeCc {
             && (rs.delivered_ce as f64 / rs.delivered as f64) >= ENVELOPE_CE_FRAC;
         let loss_qdelay = rs.lost >= ENVELOPE_LOSS_QDELAY_BYTES.min(rs.delivered + rs.lost)
             && rs.lost > 0
-            && self.model.qdelay() > self.model.qdelay_elevated_thresh();
+            && self.model.loss_congested(in_flight);
         let policer = self.model.lt_bw().is_some();
         if ce_strong || loss_qdelay {
+            let floor = self.envelope_floor();
             self.envelope
-                .set_default(in_flight.max(self.mss), reasons::ENVELOPE_SET);
+                .set_default_floored(in_flight.max(self.mss), floor, reasons::ENVELOPE_SET);
             if ce_strong {
                 self.reason = reasons::CE_RESPONSE;
             }
@@ -927,6 +968,7 @@ impl CongestionController for EdgeCc {
         self.infer.on_rate_sample(
             rs_for_belief,
             &self.model,
+            in_flight,
             in_flight_delta,
             self.tier.q_budget(self.model.base_rtt()),
             rtt_d,
@@ -1015,11 +1057,11 @@ impl CongestionController for EdgeCc {
                     .inflight_target
                     .saturating_add(rs.acked_sacked)
                     .min(self.prior_inflight_cap.unwrap_or(MAX_INFLIGHT));
-                // Cap = STARTUP_BDP_CAP × bw_est × base_rtt. base_rtt
+                // Cap = STARTUP_BDP_CAP × work_rate × base_rtt. base_rtt
                 // (not srtt) — a growing queue inflates srtt and would
                 // raise the cap with the very overshoot it bounds.
                 if let (Some(bw), Some(base)) =
-                    (self.model.bw_est(), self.model.base_rtt())
+                    (self.work_rate_bps(), self.model.base_rtt())
                 {
                     let bdp = bw as f64 * base.as_secs_f64();
                     let capped = ((bdp * STARTUP_BDP_CAP) as u64)
@@ -1113,6 +1155,10 @@ impl CongestionController for EdgeCc {
     ) {
         self.prr.note_lost(lost_bytes);
         if persistent {
+            // RTO sweeps bypass `rs.lost` — feed the model's loss
+            // columns directly so p_rand sees the real loss process.
+            self.model
+                .note_rto_loss(lost_bytes, self.model.loss_congested(in_flight));
             self.on_rto(now, in_flight);
             return;
         }
@@ -1121,17 +1167,30 @@ impl CongestionController for EdgeCc {
                 .saved
                 .or(Some((self.inflight_target, self.mode)));
             self.recovery_entry_rate = self.model.bw_est().unwrap_or(0);
-            // Envelope: loss is strong evidence only with qdelay (§2.5).
-            if self.model.qdelay() > self.model.qdelay_elevated_thresh() {
+            // Envelope: loss is strong evidence only with a real queue
+            // behind it (§2.5) — occupancy test, not the stall-inflated
+            // RTT-derived qdelay.
+            if self.model.loss_congested(in_flight) {
+                let floor = self.envelope_floor();
                 self.envelope
-                    .set_default(in_flight.max(self.mss), reasons::ENVELOPE_SET);
+                    .set_default_floored(in_flight.max(self.mss), floor, reasons::ENVELOPE_SET);
             }
-            // Belief-proportional inflight_lo (single cut, no stacking).
+            // Belief-proportional inflight_lo (single cut, no stacking)
+            // — but only when there is congestion evidence behind this
+            // loss. On a quiet path (no queue occupancy, belief below
+            // the respond gate) the loss is random; cutting the window
+            // on every random drop keeps the flight so small that the
+            // next tail loss is guaranteed → RTO loop at minimum
+            // throughput. PRR still tracks retransmission either way.
             if !self.ablations.no_belief {
-                let keep = 1.0 - BELIEF_BETA * self.infer.belief();
-                self.inflight_lo = Some(
-                    ((in_flight as f64 * keep) as u64).max(RESPOND_FLOOR_MSS * self.mss),
-                );
+                let evidenced = self.model.loss_congested(in_flight)
+                    || self.infer.belief_milli() >= BELIEF_RESPOND_MILLI;
+                self.inflight_lo = if evidenced {
+                    let keep = 1.0 - BELIEF_BETA * self.infer.belief();
+                    Some(((in_flight as f64 * keep) as u64).max(RESPOND_FLOOR_MSS * self.mss))
+                } else {
+                    None
+                };
             }
             self.prr.enter(in_flight, self.sent_total + 1);
             self.mode = modes::RECOVERY;
@@ -1150,22 +1209,45 @@ impl CongestionController for EdgeCc {
         // event granularity (§2.4: CE 比例充分 → alpha 型响应).
         let _ = now;
         if delivered > 0 && ce_bytes * 2 >= delivered {
+            let floor = self.envelope_floor();
             self.envelope
-                .set_default(in_flight.max(self.mss), reasons::ENVELOPE_SET);
+                .set_default_floored(in_flight.max(self.mss), floor, reasons::ENVELOPE_SET);
             self.reason = reasons::CE_RESPONSE;
         }
     }
 
     fn on_rto(&mut self, now: TransportInstant, in_flight: u64) {
         let _ = now;
-        // RTO is the strongest evidence: ceiling at current inflight
-        // (minus headroom), rate floored, model keeps its state for
-        // bounded recovery (§2.4: 不能凭陈旧 BDP 立即发满).
-        self.envelope
-            .set_default(in_flight.max(self.mss), reasons::ENVELOPE_SET);
-        self.inflight_lo = Some(MIN_INFLIGHT_MSS * self.mss);
-        self.inflight_target = MIN_INFLIGHT_MSS * self.mss;
-        self.pacing_bps = 0;
+        // RTO is strong evidence only with congestion corroboration
+        // (§2.5: 强证据 → envelope). A timeout on a quiet path is tail
+        // or random loss — pinning the ceiling to the drained inflight
+        // would ratchet high-p_rand paths to the floor on every
+        // retransmit timer. With an elevated queue or accumulated
+        // belief the RTO still sets the envelope as before.
+        if self.model.loss_congested(in_flight)
+            || self.infer.belief_milli() >= BELIEF_RESPOND_MILLI
+        {
+            let floor = self.envelope_floor();
+            self.envelope
+                .set_default_floored(in_flight.max(self.mss), floor, reasons::ENVELOPE_SET);
+            self.inflight_lo = Some(MIN_INFLIGHT_MSS * self.mss);
+            self.inflight_target = MIN_INFLIGHT_MSS * self.mss;
+            self.pacing_bps = 0;
+        } else {
+            // Quiet-path timeout: no queue behind the loss and no
+            // accumulated belief — the RTO is a tail/random-loss
+            // artifact, not a capacity signal. Collapsing the target
+            // to the floor here would restart the whole growth climb
+            // on every retransmit timer on high-p_rand paths; hold
+            // the proven work point instead (still bounded by the
+            // envelope, still paced so the retransmit burst is
+            // spread rather than line-rate).
+            self.inflight_lo = None;
+            self.inflight_target = self.inflight_target.max(MIN_INFLIGHT_MSS * self.mss);
+            if self.pacing_bps == 0 {
+                self.pacing_bps = self.model.bw_est().unwrap_or(0);
+            }
+        }
         self.prr = Prr::default();
         self.probe = Probe::default();
         self.release_probe_permit();

@@ -164,7 +164,7 @@ fn selected(cell: &str, variant: &str, replica: u32) -> bool {
     let mut it = f.splitn(3, ':');
     it.next() == Some(cell)
         && it.next() == Some(variant)
-        && it.next().map_or(true, |r| r == replica.to_string())
+        && it.next().is_none_or(|r| r == replica.to_string())
 }
 
 fn run_cell(v: &Variant, cfg: &SimConfig, flows: u32, cell: &str, replica: u32) {
@@ -255,6 +255,27 @@ fn main() {
                 let mut cfg = base_cell(rtt, mbps, loss);
                 cfg.buffer_bytes = bdp(&cfg);
                 let cell = format!("rtt{rtt}_loss{loss}_bw{mbps}");
+                for v in VARIANTS {
+                    for rep in 0..REPLICAS {
+                        run_cell(v, &cfg, 1, &cell, rep);
+                    }
+                }
+            }
+        }
+    }
+
+    // Harsh-WAN grid: high-RTT (200-300ms) × high-loss (10-30%) cells.
+    // These are the paths a CDN edge actually serves cross-ocean; each
+    // cell caps the transfer at 2 MiB / 240s virtual so tail-loss RTO
+    // storms bound the wall-clock cost of one run.
+    for &rtt in &[200u64, 250, 300] {
+        for &loss in &[10.0f64, 20.0, 30.0] {
+            for &mbps in &[10u64, 100] {
+                let mut cfg = base_cell(rtt, mbps, loss);
+                cfg.buffer_bytes = bdp(&cfg);
+                cfg.total_bytes = 2 * 1024 * 1024;
+                cfg.duration = Duration::from_secs(240);
+                let cell = format!("harsh_rtt{rtt}_loss{loss}_bw{mbps}");
                 for v in VARIANTS {
                     for rep in 0..REPLICAS {
                         run_cell(v, &cfg, 1, &cell, rep);

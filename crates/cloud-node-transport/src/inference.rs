@@ -129,6 +129,12 @@ pub struct Inference {
     /// quiet loss counts as congestion evidence — classic-CC behavior.
     /// Production never sets it.
     pub prand_off: bool,
+    /// Diagnostics: cumulative weight added per evidence class.
+    pub w_ce_total: f64,
+    pub w_qdelay_total: f64,
+    pub w_loss_qd_total: f64,
+    pub w_quiet_total: f64,
+    pub w_plateau_total: f64,
 }
 
 impl Default for Inference {
@@ -150,6 +156,11 @@ impl Inference {
             sbd: SbdStats::default(),
             classic_ecn: false,
             prand_off: false,
+            w_ce_total: 0.0,
+            w_qdelay_total: 0.0,
+            w_loss_qd_total: 0.0,
+            w_quiet_total: 0.0,
+            w_plateau_total: 0.0,
         }
     }
 
@@ -184,15 +195,16 @@ impl Inference {
     }
 
     /// Per-ACK update. `q_budget` is the tier's acceptable self-queue
-    /// delay (§2.4 Q_budget); `in_flight_delta` is the change in
-    /// in-flight bytes attributable to this event's window (positive
-    /// when the sender expanded).
+    /// delay (§2.4 Q_budget); `in_flight`/`in_flight_delta` are the
+    /// current in-flight bytes and the change attributable to this
+    /// event's window (positive when the sender expanded).
     ///
     /// Returns the updated belief.
     pub fn on_rate_sample(
         &mut self,
         rs: &RateSample,
         model: &PathModel,
+        in_flight: u64,
         in_flight_delta: i64,
         q_budget: Duration,
         rtt: Duration,
@@ -237,41 +249,64 @@ impl Inference {
             };
             let applied = w_ce.clamp(0.0, headroom.max(0.0));
             self.ce_lo += applied;
+            self.w_ce_total += applied;
             w += applied;
         }
 
         // qdelay over the tier budget while its gradient is positive.
         if model.qdelay() > q_budget && model.qdelay_grad_us_per_rtt() > 0.0 {
+            self.w_qdelay_total += weights::QDELAY_OVER_BUDGET;
             w += weights::QDELAY_OVER_BUDGET;
         }
 
         if rs.lost > 0 {
             self.sbd.note_loss(rs.now);
-            if model.qdelay() > model.qdelay_elevated_thresh() {
+            if model.loss_congested(in_flight) {
+                self.w_loss_qd_total += weights::LOSS_WITH_QDELAY;
                 w += weights::LOSS_WITH_QDELAY;
             } else {
                 // Quiet loss counts only for the part above the random
-                // baseline: weight = (loss_rate − p_rand)+ × scale.
-                let total = (rs.delivered + rs.lost).max(1) as f64;
-                let rate = rs.lost as f64 / total;
+                // baseline: weight = (recent rate − p_rand)+ × scale.
+                // The recent rate is the model's byte-ratio EWMA — the
+                // raw per-ACK fraction spikes when one ACK burst-marks
+                // a tail of losses, which would keep excess positive
+                // forever on genuinely random-loss paths.
+                let total = (rs.acked_sacked + rs.lost).max(1) as f64;
+                let rate = model
+                    .quiet_loss_rate()
+                    .unwrap_or(rs.lost as f64 / total);
+                // No baseline → no "excess" claim: before p_rand has
+                // converged, quiet loss proves nothing about
+                // congestion (treating the missing baseline as zero
+                // gave every early random loss full weight and locked
+                // belief above the respond gate permanently).
                 let baseline = if self.prand_off {
-                    0.0
+                    Some(0.0)
                 } else {
-                    model.p_rand().unwrap_or(0.0)
+                    model.p_rand()
                 };
-                let excess = (rate - baseline).max(0.0);
-                w += weights::LOSS_QUIET_SCALE * excess;
+                if let Some(base) = baseline {
+                    let excess = (rate - base).max(0.0);
+                    self.w_quiet_total += weights::LOSS_QUIET_SCALE * excess;
+                    w += weights::LOSS_QUIET_SCALE * excess;
+                }
             }
         }
 
         // inflight rising while delivery plateaus — compare the same
-        // per-sample rate the model filtered.
+        // per-sample rate the model filtered. Only meaningful at or
+        // beyond the BDP: below it, growing the window is *supposed*
+        // to outgrow the delivered stream, so a flat rate is not
+        // plateau evidence (on lossy paths this would fire on every
+        // post-recovery regrowth ACK).
         if in_flight_delta > 0
             && rs.delivered > 0
+            && model.over_bdp(in_flight)
             && let Some(est) = model.bw_est()
         {
             let rate = model.bw_last_sample();
             if rate <= est + est / 20 {
+                self.w_plateau_total += weights::PLATEAU_INFLIGHT_UP;
                 w += weights::PLATEAU_INFLIGHT_UP;
             }
         }
