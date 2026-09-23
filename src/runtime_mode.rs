@@ -484,6 +484,52 @@ pub enum XdpTransportController {
     LossBlind,
 }
 
+/// Validation-only controller override (usize-encoded
+/// `XdpTransportController`, `usize::MAX` = unset). Smoke/bench entry
+/// points install a reference controller onto the AF_XDP dataplane for
+/// real-wire A/B measurement; production wiring never calls the setter,
+/// so the serving path always resolves EdgeCC.
+static VALIDATION_TRANSPORT_CONTROLLER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+fn transport_controller_index(controller: XdpTransportController) -> usize {
+    match controller {
+        XdpTransportController::Cubic => 0,
+        XdpTransportController::Edgecc => 1,
+        XdpTransportController::Bbr3 => 2,
+        XdpTransportController::NewReno => 3,
+        XdpTransportController::LossBlind => 4,
+    }
+}
+
+fn transport_controller_from_index(index: usize) -> Option<XdpTransportController> {
+    match index {
+        0 => Some(XdpTransportController::Cubic),
+        1 => Some(XdpTransportController::Edgecc),
+        2 => Some(XdpTransportController::Bbr3),
+        3 => Some(XdpTransportController::NewReno),
+        4 => Some(XdpTransportController::LossBlind),
+        _ => None,
+    }
+}
+
+/// Validation harnesses only: pin the AF_XDP dataplane's congestion
+/// controller for the lifetime of this process. Called from smoke/bench
+/// subcommand entry points before the manager is built — never from the
+/// serving path.
+pub fn set_validation_transport_controller(controller: XdpTransportController) {
+    VALIDATION_TRANSPORT_CONTROLLER.store(
+        transport_controller_index(controller),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn validation_transport_controller() -> Option<XdpTransportController> {
+    transport_controller_from_index(
+        VALIDATION_TRANSPORT_CONTROLLER.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 impl XdpTransportController {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -520,8 +566,16 @@ impl XdpTransportSettings {
     /// Resolved production policy: EdgeCC is pinned — the parsed
     /// `controller` value cannot select ablation controllers on
     /// production wiring; `trustedEcn`/`aggregation` stay
-    /// operator-configurable.
+    /// operator-configurable. A validation override (smoke/bench only,
+    /// see [`set_validation_transport_controller`]) wins over the pin
+    /// so real-wire A/B runs can compare controllers.
     pub fn production_pinned(&self) -> Self {
+        if let Some(controller) = validation_transport_controller() {
+            return Self {
+                controller,
+                ..*self
+            };
+        }
         Self {
             controller: XdpTransportController::Edgecc,
             ..*self

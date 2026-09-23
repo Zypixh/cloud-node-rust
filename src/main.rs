@@ -446,6 +446,11 @@ enum XdpCommands {
         /// 19002 tcp-echo, 19003 udp-echo, 19005 sni-tls; quic stays local)
         #[arg(long)]
         remote: Option<std::net::IpAddr>,
+        /// Validation-only: pin the AF_XDP dataplane's congestion controller
+        /// for this smoke process (real-wire A/B measurement; production
+        /// stays pinned to edgecc)
+        #[arg(long, value_enum)]
+        cc: Option<XdpCliCc>,
     },
     /// Verify an in-process XDP reload while AF_XDP proxy bridge is active
     #[command(name = "proxy-reload-smoke")]
@@ -479,11 +484,37 @@ enum XdpCommands {
         /// after session establishment (F1 lifecycle validation)
         #[arg(long)]
         reload_at_ms: Option<u64>,
+        /// Validation-only: pin the AF_XDP dataplane's congestion controller
+        /// for this smoke process (real-wire A/B measurement; production
+        /// stays pinned to edgecc)
+        #[arg(long, value_enum)]
+        cc: Option<XdpCliCc>,
     },
 
     /// Interactive XDP configuration wizard / XDP 交互式配置向导
     #[command(name = "configure")]
     Configure,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum XdpCliCc {
+    Cubic,
+    Edgecc,
+    Bbr3,
+    NewReno,
+    LossBlind,
+}
+
+impl From<XdpCliCc> for cloud_node_rust::runtime_mode::XdpTransportController {
+    fn from(value: XdpCliCc) -> Self {
+        match value {
+            XdpCliCc::Cubic => Self::Cubic,
+            XdpCliCc::Edgecc => Self::Edgecc,
+            XdpCliCc::Bbr3 => Self::Bbr3,
+            XdpCliCc::NewReno => Self::NewReno,
+            XdpCliCc::LossBlind => Self::LossBlind,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1115,9 +1146,13 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             ready_file,
             kernel,
             remote,
+            cc,
         } => {
             let runtime_config = RuntimeConfig::load_default()?;
             RuntimeConfig::set_current(runtime_config);
+            if let Some(cc) = cc {
+                cloud_node_rust::runtime_mode::set_validation_transport_controller(cc.into());
+            }
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -1149,9 +1184,13 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             payload_bytes,
             send_interval_ms,
             reload_at_ms,
+            cc,
         } => {
             let runtime_config = RuntimeConfig::load_default()?;
             RuntimeConfig::set_current(runtime_config);
+            if let Some(cc) = cc {
+                cloud_node_rust::runtime_mode::set_validation_transport_controller(cc.into());
+            }
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
