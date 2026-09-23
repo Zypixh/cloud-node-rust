@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,7 +389,32 @@ struct MemorySnapshot {
     psi_full_avg10_x100: u32,
 }
 
-pub static MEMORY_GOVERNOR: LazyLock<MemoryGovernor> = LazyLock::new(MemoryGovernor::new);
+pub static MEMORY_GOVERNOR: LazyLock<MemoryGovernor> = LazyLock::new(|| {
+    let governor = MemoryGovernor::new();
+    governor.refresher_owned.store(true, Ordering::Relaxed);
+    // The published snapshot is refreshed by one dedicated thread so
+    // hot-path readers (admission checks, AF_XDP pumps) never pay a
+    // synchronous /proc walk — smaps_rollup alone was measured at
+    // ~23ms on a 480MB-RSS process, i.e. tens of percent of a core at
+    // the 250ms cadence.
+    let _ = std::thread::Builder::new()
+        .name("memgov-snapshot".to_string())
+        .spawn(|| loop {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                {
+                    let _update = lock_recover(&MEMORY_GOVERNOR.snapshot_update);
+                    MEMORY_GOVERNOR.refresh_snapshot_uncached(
+                        crate::utils::time::system_timestamp_millis(),
+                    );
+                }
+                // Rebuild the materialized limits table against the fresh
+                // inputs so `limits()` stays a pure ArcSwap load.
+                let _ = MEMORY_GOVERNOR.refresh_limits();
+            }));
+            std::thread::sleep(Duration::from_millis(SNAPSHOT_TTL_MS as u64));
+        });
+    governor
+});
 
 // Pressure observations are handed to the reclaim monitor asynchronously
 // (memory_reclaim::notify_pressure_async), so observing pressure can no longer
@@ -417,6 +442,12 @@ pub fn reported_memory_totals() -> (i64, i64) {
 /// The hot path never reads /proc — it reads the published snapshot and
 /// the materialized limits table.
 const SNAPSHOT_TTL_MS: i64 = 250;
+/// How stale the published snapshot may grow before a reader stops
+/// trusting the background refresher and refreshes inline. ~8× the
+/// cadence — a dead or starved refresher must not freeze pressure
+/// classification, and test governors (no refresher) never wait this
+/// long because they are not marked `refresher_owned`.
+const SNAPSHOT_HARD_STALE_MS: i64 = 2_000;
 const FD_SNAPSHOT_TTL_MS: i64 = 250;
 const MIN_MEMORY_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const CONNECTION_BUDGET_PCT: u64 = 45;
@@ -759,6 +790,13 @@ pub struct MemoryGovernor {
     cached_fd_used: AtomicU64,
     cached_fd_used_at_millis: AtomicU64,
     cached_at_millis: AtomicU64,
+    /// True only on the process-global `MEMORY_GOVERNOR`: a dedicated
+    /// refresher thread republishes the snapshot every SNAPSHOT_TTL_MS,
+    /// so readers serve the cache up to SNAPSHOT_HARD_STALE_MS old
+    /// instead of paying a synchronous /proc walk on the hot path.
+    /// Instances constructed directly (tests) stay false and keep the
+    /// inline-refresh behaviour.
+    refresher_owned: AtomicBool,
     /// Serializes cache refreshers; readers use `cached_at_millis` as a
     /// seqlock version (0 = update in progress).
     snapshot_update: Mutex<()>,
@@ -1187,6 +1225,7 @@ impl MemoryGovernor {
             cached_fd_used: AtomicU64::new(0),
             cached_fd_used_at_millis: AtomicU64::new(0),
             cached_at_millis: AtomicU64::new(0),
+            refresher_owned: AtomicBool::new(false),
             snapshot_update: Mutex::new(()),
             cached_cgroup_managed: AtomicU64::new(0),
             cached_cgroup_memory_max_bytes: AtomicU64::new(0),
@@ -2859,13 +2898,31 @@ impl MemoryGovernor {
         self.refresh_limits()
     }
 
+    /// The cached snapshot is usable when it was published recently —
+    /// SNAPSHOT_TTL_MS for self-refreshing instances, the looser
+    /// SNAPSHOT_HARD_STALE_MS bound when the dedicated refresher thread
+    /// owns republication (its per-TTL writes keep the cache well inside
+    /// that bound; exceeding it means the refresher is dead and inline
+    /// refresh takes over).
+    fn snapshot_usable(&self, now: i64, cached_at: i64) -> bool {
+        if cached_at <= 0 {
+            return false;
+        }
+        let staleness_ms = now.saturating_sub(cached_at);
+        if self.refresher_owned.load(Ordering::Relaxed) {
+            staleness_ms < SNAPSHOT_HARD_STALE_MS
+        } else {
+            staleness_ms < SNAPSHOT_TTL_MS
+        }
+    }
+
     /// Mirrors the freshness test inside `memory_snapshot()`: the cached
     /// inputs are usable for at most SNAPSHOT_TTL_MS, after which the table
     /// must be rebuilt from re-read kernel counters.
     fn snapshot_fresh(&self) -> bool {
         let now = crate::utils::time::system_timestamp_millis();
         let cached_at = self.cached_at_millis.load(Ordering::Relaxed) as i64;
-        cached_at > 0 && now.saturating_sub(cached_at) < SNAPSHOT_TTL_MS
+        self.snapshot_usable(now, cached_at)
     }
 
     /// Rebuild is idempotent: concurrent rebuilds may race to store, last one
@@ -2994,7 +3051,7 @@ impl MemoryGovernor {
     fn memory_snapshot(&self) -> BudgetedMemorySnapshot {
         let now = crate::utils::time::system_timestamp_millis();
         let cached_at = self.cached_at_millis.load(Ordering::Acquire) as i64;
-        if cached_at > 0 && now.saturating_sub(cached_at) < SNAPSHOT_TTL_MS {
+        if self.snapshot_usable(now, cached_at) {
             let mem = self.budgeted_from_cached();
             // Seqlock validation: a writer marks the timestamp 0 while it
             // updates the fields, so if it changed mid-read this snapshot is
@@ -3011,11 +3068,19 @@ impl MemoryGovernor {
         let _update = lock_recover(&self.snapshot_update);
         let now = crate::utils::time::system_timestamp_millis();
         let cached_at = self.cached_at_millis.load(Ordering::Relaxed) as i64;
-        if cached_at > 0 && now.saturating_sub(cached_at) < SNAPSHOT_TTL_MS {
+        if self.snapshot_usable(now, cached_at) {
             let mem = self.budgeted_from_cached();
             notify_pressure_reclaim(memory_pressure_level(&mem));
             return mem;
         }
+        self.refresh_snapshot_uncached(now)
+    }
+
+    /// Read the kernel counters and republish every cached snapshot field.
+    /// The caller must hold `snapshot_update` — inline refreshers take it
+    /// above; the dedicated refresher thread takes it around this call so
+    /// its writes never interleave with a fallback refresh.
+    fn refresh_snapshot_uncached(&self, now: i64) -> BudgetedMemorySnapshot {
         // Sample the unconfirmed-commit counter BEFORE reading the kernel:
         // only bytes committed before this read are inside the `used` the
         // snapshot is about to observe. Commits racing the read stay
