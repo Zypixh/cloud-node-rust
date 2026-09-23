@@ -1309,7 +1309,9 @@ impl AfXdpTcpReactor {
             return AfXdpTcpIngestStatus::RefusedAtCapacity;
         }
         #[cfg(target_os = "linux")]
-        AF_XDP_TCP_DIAG_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+        if !existing_session {
+            AF_XDP_TCP_DIAG_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+        }
         if !self.enqueue_ingress(route, flow, ip_packet) {
             return AfXdpTcpIngestStatus::IngressQueueFull;
         }
@@ -1559,6 +1561,16 @@ impl AfXdpTcpReactor {
         if let Some(session) = self.sessions.get_mut(flow) {
             session.cap_parked_since = Some(since);
             self.ingress_stalled.insert(*flow);
+        }
+    }
+
+    /// Test hook: mark `flow` closing without aborting the socket —
+    /// the FIN-WAIT-2 zombie shape (close handshake stalled, socket
+    /// still in a non-terminal state).
+    #[cfg(test)]
+    pub(crate) fn force_closing_for_test(&mut self, flow: &AfXdpTcpFlowKey) {
+        if let Some(session) = self.sessions.get_mut(flow) {
+            session.closing = true;
         }
     }
 
@@ -1826,12 +1838,11 @@ impl AfXdpTcpReactor {
 
     fn publish_session_gauges(&self) {
         #[cfg(target_os = "linux")]
-        {
-            AF_XDP_TCP_DIAG_SESSIONS_CURRENT
-                .store(self.sessions.len() as u64, Ordering::Relaxed);
-            AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT
-                .store(self.pre_proxy_sessions as u64, Ordering::Relaxed);
-        }
+        publish_tcp_session_count(
+            &self.label,
+            self.sessions.len() as u64,
+            self.pre_proxy_sessions as u64,
+        );
     }
 
     /// T4: the bridge installs the generation's dial registry before the
@@ -2353,6 +2364,8 @@ impl AfXdpTcpReactor {
         // them shrank every transferring session's share to ~300KB under
         // speedtest churn (≈ share/RTT → a ~14 Mbps ceiling).
         let live_sessions = self.contender_sessions();
+        #[cfg(target_os = "linux")]
+        let sessions_len = self.sessions.len() as u64;
         let Some(session) = self.sessions.get_mut(&flow) else {
             return;
         };
@@ -2466,8 +2479,11 @@ impl AfXdpTcpReactor {
                         }
                     }
                     #[cfg(target_os = "linux")]
-                    AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT
-                        .store(self.pre_proxy_sessions as u64, Ordering::Relaxed);
+                    publish_tcp_session_count(
+                        &self.label,
+                        sessions_len,
+                        self.pre_proxy_sessions as u64,
+                    );
                 } else {
                     // A pre-proxy socket that reached a terminal state on
                     // its own (peer RST during the handshake) has no
@@ -2854,6 +2870,19 @@ impl AfXdpTcpReactor {
                         idle_timeout,
                     ));
                 }
+                finished.push(*flow);
+            } else if session.closing && idle_for >= AF_XDP_TCP_CLOSING_REAP_AFTER {
+                // The close handshake stalled — FIN-WAIT-2 has no protocol
+                // timeout, so a silent peer would pin the session's buffer
+                // permits forever. Force-reap; the removal path aborts the
+                // socket (RST) so nothing dangles kernel-side either.
+                tracing::debug!(
+                    "AF_XDP TCP reactor reaping stalled closing session local={} peer={} state={} idle_ms={}",
+                    session.flow.local_addr,
+                    session.flow.peer_addr,
+                    socket.state(),
+                    idle_for.as_millis()
+                );
                 finished.push(*flow);
             } else if af_xdp_tcp_session_reapable(session.closing, socket.state()) {
                 finished.push(*flow);
@@ -3449,6 +3478,7 @@ impl AsyncWrite for AfXdpTcpStream {
 impl Drop for AfXdpTcpReactor {
     fn drop(&mut self) {
         purge_tcp_session_snapshots(&self.label);
+        remove_tcp_session_count(&self.label);
         // T4: reactor teardown fails every unresolved dial and releases
         // each dialed flow's registry state — no source port, demux
         // entry, or XDP_OUT_CT row may outlive its owner.

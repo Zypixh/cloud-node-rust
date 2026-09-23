@@ -143,6 +143,14 @@ pub(crate) const AF_XDP_TCP_CAP_PARK_DEADLINE: Duration = Duration::from_secs(30
 /// measured pinning the whole queue budget long after traffic stopped.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_IDLE_SHRINK_AFTER: Duration = Duration::from_secs(2);
+/// A session marked `closing` whose peer stops driving the close
+/// handshake is reaped after this long with no activity. FIN-WAIT-2 has
+/// no protocol timeout: without this bound a silent peer leaves the
+/// session immortal — observed on-node as 20 upstream sessions holding
+/// ~1 MiB of socket-buffer charge each long after every client died.
+/// 60s mirrors the Linux TCP_LINGER2 default for the same zombie shape.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_CLOSING_REAP_AFTER: Duration = Duration::from_secs(60);
 /// T9: after a refused growth charge, wait this long before trying
 /// again. Per-pump retries against a full ledger were measured at
 /// ~11M CAS attempts/min — enough to starve the single reactor thread
@@ -208,10 +216,16 @@ static AF_XDP_TCP_DIAG_BUDGET_STALLS: AtomicU64 = AtomicU64::new(0);
 /// `release_budget_backpressure`.
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_WRITE_STALLS: AtomicU64 = AtomicU64::new(0);
+/// T1: live session counts per reactor ("iface:queue" → count). A single
+/// atomic would be last-writer-wins across queues — the /status value
+/// must be the node-wide sum, so each reactor publishes its own slot and
+/// readers aggregate. Rows are removed on reactor drop.
 #[cfg(target_os = "linux")]
-static AF_XDP_TCP_DIAG_SESSIONS_CURRENT: AtomicU64 = AtomicU64::new(0);
+static AF_XDP_TCP_SESSIONS_BY_QUEUE: std::sync::LazyLock<DashMap<String, u64>> =
+    std::sync::LazyLock::new(DashMap::new);
 #[cfg(target_os = "linux")]
-static AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT: AtomicU64 = AtomicU64::new(0);
+static AF_XDP_TCP_PRE_PROXY_BY_QUEUE: std::sync::LazyLock<DashMap<String, u64>> =
+    std::sync::LazyLock::new(DashMap::new);
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
@@ -301,8 +315,8 @@ pub(crate) fn reset_tcp_diag() {
     AF_XDP_TCP_DIAG_WAKE_SIGNALS.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_BUDGET_STALLS.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_WRITE_STALLS.store(0, Ordering::Relaxed);
-    AF_XDP_TCP_DIAG_SESSIONS_CURRENT.store(0, Ordering::Relaxed);
-    AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_SESSIONS_BY_QUEUE.clear();
+    AF_XDP_TCP_PRE_PROXY_BY_QUEUE.clear();
     AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_PER_IP_EVICTED.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED.store(0, Ordering::Relaxed);
@@ -318,10 +332,40 @@ pub(crate) fn reset_tcp_diag() {
 /// Compact scalar-only diag line for periodic journal visibility —
 /// per-session rows stay in `tcp_diag_snapshot` for the status endpoint.
 #[cfg(target_os = "linux")]
+fn tcp_sessions_current() -> u64 {
+    AF_XDP_TCP_SESSIONS_BY_QUEUE
+        .iter()
+        .map(|entry| *entry.value())
+        .sum()
+}
+
+#[cfg(target_os = "linux")]
+fn tcp_pre_proxy_current() -> u64 {
+    AF_XDP_TCP_PRE_PROXY_BY_QUEUE
+        .iter()
+        .map(|entry| *entry.value())
+        .sum()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn publish_tcp_session_count(label: &str, sessions: u64, pre_proxy: u64) {
+    AF_XDP_TCP_SESSIONS_BY_QUEUE.insert(label.to_string(), sessions);
+    AF_XDP_TCP_PRE_PROXY_BY_QUEUE.insert(label.to_string(), pre_proxy);
+}
+
+/// Drop a reactor's gauge rows — same lifetime contract as
+/// `purge_tcp_session_snapshots`: a dead queue must not keep publishing.
+#[cfg(target_os = "linux")]
+pub(crate) fn remove_tcp_session_count(label: &str) {
+    AF_XDP_TCP_SESSIONS_BY_QUEUE.remove(label);
+    AF_XDP_TCP_PRE_PROXY_BY_QUEUE.remove(label);
+}
+
+#[cfg(target_os = "linux")]
 pub fn tcp_diag_scalars() -> serde_json::Value {
     serde_json::json!({
-        "sessions": AF_XDP_TCP_DIAG_SESSIONS_CURRENT.load(Ordering::Relaxed),
-        "preProxy": AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT.load(Ordering::Relaxed),
+        "sessions": tcp_sessions_current(),
+        "preProxy": tcp_pre_proxy_current(),
         "accepted": AF_XDP_TCP_DIAG_ACCEPTED.load(Ordering::Relaxed),
         "refusedAtCapacity": AF_XDP_TCP_DIAG_REFUSED_AT_CAPACITY.load(Ordering::Relaxed),
         "preProxyTimeout": AF_XDP_TCP_DIAG_PRE_PROXY_TIMEOUT.load(Ordering::Relaxed),
@@ -460,8 +504,8 @@ pub(crate) fn tcp_diag_snapshot() -> serde_json::Value {
         "drainCapParks": AF_XDP_TCP_DIAG_CAP_PARKS.load(Ordering::Relaxed),
         "drainCapReaped": AF_XDP_TCP_DIAG_CAP_REAPED.load(Ordering::Relaxed),
         "bufferShrinks": AF_XDP_TCP_DIAG_BUFFER_SHRINKS.load(Ordering::Relaxed),
-        "sessionsCurrent": AF_XDP_TCP_DIAG_SESSIONS_CURRENT.load(Ordering::Relaxed),
-        "preProxyCurrent": AF_XDP_TCP_DIAG_PRE_PROXY_CURRENT.load(Ordering::Relaxed),
+        "sessionsCurrent": tcp_sessions_current(),
+        "preProxyCurrent": tcp_pre_proxy_current(),
         "preProxyEvicted": AF_XDP_TCP_DIAG_PRE_PROXY_EVICTED.load(Ordering::Relaxed),
         "perIpPreProxyEvicted": AF_XDP_TCP_DIAG_PER_IP_EVICTED.load(Ordering::Relaxed),
         "preProxyRefused": AF_XDP_TCP_DIAG_PRE_PROXY_REFUSED.load(Ordering::Relaxed),

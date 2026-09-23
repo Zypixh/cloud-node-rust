@@ -1696,6 +1696,61 @@ fn af_xdp_tcp_reactor_reaps_idle_sessions() {
 
 #[cfg(any(test, target_os = "linux"))]
 #[test]
+fn af_xdp_tcp_reactor_reaps_stalled_closing_sessions() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    use std::time::Duration;
+    // Production regression: a session marked closing whose peer never
+    // finishes the handshake (FIN-WAIT-2 has no protocol timeout) was
+    // immortal — `af_xdp_tcp_session_reapable` only fires on
+    // Closed/TimeWait — pinning its buffer permits on the ledger
+    // forever. The closing deadline must reap it; a freshly-closing
+    // session inside the deadline must survive.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
+    let clock = reactor.install_manual_clock_for_test();
+    let t0 = smoltcp::time::Instant::from_micros(clock.now_micros());
+    let frame = ipv4_tcp_syn_frame_with_source_port(false, 53500);
+    let af_xdp::AfXdpProxyFrame::Tcp { route, flow, .. } =
+        af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    assert!(reactor.ensure_session_at(
+        route.clone(),
+        flow,
+        af_xdp::AfXdpTcpProxyClass::TcpPlain,
+        t0
+    ));
+    reactor.force_closing_for_test(&flow);
+
+    clock.advance(af_xdp::AF_XDP_TCP_CLOSING_REAP_AFTER + Duration::from_millis(1));
+    let now = smoltcp::time::Instant::from_micros(clock.now_micros());
+    // A session that just started closing must not be swept.
+    let fresh_frame = ipv4_tcp_syn_frame_with_source_port(false, 53501);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route: fresh_route,
+        flow: fresh_flow,
+        ..
+    } = af_xdp::parse_proxy_frame("eth0", 0, &fresh_frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    assert!(reactor.ensure_session_at(
+        fresh_route,
+        fresh_flow,
+        af_xdp::AfXdpTcpProxyClass::TcpPlain,
+        now
+    ));
+    reactor.force_closing_for_test(&fresh_flow);
+
+    let _ = reactor.poll_at_for_test(now);
+    assert_eq!(reactor.session_count(), 1);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
 fn af_xdp_tcp_reactor_reaps_closing_time_wait_sessions() {
     assert!(af_xdp::af_xdp_tcp_session_reapable(
         true,
@@ -3287,6 +3342,88 @@ fn af_xdp_tcp_ingress_enqueue_ignores_ledger_saturation() {
         af_xdp::AfXdpTcpIngestStatus::Accepted
     );
     assert_eq!(reactor.queued_ingress_count(), 2);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_drop_returns_all_queue_charge() {
+    // Memory-governor audit: socket-buffer capacity permits and queued
+    // payload charges are session-owned — dropping the reactor must
+    // return the ledger to baseline. A residual with zero sessions is
+    // the on-node leak signature (sessionsCurrent=0, tcpQueueBytes>0).
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let governor = &*crate::memory_governor::MEMORY_GOVERNOR;
+    let baseline = governor.tcp_queue_bytes();
+    {
+        let mut reactor =
+            af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+        let frame = ipv4_tcp_syn_frame(false);
+        let af_xdp::AfXdpProxyFrame::Tcp {
+            route,
+            flow,
+            ip_packet,
+        } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+        else {
+            panic!("expected TCP proxy frame");
+        };
+        assert_eq!(
+            reactor.ingest(route, flow, ip_packet),
+            af_xdp::AfXdpTcpIngestStatus::Accepted
+        );
+        // Socket-buffer capacity was charged at admission.
+        assert!(governor.tcp_queue_bytes() > baseline);
+        reactor.poll();
+    }
+    assert_eq!(
+        governor.tcp_queue_bytes(),
+        baseline,
+        "reactor drop must release every session-owned permit"
+    );
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[tokio::test]
+async fn af_xdp_tcp_stream_channel_charge_releases_with_stream() {
+    // Charged bytes already queued in a stream channel outlive the
+    // session that produced them — they belong to the receiver. A
+    // `sessionsCurrent=0, tcpQueueBytes>0` reading is therefore only a
+    // leak if the proxy task never exits; the ledger must drain the
+    // moment the stream (and with it the queued payloads) drops.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let governor = &*crate::memory_governor::MEMORY_GOVERNOR;
+    let baseline = governor.tcp_queue_bytes();
+    let flow = af_xdp::AfXdpTcpFlowKey {
+        local_addr: "198.51.100.5:443".parse().unwrap(),
+        peer_addr: "192.0.2.10:53000".parse().unwrap(),
+    };
+    let af_xdp::AfXdpTcpStreamParts {
+        stream,
+        ingress_tx,
+        ..
+    } = af_xdp::AfXdpTcpStream::channel_pair_with_wake(
+        8,
+        flow,
+        Default::default(),
+        Default::default(),
+    );
+    let payload =
+        af_xdp::AfXdpTcpChargedBytes::charged(bytes::Bytes::from_static(&[7u8; 8192]))
+            .expect("ledger must admit the test payload");
+    ingress_tx.try_send(payload).expect("channel has capacity");
+    // Sender dropped (session reaped) — queued payloads keep their
+    // charge while the receiver is alive.
+    drop(ingress_tx);
+    assert_eq!(governor.tcp_queue_bytes(), baseline + 8192);
+    drop(stream);
+    assert_eq!(
+        governor.tcp_queue_bytes(),
+        baseline,
+        "stream drop must release every channel-held charge"
+    );
 }
 
 #[cfg(any(test, target_os = "linux"))]
