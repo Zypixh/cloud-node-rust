@@ -207,6 +207,62 @@ kernel 臂负载：11–13% CPU，RSS 446MB。读法与 §6 一致：干净/低�
 edgecc 有完成样本）；≥20% 独立/突发丢包两者都坍缩（GE 单元 BBR 略高
 但同处不可用区间）。该区间属 FEC/多路径领域。
 
+### 8.5 AF_XDP UDP 数据面：会话任务调度 + TX kick 修复
+
+新增 UDP echo 对压链路（`.120` echo `:19003` + 计数/时间戳客户端）后真机复现
+两个独立缺陷，均已修复并回归：
+
+**缺陷 A — UDP 会话工作挤占队列 reactor 线程。**
+`UdpProxyManager` 的会话 relay / pending 创建 worker 通过裸 `tokio::spawn`
+落在每队列 pinned 单线程 reactor runtime 上，与 dataplane 循环共享一个
+yield 槽/轮。突发下答复报文在 dialed-socket ingress 通道实测停放
+**max 702ms / >500ms 共 37 条**（`udpProxyDiag.sockIngressMaxAgeMs`）。
+修法：构造时捕获进程级 multi_thread runtime 句柄 `session_rt`，
+`spawn_session_work` 统一路由会话/创建任务——与 TCP 侧
+"reactor 线程保持 dataplane 节奏，L7 上进程 runtime" 的既有分工一致。
+
+**缺陷 B — virtio_net 6.12 无 XSK TX drain + NEED_WAKEUP ring flag 恒不置位。**
+该版本驱动有 XSK RX zerocopy 但**没有任何 TX ring 消费函数**
+（`virtnet_xsk_xmit` 不存在）；`cached_need_wakeup=XDP_WAKEUP_TX` 恒置位使
+`xsk_poll`/`sendto` 成为唯一 TX 驱动点，而用户态可见的 ring flag 永不置位
+→ `produce_one_and_wakeup` 从不发 sendto → TX 帧只能靠 bridge 顺带
+`poll()` 冲刷，产生 ~1s 攒批（对齐 `AF_XDP_IDLE_WAIT_CAP`）+ 36ms 突发到达。
+修法：每轮 TX 生产后置 `tx_kick_pending`，轮末 `flush_tx_kick` 无条件
+sendto 一次。
+
+**缺陷 C（本轮前置）— ingress 串行建会话。** 新流首包在 bridge 循环里内联
+await 路由链+上游拨号（~5ms/流），突发新流串行阻塞收包 → XSK ring 溢出。
+修法：per-key pending 队列 + 64 worker 池异步建会话、按序回放
+（`pendingQueued/replayed` 计数）。
+
+修复后真机矩阵（afxdp 臂，echo `.120:19003`）：
+
+| 用例 | 修复前 | 修复后 |
+|---|---|---|
+| paced 500@800/s | 7–64% 丢, RTT p50 232ms–3.2s | **0% 丢, p50 10.2–11.4ms, p99 30–209ms** |
+| paced 500@2000/s | 2.2% 丢, RTT p50 **2051ms** | **0% 丢, p50 9.7ms, p99 22.8ms** |
+| paced 200@200/s | 13.5% 丢, RTT p50 582ms | **0% 丢, p50 10.4ms, p99 20.2ms** |
+| churn 500 新流@300/s | 新流突发大量丢 | **0% 丢, p50 10.9ms, p99 24ms** |
+| echo leg1 延迟 | p50 194–390ms | **p50 ~6ms, p99 ~16–21ms** |
+
+终态归因计数（全窗口累计）：`received→upstreamTx` 全通、
+`sockIngressMaxAgeMs=7`（原 702）、`sockIngressAged500ms=0`（原 37）、
+`downstreamShed=0` `sockIngressShed=0` `txDeferred=0` `congestedDrops=0`
+`rxRingFull=0` `rxDropped=0` `txInflightMax=0` —— 节点内部零丢弃。
+kernel 对照臂同链路 0% 丢/RTT ~10ms，两臂一致。
+
+**环境限制（非节点缺陷，测试已区分）：**
+- 运营商入口 UDP 瞬时突发管制：~250 token 桶，>桶深的瞬时突发在到达
+  `.90` 网卡前即被丢（往**关闭端口**发同样突发也只有 ~52% 到达；
+  NIC RX 计数证实帧未上机）。`flows` 模式 4000 包瞬时突发 ~96% 丢
+  属此效应；限速突发（paced/churn）全通。
+- 单流背靠背 300 包突发 ~54% "丢"同为线路效应——节点侧
+  `received→txOk` 全通、零内部丢弃。
+- >路径 MTU（1500）的 UDP 报文不在本数据面转发：入向在网线上已被
+  IP 分片、XDP 解析器按非首片语义丢弃；出向 `check_payload_cap` 返回
+  EMSGSIZE（内核 connected UDP 同义）。属设计限制，发布说明需注明
+  UDP 代理路径不支持分片报文。
+
 ## 9. 复现脚本（均在测试机保留）
 
 - `.120`: `/root/netem2.sh`（uniform/gemodel/normal）、`/root/ws_echo.py`、
