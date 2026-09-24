@@ -1153,7 +1153,12 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             if let Some(cc) = cc {
                 cloud_node_rust::runtime_mode::set_validation_transport_controller(cc.into());
             }
-            let rt = tokio::runtime::Builder::new_current_thread()
+            // Match the production `run_node` scheduler: session tasks,
+            // demux workers and per-queue bridges spread across cores.
+            // current_thread serializes all of that onto the bridge loop's
+            // thread, which starves XSK ring draining under burst load and
+            // reports proxy losses the real deployment never sees.
+            let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
             let duration = Duration::from_millis(duration_ms.max(1));

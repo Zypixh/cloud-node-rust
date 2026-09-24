@@ -26,6 +26,9 @@ pub(crate) enum AfXdpReactorRequest {
         /// ECN codepoint bits (0–3) requested by the sender — QUIC marks
         /// packets; plain UDP proxy traffic passes `None`.
         ecn: Option<u8>,
+        /// Monotonic enqueue timestamp (`udp_activity_now_ms`) — the
+        /// bridge reports channel age when it drains the request.
+        enqueued_ms: u64,
     },
     /// T4-7: an ICMP error quoting this flow arrived on some queue's
     /// XSK — deliver the reported next-hop MTU to the owning session's
@@ -659,6 +662,9 @@ pub(crate) const AF_XDP_UDP_DIAL_INGRESS_QUEUE: usize = 256;
 pub(crate) struct AfXdpUdpDatagram {
     pub payload: Bytes,
     pub ecn: Option<u8>,
+    /// Monotonic enqueue timestamp (`udp_activity_now_ms`) set by the
+    /// demuxing bridge — the socket reports channel age on recv.
+    pub enqueued_ms: u64,
 }
 
 /// T4-7: one message on a dialed UDP socket's ingress channel. ICMP
@@ -710,6 +716,7 @@ impl AfXdpUdpSocket {
             remote: self.flow.peer_addr,
             payload: Bytes::copy_from_slice(payload),
             ecn,
+            enqueued_ms: crate::udp_proxy::udp_activity_now_ms(),
         }
     }
 
@@ -801,6 +808,10 @@ impl AfXdpUdpSocket {
             .unwrap_or_else(|err| err.into_inner());
         match rx.poll_recv(cx) {
             std::task::Poll::Ready(Some(AfXdpUdpIngress::Datagram(datagram))) => {
+                crate::udp_proxy::note_udp_sock_ingress_age_ms(
+                    crate::udp_proxy::udp_activity_now_ms()
+                        .saturating_sub(datagram.enqueued_ms),
+                );
                 let len = datagram.payload.len().min(buf.len());
                 buf[..len].copy_from_slice(&datagram.payload[..len]);
                 std::task::Poll::Ready(Ok((len, datagram.ecn)))
@@ -829,7 +840,13 @@ impl AfXdpUdpSocket {
             // ICMP errors surface once, kernel error-queue style;
             // the loop continues so the next item is the payload.
             Some(AfXdpUdpIngress::IcmpError { mtu }) => Err(self.icmp_error(mtu)),
-            Some(AfXdpUdpIngress::Datagram(datagram)) => Ok(datagram.payload),
+            Some(AfXdpUdpIngress::Datagram(datagram)) => {
+                crate::udp_proxy::note_udp_sock_ingress_age_ms(
+                    crate::udp_proxy::udp_activity_now_ms()
+                        .saturating_sub(datagram.enqueued_ms),
+                );
+                Ok(datagram.payload)
+            }
             None => Err(self.ingress_closed_error()),
         }
     }
@@ -1007,6 +1024,7 @@ mod tests {
             .try_send(AfXdpUdpIngress::Datagram(AfXdpUdpDatagram {
                 payload: Bytes::from_static(b"pong"),
                 ecn: Some(0b10),
+                enqueued_ms: crate::udp_proxy::udp_activity_now_ms(),
             }))
             .unwrap();
         let err = socket.recv().await.expect_err("ICMP error surfaces");

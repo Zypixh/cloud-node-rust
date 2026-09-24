@@ -193,6 +193,7 @@ pub async fn proxy_smoke(
 ) -> anyhow::Result<serde_json::Value> {
     af_xdp::reset_tcp_diag();
     crate::tcp_proxy::reset_af_xdp_tcp_proxy_diag();
+    crate::udp_proxy::reset_af_xdp_udp_diag();
     let manager = manager_from_runtime();
     let ports = xdp_proxy_smoke_ports(&manager.config)?;
 
@@ -690,6 +691,13 @@ async fn dial_smoke_inner(
 }
 
 #[cfg(target_os = "linux")]
+fn queue_stats<'a>(
+    status: &'a super::XdpStatusSnapshot,
+) -> impl Iterator<Item = &'a super::XdpQueueStatus> + 'a {
+    status.interfaces.iter().flat_map(|i| i.xsk_queues.iter())
+}
+
+#[cfg(target_os = "linux")]
 async fn proxy_smoke_inner(
     manager: std::sync::Arc<XdpManager>,
     services: XdpProxySmokeServices,
@@ -722,6 +730,21 @@ async fn proxy_smoke_inner(
         "parseErrors": status.parse_errors,
         "mapMiss": status.map_miss,
         "xskDrops": status.xsk_drops,
+        // Per-queue XSK/bridge counters — burst loss attribution between
+        // NIC→XSK delivery (kernel stats), TX backpressure (congested) and
+        // reactor admission refusals must be visible in the report, not
+        // only in a live `xdp status` snapshot.
+        "xskQueueStats": {
+            "rxDropped": queue_stats(&status).map(|q| q.rx_dropped).sum::<u64>(),
+            "rxRingFull": queue_stats(&status).map(|q| q.rx_ring_full).sum::<u64>(),
+            "rxInvalidDescs": queue_stats(&status).map(|q| q.rx_invalid_descs).sum::<u64>(),
+            "txInvalidDescs": queue_stats(&status).map(|q| q.tx_invalid_descs).sum::<u64>(),
+            "congestedDrops": queue_stats(&status).map(|q| q.congested_drops).sum::<u64>(),
+            "admissionRefusals": queue_stats(&status).map(|q| q.admission_refusals).sum::<u64>(),
+            "aqmDrops": queue_stats(&status).map(|q| q.aqm_drops).sum::<u64>(),
+            "txInflightMax": queue_stats(&status).map(|q| q.tx_inflight).max().unwrap_or(0),
+            "faulted": queue_stats(&status).filter(|q| q.faulted).count(),
+        },
         "ports": {
             "http": ports.http,
             "https": ports.https,
@@ -749,6 +772,7 @@ async fn proxy_smoke_inner(
         },
         "tcpDiag": af_xdp::tcp_diag_snapshot(),
         "tcpProxyDiag": crate::tcp_proxy::af_xdp_tcp_proxy_diag_snapshot(),
+        "udpProxyDiag": crate::udp_proxy::af_xdp_udp_diag_snapshot(),
     });
     services.abort();
     Ok(report)
@@ -855,6 +879,7 @@ async fn proxy_smoke_kernel(
             "quicRequests": services.quic_requests.load(Ordering::Relaxed),
         },
         "tcpProxyDiag": crate::tcp_proxy::af_xdp_tcp_proxy_diag_snapshot(),
+        "udpProxyDiag": crate::udp_proxy::af_xdp_udp_diag_snapshot(),
     });
     services.abort();
     for task in &listener_tasks {

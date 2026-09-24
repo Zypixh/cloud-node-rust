@@ -383,6 +383,12 @@ pub(crate) struct AfXdpQueueHandle {
     /// TX descriptors produced to the ring but not yet completed —
     /// the in-flight depth capped by `AF_XDP_TX_INFLIGHT_CAP`.
     tx_inflight: usize,
+    /// A TX frame was produced this round but the kernel has not been
+    /// kicked yet — `flush_tx_kick` sends one `sendto` per round.
+    tx_kick_pending: bool,
+    /// TX wakeup syscalls that returned a real error (benign transient
+    /// errnos are filtered inside the wakeup itself).
+    tx_kick_errors: u64,
 }
 
 impl AfXdpQueueHandle {
@@ -553,19 +559,38 @@ impl AfXdpQueueHandle {
         }
         // SAFETY: `desc` describes a frame from this queue's UMEM. After successful
         // submission it is not reused until returned by the completion queue.
-        match unsafe { self.tx.produce_one_and_wakeup(&desc) } {
-            Ok(1) => {
+        match unsafe { self.tx.produce_one(&desc) } {
+            1 => {
                 self.tx_inflight += 1;
+                // The driver kick is deferred to `flush_tx_kick` (one
+                // sendto per loop round): the producer flag does not
+                // reliably reflect a stalled TX ring on virtio_net, so
+                // gating the kick on `needs_wakeup` strands frames until
+                // an unrelated NAPI run flushes them (observed: ~1-3s
+                // reply bursts on kernel 6.12/virtio_net).
+                self.tx_kick_pending = true;
                 Ok(true)
             }
-            Ok(_) => {
+            _ => {
                 self.free_frames.push(desc);
                 Ok(false)
             }
-            Err(err) => {
-                self.free_frames.push(desc);
-                Err(err.into())
-            }
+        }
+    }
+
+    /// Kick the kernel TX path once if this round produced any frames.
+    /// The socket was bound with XDP_USE_NEED_WAKEUP, so the kick is a
+    /// `sendto(MSG_DONTWAIT)` that schedules the driver's TX processing;
+    /// calling it unconditionally keeps TX latency bounded on drivers
+    /// whose `needs_wakeup` flag does not track a stranded ring.
+    pub(crate) fn flush_tx_kick(&mut self) {
+        if !self.tx_kick_pending {
+            return;
+        }
+        self.tx_kick_pending = false;
+        if let Err(err) = self.tx.wakeup() {
+            self.tx_kick_errors = self.tx_kick_errors.saturating_add(1);
+            tracing::warn!("AF_XDP TX wakeup failed: {err}");
         }
     }
 }
@@ -884,6 +909,8 @@ fn create_af_xdp_queue(
             tx_completion_batch: vec![FrameDesc::default(); AF_XDP_RX_BATCH],
             tx_scratch: Vec::with_capacity(interface.frame_size as usize),
             tx_inflight: 0,
+            tx_kick_pending: false,
+            tx_kick_errors: 0,
         },
         status,
     ))

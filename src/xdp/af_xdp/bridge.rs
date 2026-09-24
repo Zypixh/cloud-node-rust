@@ -1339,7 +1339,11 @@ pub(crate) async fn run_queue_bridge_loop(
                     remote,
                     payload,
                     ecn,
+                    enqueued_ms,
                 }) => {
+                    crate::udp_proxy::note_udp_egress_chan_age_ms(
+                        crate::udp_proxy::udp_activity_now_ms().saturating_sub(enqueued_ms),
+                    );
                     // T8: QUIC/UDP egress honors the same shaping gate and
                     // bounded retry queue as TCP — UDP is lossy by
                     // contract, but a shed must be counted, never silent.
@@ -1453,11 +1457,18 @@ pub(crate) async fn run_queue_bridge_loop(
                             match tx.try_send(AfXdpUdpIngress::Datagram(AfXdpUdpDatagram {
                                 payload: packet.payload.clone(),
                                 ecn: packet.ecn,
+                                enqueued_ms: crate::udp_proxy::udp_activity_now_ms(),
                             })) {
-                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
+                                Ok(()) => {
+                                    crate::udp_proxy::note_udp_sock_ingress_delivered();
+                                }
+                                Err(mpsc::error::TrySendError::Full(_)) => {
                                     // A full socket channel sheds the
                                     // datagram — UDP loss semantics, the
-                                    // queue stays healthy.
+                                    // queue stays healthy, but the shed is
+                                    // counted so burst loss stays
+                                    // attributable.
+                                    crate::udp_proxy::note_udp_sock_ingress_shed();
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
                                     dial_registry.release(&dialed_flow);
@@ -1645,10 +1656,14 @@ pub(crate) async fn run_queue_bridge_loop(
             };
             downstream_datagrams = downstream_datagrams.saturating_add(1);
             let now_ms = crate::udp_proxy::udp_activity_now_ms();
+            crate::udp_proxy::note_udp_downstream_chan_age_ms(
+                now_ms.saturating_sub(datagram.enqueued_ms),
+            );
             let route = {
                 let Some(mut entry) =
                     udp_routes.get_mut(&(datagram.listen_addr, datagram.peer_addr))
                 else {
+                    crate::udp_proxy::note_udp_tx_no_route();
                     tracing::debug!(
                         "AF_XDP proxy bridge has no L2 route for downstream datagram listen={} peer={} bytes={}",
                         datagram.listen_addr,
@@ -1721,6 +1736,7 @@ pub(crate) async fn run_queue_bridge_loop(
                 sched.charge(tx_now, pending.flow, pending.len()),
                 cloud_node_transport::sched::Admit::Wait(_)
             ) {
+                crate::udp_proxy::note_udp_tx_deferred();
                 if !queue_deferred_tx(
                     &mut pending_tx,
                     &mut pending_tx_count,
@@ -1749,12 +1765,14 @@ pub(crate) async fn run_queue_bridge_loop(
             );
             match sent {
                 Ok(true) => {
+                    crate::udp_proxy::note_udp_tx_ok();
                     congested = false;
                     tx_failures.record(AfXdpTxStatus::Sent);
                 }
                 Ok(false) => {
                     // T8: ring full is backpressure — defer to the next
                     // round; only a full retry queue sheds (counted).
+                    crate::udp_proxy::note_udp_tx_deferred();
                     if queue_deferred_tx(
                         &mut pending_tx,
                         &mut pending_tx_count,
@@ -2062,6 +2080,13 @@ pub(crate) async fn run_queue_bridge_loop(
             }
         }
 
+        // Kick the kernel TX path once per round whenever this round
+        // produced frames. Gating the kick on the TX producer flag alone
+        // stranded frames for seconds on virtio_net (kernel 6.12): the
+        // flag can stay clear while the driver has gone idle, so frames
+        // only flushed on unrelated NAPI runs. One `sendto` per busy
+        // round keeps TX latency bounded regardless of the flag.
+        queue_handle.flush_tx_kick();
         // Idle rounds go to an event-driven wait — whichever arrives
         // first: an XSK RX frame, a queued channel item, a stream-egress
         // notify, or the next smoltcp timer deadline. There is no

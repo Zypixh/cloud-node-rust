@@ -7,7 +7,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock as Lazy;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -38,6 +38,225 @@ const UDP_METRICS_FLUSH_BYTES: u64 = 1024 * 1024;
 const UDP_METRICS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const UDP_DNS_CACHE_TTL: Duration = Duration::from_secs(30);
 const UDP_DNS_CACHE_CAPACITY: u64 = 4096;
+/// Datagrams buffered per (client, port) while its session is being created
+/// off the ingress loop. Small on purpose: a client that cannot pace its
+/// first packets within a session-establishment window is shed, not queued.
+const UDP_PENDING_DATAGRAMS_PER_SESSION: usize = 8;
+/// Distinct flows allowed to sit in the creation-pending map at once.
+/// Beyond this the ingress reports Full — the same honest backpressure a
+/// full session queue produces.
+const UDP_PENDING_SESSIONS_MAX: usize = 4096;
+/// Concurrent session-creation workers draining the pending map. Session
+/// creation awaits DNS/LB/upstream-socket setup, so a burst of new flows
+/// must overlap — serializing creations inside the AF_XDP queue loop let
+/// the XSK ring overflow (~97% datagram loss at 2000 concurrent new flows,
+/// EN-27 follow-up).
+const UDP_SESSION_CREATION_WORKERS: usize = 64;
+
+/// Release-validation diagnostics for the AF_XDP UDP ingress path. The
+/// proxy-smoke harness runs without the tracing subscriber, so every
+/// silent drop site gets a named counter instead — a burst loss must be
+/// attributable to pending overflow, session-queue backpressure, or a
+/// failed creation, never guesswork.
+#[cfg(target_os = "linux")]
+mod af_xdp_udp_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static RECEIVED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PENDING_QUEUED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PENDING_CREATED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PENDING_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PENDING_SESSIONS_FULL: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SESSION_SENT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SESSION_FULL: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SESSION_CLOSED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static NO_ROUTE: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BLOCKED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static CREATE_OK: AtomicU64 = AtomicU64::new(0);
+    pub(super) static CREATE_NONE: AtomicU64 = AtomicU64::new(0);
+    pub(super) static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
+    pub(super) static REPLAYED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static DROPPED_ON_FAIL: AtomicU64 = AtomicU64::new(0);
+    // Reply path: backend datagrams the AF_XDP bridge delivered into a
+    // dialed socket's ingress channel vs shed on a full channel; session
+    // upstream send/recv outcomes; downstream enqueue vs channel-full shed.
+    pub(super) static SOCK_INGRESS_DELIVERED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SOCK_INGRESS_SHED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static UPSTREAM_TX: AtomicU64 = AtomicU64::new(0);
+    pub(super) static UPSTREAM_TX_ERR: AtomicU64 = AtomicU64::new(0);
+    pub(super) static UPSTREAM_RX: AtomicU64 = AtomicU64::new(0);
+    pub(super) static DOWNSTREAM_ENQ: AtomicU64 = AtomicU64::new(0);
+    pub(super) static DOWNSTREAM_SHED: AtomicU64 = AtomicU64::new(0);
+    // Downstream drain outcomes on the bridge: produced to the TX ring,
+    // parked on the deferred queue (backpressure), or skipped because the
+    // L2 route cache lost the peer entry between ingress and reply.
+    pub(super) static TX_OK: AtomicU64 = AtomicU64::new(0);
+    pub(super) static TX_DEFERRED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static TX_NO_ROUTE: AtomicU64 = AtomicU64::new(0);
+    // Pipeline latency probes (ms): age of a queued item measured at the
+    // moment the next stage consumes it. egressChan = session socket →
+    // per-queue reactor request channel → bridge drain; sockIngress =
+    // bridge demux → dialed socket channel → session task recv;
+    // downstreamChan = session task → downstream channel → bridge drain.
+    pub(super) static EGRESS_CHAN_MAX_AGE_MS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static EGRESS_CHAN_AGED_500MS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SOCK_INGRESS_MAX_AGE_MS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SOCK_INGRESS_AGED_500MS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static DOWNSTREAM_CHAN_MAX_AGE_MS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static DOWNSTREAM_CHAN_AGED_500MS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_age(max_counter: &AtomicU64, aged_counter: &AtomicU64, age_ms: u64) {
+        max_counter.fetch_max(age_ms, Ordering::Relaxed);
+        if age_ms >= 500 {
+            aged_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn reset() {
+        for c in [
+            &RECEIVED,
+            &PENDING_QUEUED,
+            &PENDING_CREATED,
+            &PENDING_QUEUE_FULL,
+            &PENDING_SESSIONS_FULL,
+            &SESSION_SENT,
+            &SESSION_FULL,
+            &SESSION_CLOSED,
+            &NO_ROUTE,
+            &BLOCKED,
+            &CREATE_OK,
+            &CREATE_NONE,
+            &CREATE_ERR,
+            &REPLAYED,
+            &DROPPED_ON_FAIL,
+            &SOCK_INGRESS_DELIVERED,
+            &SOCK_INGRESS_SHED,
+            &UPSTREAM_TX,
+            &UPSTREAM_TX_ERR,
+            &UPSTREAM_RX,
+            &DOWNSTREAM_ENQ,
+            &DOWNSTREAM_SHED,
+            &TX_OK,
+            &TX_DEFERRED,
+            &TX_NO_ROUTE,
+            &EGRESS_CHAN_MAX_AGE_MS,
+            &EGRESS_CHAN_AGED_500MS,
+            &SOCK_INGRESS_MAX_AGE_MS,
+            &SOCK_INGRESS_AGED_500MS,
+            &DOWNSTREAM_CHAN_MAX_AGE_MS,
+            &DOWNSTREAM_CHAN_AGED_500MS,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn snapshot() -> serde_json::Value {
+        serde_json::json!({
+            "received": RECEIVED.load(Ordering::Relaxed),
+            "pendingQueued": PENDING_QUEUED.load(Ordering::Relaxed),
+            "pendingCreated": PENDING_CREATED.load(Ordering::Relaxed),
+            "pendingQueueFull": PENDING_QUEUE_FULL.load(Ordering::Relaxed),
+            "pendingSessionsFull": PENDING_SESSIONS_FULL.load(Ordering::Relaxed),
+            "sessionSent": SESSION_SENT.load(Ordering::Relaxed),
+            "sessionFull": SESSION_FULL.load(Ordering::Relaxed),
+            "sessionClosed": SESSION_CLOSED.load(Ordering::Relaxed),
+            "noRoute": NO_ROUTE.load(Ordering::Relaxed),
+            "blocked": BLOCKED.load(Ordering::Relaxed),
+            "createOk": CREATE_OK.load(Ordering::Relaxed),
+            "createNone": CREATE_NONE.load(Ordering::Relaxed),
+            "createErr": CREATE_ERR.load(Ordering::Relaxed),
+            "replayed": REPLAYED.load(Ordering::Relaxed),
+            "droppedOnFail": DROPPED_ON_FAIL.load(Ordering::Relaxed),
+            "sockIngressDelivered": SOCK_INGRESS_DELIVERED.load(Ordering::Relaxed),
+            "sockIngressShed": SOCK_INGRESS_SHED.load(Ordering::Relaxed),
+            "upstreamTx": UPSTREAM_TX.load(Ordering::Relaxed),
+            "upstreamTxErr": UPSTREAM_TX_ERR.load(Ordering::Relaxed),
+            "upstreamRx": UPSTREAM_RX.load(Ordering::Relaxed),
+            "downstreamEnq": DOWNSTREAM_ENQ.load(Ordering::Relaxed),
+            "downstreamShed": DOWNSTREAM_SHED.load(Ordering::Relaxed),
+            "txOk": TX_OK.load(Ordering::Relaxed),
+            "txDeferred": TX_DEFERRED.load(Ordering::Relaxed),
+            "txNoRoute": TX_NO_ROUTE.load(Ordering::Relaxed),
+            "egressChanMaxAgeMs": EGRESS_CHAN_MAX_AGE_MS.load(Ordering::Relaxed),
+            "egressChanAged500ms": EGRESS_CHAN_AGED_500MS.load(Ordering::Relaxed),
+            "sockIngressMaxAgeMs": SOCK_INGRESS_MAX_AGE_MS.load(Ordering::Relaxed),
+            "sockIngressAged500ms": SOCK_INGRESS_AGED_500MS.load(Ordering::Relaxed),
+            "downstreamChanMaxAgeMs": DOWNSTREAM_CHAN_MAX_AGE_MS.load(Ordering::Relaxed),
+            "downstreamChanAged500ms": DOWNSTREAM_CHAN_AGED_500MS.load(Ordering::Relaxed),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn reset_af_xdp_udp_diag() {
+    af_xdp_udp_diag::reset();
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn af_xdp_udp_diag_snapshot() -> serde_json::Value {
+    af_xdp_udp_diag::snapshot()
+}
+
+/// Reply-path counters the AF_XDP bridge records — the diag module is
+/// private to this file, so the bridge bumps through these wrappers.
+#[cfg(target_os = "linux")]
+pub(crate) fn note_udp_sock_ingress_delivered() {
+    af_xdp_udp_diag::bump(&af_xdp_udp_diag::SOCK_INGRESS_DELIVERED);
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn note_udp_sock_ingress_shed() {
+    af_xdp_udp_diag::bump(&af_xdp_udp_diag::SOCK_INGRESS_SHED);
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn note_udp_tx_ok() {
+    af_xdp_udp_diag::bump(&af_xdp_udp_diag::TX_OK);
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn note_udp_tx_deferred() {
+    af_xdp_udp_diag::bump(&af_xdp_udp_diag::TX_DEFERRED);
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn note_udp_tx_no_route() {
+    af_xdp_udp_diag::bump(&af_xdp_udp_diag::TX_NO_ROUTE);
+}
+
+/// Age probes (enqueue→consume, ms) for the three UDP pipeline channels
+/// — the bridge and the dialed socket report through these so a stall
+/// localizes to a specific hop instead of blending into end-to-end RTT.
+#[cfg(target_os = "linux")]
+pub(crate) fn note_udp_egress_chan_age_ms(age_ms: u64) {
+    af_xdp_udp_diag::note_age(
+        &af_xdp_udp_diag::EGRESS_CHAN_MAX_AGE_MS,
+        &af_xdp_udp_diag::EGRESS_CHAN_AGED_500MS,
+        age_ms,
+    );
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn note_udp_sock_ingress_age_ms(age_ms: u64) {
+    af_xdp_udp_diag::note_age(
+        &af_xdp_udp_diag::SOCK_INGRESS_MAX_AGE_MS,
+        &af_xdp_udp_diag::SOCK_INGRESS_AGED_500MS,
+        age_ms,
+    );
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn note_udp_downstream_chan_age_ms(age_ms: u64) {
+    af_xdp_udp_diag::note_age(
+        &af_xdp_udp_diag::DOWNSTREAM_CHAN_MAX_AGE_MS,
+        &af_xdp_udp_diag::DOWNSTREAM_CHAN_AGED_500MS,
+        age_ms,
+    );
+}
 
 static UDP_ACTIVITY_EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
 
@@ -655,6 +874,10 @@ pub struct DownstreamUdpDatagram {
     pub listen_addr: SocketAddr,
     pub peer_addr: SocketAddr,
     pub payload: Bytes,
+    /// Monotonic enqueue timestamp (`udp_activity_now_ms`) — the AF_XDP
+    /// bridge reports channel age when it drains the datagram.
+    #[cfg(target_os = "linux")]
+    pub enqueued_ms: u64,
 }
 
 #[derive(Debug)]
@@ -670,6 +893,8 @@ impl ChannelUdpDownstreamSender {
             listen_addr: self.listen_addr,
             peer_addr: target,
             payload: Bytes::copy_from_slice(data),
+            #[cfg(target_os = "linux")]
+            enqueued_ms: udp_activity_now_ms(),
         }) {
             Ok(()) => Ok(len),
             Err(mpsc::error::TrySendError::Full(_)) => Err(io::Error::new(
@@ -714,6 +939,16 @@ struct ListenerHandle {
     generation: u64,
 }
 
+/// Datagrams buffered while a (client, port) session is created by a
+/// worker task instead of inline on the caller's ingress path. The
+/// resolved server is kept so the worker does not re-run route lookup.
+struct PendingUdpSession {
+    server: Arc<crate::config_models::ServerConfig>,
+    queue: VecDeque<QueuedUdpDatagram>,
+    downstream_sender: UdpDownstreamSender,
+    shutdown_rx: watch::Receiver<bool>,
+}
+
 pub struct UdpProxyManager {
     config_store: ConfigStore,
     waf_state: Arc<WafStateManager>,
@@ -722,6 +957,16 @@ pub struct UdpProxyManager {
     /// (ClientAddr, ListenPort) -> Session
     sessions: Arc<DashMap<(SocketAddr, u16), Arc<UdpSession>>>,
     inflight_sessions: Arc<DashMap<(SocketAddr, u16), Arc<InflightUdpSession>>>,
+    /// (ClientAddr, ListenPort) -> datagrams waiting on an in-flight
+    /// session creation. Checked before `sessions` on every ingress so
+    /// ordering is preserved across the async handoff.
+    pending_sessions: DashMap<(SocketAddr, u16), PendingUdpSession>,
+    /// `DashMap::len()` read-locks every shard — calling it while holding
+    /// an `entry()` write guard self-deadlocks, so the pending count is
+    /// tracked separately for the admission cap.
+    pending_sessions_count: AtomicUsize,
+    creation_queue_tx: mpsc::UnboundedSender<(SocketAddr, u16)>,
+    creation_queue_rx: Mutex<Option<mpsc::UnboundedReceiver<(SocketAddr, u16)>>>,
     /// (ClientAddr, ListenPort) -> last upstream socket address, kept briefly
     /// so a recreated session can try to keep the same upstream port.
     recent_upstream_ports: RecentUpstreamPorts,
@@ -735,6 +980,15 @@ pub struct UdpProxyManager {
     next_listener_id: AtomicU64,
     next_listener_generation: AtomicU64,
     next_session_id: AtomicU64,
+    /// Process runtime for session relay and creation workers. AF_XDP
+    /// ingress calls run inside per-queue pinned single-thread reactor
+    /// runtimes — spawning session work there multiplexes it with the
+    /// dataplane loop, which only grants spawned tasks one yield slot
+    /// per busy round (observed live: reply datagrams parking ~700ms in
+    /// the dialed-socket channel while the queue thread is saturated).
+    /// TCP session work already follows this split via `proxy_rt`; UDP
+    /// must match so the reactor thread keeps dataplane cadence.
+    session_rt: Option<tokio::runtime::Handle>,
 }
 
 type SharedUdpCreationResult = Result<Option<Arc<UdpSession>>, Arc<anyhow::Error>>;
@@ -812,6 +1066,7 @@ impl UdpProxyManager {
         waf_state: Arc<WafStateManager>,
         node_id: i64,
     ) -> Arc<Self> {
+        let (creation_queue_tx, creation_queue_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             config_store,
             waf_state,
@@ -819,6 +1074,10 @@ impl UdpProxyManager {
             dns_cache: Arc::new(UdpDnsResolutionCache::new()),
             sessions: Arc::new(DashMap::new()),
             inflight_sessions: Arc::new(DashMap::new()),
+            pending_sessions: DashMap::new(),
+            pending_sessions_count: AtomicUsize::new(0),
+            creation_queue_tx,
+            creation_queue_rx: Mutex::new(Some(creation_queue_rx)),
             recent_upstream_ports: Arc::new(DashMap::new()),
             undesired_since: DashMap::new(),
             #[cfg(test)]
@@ -827,7 +1086,22 @@ impl UdpProxyManager {
             next_listener_id: AtomicU64::new(1),
             next_listener_generation: AtomicU64::new(1),
             next_session_id: AtomicU64::new(1),
+            session_rt: tokio::runtime::Handle::try_current().ok(),
         })
+    }
+
+    /// Spawns UDP session/creation work on the process runtime captured
+    /// at construction, falling back to `tokio::spawn` when the manager
+    /// was built outside a runtime context (unit tests).
+    fn spawn_session_work<F>(&self, fut: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        match &self.session_rt {
+            Some(rt) => rt.spawn(fut),
+            None => tokio::spawn(fut),
+        }
     }
 
     pub async fn start_listeners(self: Arc<Self>) {
@@ -1057,38 +1331,109 @@ impl UdpProxyManager {
     }
 
     pub async fn receive_datagram_with_downstream(
-        &self,
+        self: &Arc<Self>,
         client_addr: SocketAddr,
         port: u16,
         data: Bytes,
         downstream_sender: UdpDownstreamSender,
         shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<UdpIngressDatagramStatus> {
+        #[cfg(target_os = "linux")]
+        af_xdp_udp_diag::bump(&af_xdp_udp_diag::RECEIVED);
         if crate::l4_defense::is_l4_blocked(&self.config_store, &self.waf_state, client_addr.ip()) {
+            #[cfg(target_os = "linux")]
+            af_xdp_udp_diag::bump(&af_xdp_udp_diag::BLOCKED);
             return Ok(UdpIngressDatagramStatus::Blocked);
         }
 
         let key = (client_addr, port);
-        let session = if let Some(session) = self.sessions.get(&key) {
-            session.clone()
-        } else {
-            let Some(session) = self
-                .create_passthrough_session_with_downstream(
-                    client_addr,
-                    port,
-                    data.as_ref(),
-                    downstream_sender,
-                    shutdown_rx,
-                )
-                .await?
-            else {
-                return Ok(UdpIngressDatagramStatus::NoRoute);
+        // Pending entries are checked before `sessions`: a datagram that
+        // arrives while a worker drains the queue must join the queue so
+        // per-flow ordering survives the async creation handoff. DashMap
+        // guards are never held across an await.
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) = self.pending_sessions.entry(key)
+        {
+            if entry.get().queue.len() >= UDP_PENDING_DATAGRAMS_PER_SESSION {
+                #[cfg(target_os = "linux")]
+                af_xdp_udp_diag::bump(&af_xdp_udp_diag::PENDING_QUEUE_FULL);
+                return Ok(UdpIngressDatagramStatus::Full);
+            }
+            let Some(item) = QueuedUdpDatagram::new(data) else {
+                #[cfg(target_os = "linux")]
+                af_xdp_udp_diag::bump(&af_xdp_udp_diag::PENDING_QUEUE_FULL);
+                return Ok(UdpIngressDatagramStatus::Full);
             };
-            session
+            entry.get_mut().queue.push_back(item);
+            #[cfg(target_os = "linux")]
+            af_xdp_udp_diag::bump(&af_xdp_udp_diag::PENDING_QUEUED);
+            return Ok(UdpIngressDatagramStatus::Sent);
+        }
+        let session = match self.sessions.get(&key) {
+            Some(session) => session.clone(),
+            None => {
+                // Route lookup is synchronous lookups under the hood —
+                // unroutable datagrams still get an honest NoRoute rather
+                // than vanishing into the pending queue.
+                let Some(server) = self.find_server_for_packet(port, &data).await else {
+                    #[cfg(target_os = "linux")]
+                    af_xdp_udp_diag::bump(&af_xdp_udp_diag::NO_ROUTE);
+                    return Ok(UdpIngressDatagramStatus::NoRoute);
+                };
+                // Another datagram may have opened the pending entry while
+                // the route lookup ran — re-enter to keep queue order.
+                match self.pending_sessions.entry(key) {
+                    dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                        if entry.get().queue.len() >= UDP_PENDING_DATAGRAMS_PER_SESSION {
+                            #[cfg(target_os = "linux")]
+                            af_xdp_udp_diag::bump(&af_xdp_udp_diag::PENDING_QUEUE_FULL);
+                            return Ok(UdpIngressDatagramStatus::Full);
+                        }
+                        let Some(item) = QueuedUdpDatagram::new(data) else {
+                            #[cfg(target_os = "linux")]
+                            af_xdp_udp_diag::bump(&af_xdp_udp_diag::PENDING_QUEUE_FULL);
+                            return Ok(UdpIngressDatagramStatus::Full);
+                        };
+                        entry.get_mut().queue.push_back(item);
+                        #[cfg(target_os = "linux")]
+                        af_xdp_udp_diag::bump(&af_xdp_udp_diag::PENDING_QUEUED);
+                        return Ok(UdpIngressDatagramStatus::Sent);
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        if self.pending_sessions_count.load(Ordering::Acquire)
+                            >= UDP_PENDING_SESSIONS_MAX
+                        {
+                            #[cfg(target_os = "linux")]
+                            af_xdp_udp_diag::bump(&af_xdp_udp_diag::PENDING_SESSIONS_FULL);
+                            return Ok(UdpIngressDatagramStatus::Full);
+                        }
+                        let Some(item) = QueuedUdpDatagram::new(data) else {
+                            #[cfg(target_os = "linux")]
+                            af_xdp_udp_diag::bump(&af_xdp_udp_diag::PENDING_QUEUE_FULL);
+                            return Ok(UdpIngressDatagramStatus::Full);
+                        };
+                        entry.insert(PendingUdpSession {
+                            server,
+                            queue: VecDeque::from([item]),
+                            downstream_sender,
+                            shutdown_rx,
+                        });
+                        self.pending_sessions_count.fetch_add(1, Ordering::AcqRel);
+                        #[cfg(target_os = "linux")]
+                        af_xdp_udp_diag::bump(&af_xdp_udp_diag::PENDING_CREATED);
+                        self.ensure_creation_workers();
+                        let _ = self.creation_queue_tx.send(key);
+                        return Ok(UdpIngressDatagramStatus::Sent);
+                    }
+                }
+            }
         };
 
         match Self::send_to_session_from_client(&session, client_addr, data).await {
-            UdpSessionSendStatus::Sent => Ok(UdpIngressDatagramStatus::Sent),
+            UdpSessionSendStatus::Sent => {
+                #[cfg(target_os = "linux")]
+                af_xdp_udp_diag::bump(&af_xdp_udp_diag::SESSION_SENT);
+                Ok(UdpIngressDatagramStatus::Sent)
+            }
             UdpSessionSendStatus::Full => {
                 // Throttle defense accounting: a busy but legitimate session
                 // can drop many datagrams per second and must not look like a
@@ -1100,18 +1445,145 @@ impl UdpProxyManager {
                         format!("port={} peer={} session={}", port, client_addr, session.id),
                     );
                 }
+                #[cfg(target_os = "linux")]
+                af_xdp_udp_diag::bump(&af_xdp_udp_diag::SESSION_FULL);
                 Ok(UdpIngressDatagramStatus::Full)
             }
             UdpSessionSendStatus::Closed => {
                 self.sessions
                     .remove_if(&key, |_, existing| existing.id == session.id);
+                #[cfg(target_os = "linux")]
+                af_xdp_udp_diag::bump(&af_xdp_udp_diag::SESSION_CLOSED);
                 Ok(UdpIngressDatagramStatus::Closed)
             }
         }
     }
 
+    /// Lazily spawns the session-creation worker pool on the first pending
+    /// datagram. `new` is callable outside a runtime (tests), so workers
+    /// are not spawned at construction.
+    fn ensure_creation_workers(self: &Arc<Self>) {
+        let rx = self
+            .creation_queue_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(rx) = rx else { return };
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        for _ in 0..UDP_SESSION_CREATION_WORKERS {
+            let this = Arc::clone(self);
+            let rx = rx.clone();
+            self.spawn_session_work(async move {
+                loop {
+                    let key = rx.lock().await.recv().await;
+                    let Some(key) = key else { return };
+                    this.run_pending_session_creation(key).await;
+                }
+            });
+        }
+    }
+
+    /// Removes a pending entry and releases its admission count. Every
+    /// pending-map removal must go through here to keep the counter honest.
+    fn remove_pending_session(&self, key: &(SocketAddr, u16)) {
+        if self.pending_sessions.remove(key).is_some() {
+            self.pending_sessions_count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Runs one pending session creation, then replays the queued
+    /// datagrams in order. The pending entry is removed only when its
+    /// queue is observed empty under the shard lock, so datagrams that
+    /// arrive during the drain still land behind the earlier ones.
+    async fn run_pending_session_creation(self: &Arc<Self>, key: (SocketAddr, u16)) {
+        let (client_addr, port) = key;
+        let Some((server, sender, shutdown_rx)) = self.pending_sessions.get(&key).map(|p| {
+            (
+                p.server.clone(),
+                p.downstream_sender.clone(),
+                p.shutdown_rx.clone(),
+            )
+        }) else {
+            return;
+        };
+        let session = match self
+            .create_passthrough_session_for_server_with_downstream(
+                client_addr,
+                port,
+                server,
+                None,
+                sender,
+                shutdown_rx,
+            )
+            .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                debug!(
+                    "async UDP session creation for {} on port {} failed: {}",
+                    client_addr, port, err
+                );
+                #[cfg(target_os = "linux")]
+                {
+                    af_xdp_udp_diag::bump(&af_xdp_udp_diag::CREATE_ERR);
+                    if let Some(entry) = self.pending_sessions.get(&key) {
+                        for _ in 0..entry.queue.len() {
+                            af_xdp_udp_diag::bump(&af_xdp_udp_diag::DROPPED_ON_FAIL);
+                        }
+                    }
+                }
+                self.remove_pending_session(&key);
+                return;
+            }
+        };
+        #[cfg(target_os = "linux")]
+        if session.is_none() {
+            af_xdp_udp_diag::bump(&af_xdp_udp_diag::CREATE_NONE);
+            if let Some(entry) = self.pending_sessions.get(&key) {
+                for _ in 0..entry.queue.len() {
+                    af_xdp_udp_diag::bump(&af_xdp_udp_diag::DROPPED_ON_FAIL);
+                }
+            }
+        } else {
+            af_xdp_udp_diag::bump(&af_xdp_udp_diag::CREATE_OK);
+        }
+        loop {
+            let batch = match self.pending_sessions.entry(key) {
+                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                    if entry.get().queue.is_empty() {
+                        entry.remove();
+                        self.pending_sessions_count.fetch_sub(1, Ordering::AcqRel);
+                        None
+                    } else {
+                        Some(std::mem::take(&mut entry.get_mut().queue))
+                    }
+                }
+                dashmap::mapref::entry::Entry::Vacant(_) => None,
+            };
+            let Some(queue) = batch else { break };
+            let Some(session) = session.as_ref() else {
+                break;
+            };
+            for item in queue {
+                #[cfg(target_os = "linux")]
+                af_xdp_udp_diag::bump(&af_xdp_udp_diag::REPLAYED);
+                let status =
+                    Self::send_to_session_from_client(session, client_addr, item.data).await;
+                if matches!(status, UdpSessionSendStatus::Closed) {
+                    self.sessions
+                        .remove_if(&key, |_, existing| existing.id == session.id);
+                    self.remove_pending_session(&key);
+                    return;
+                }
+            }
+        }
+        if session.is_none() {
+            self.remove_pending_session(&key);
+        }
+    }
+
     pub async fn receive_af_xdp_datagram(
-        &self,
+        self: &Arc<Self>,
         datagram: crate::xdp::af_xdp::AfXdpDatagram,
         downstream_tx: mpsc::Sender<DownstreamUdpDatagram>,
         shutdown_rx: watch::Receiver<bool>,
@@ -1475,7 +1947,7 @@ impl UdpProxyManager {
             });
         self.sessions.insert(key, session.clone());
 
-        tokio::spawn(async move {
+        self.spawn_session_work(async move {
             let _session_permit = session_permit;
             let _listener_permit = listener_permit;
             // Shadow counter for live UDP passthrough sessions.
@@ -1762,6 +2234,8 @@ impl UdpProxyManager {
                             // egress failures that would otherwise force a new
                             // upstream port and break tuple-pinned protocols.
                             crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+                            #[cfg(target_os = "linux")]
+                            af_xdp_udp_diag::bump(&af_xdp_udp_diag::UPSTREAM_TX_ERR);
                             debug!(
                                 "UDP session {} upstream send to {} failed, dropping datagram: {}",
                                 session_id, backend_addr, err
@@ -1771,6 +2245,8 @@ impl UdpProxyManager {
                             }
                             break;
                         }
+                        #[cfg(target_os = "linux")]
+                        af_xdp_udp_diag::bump(&af_xdp_udp_diag::UPSTREAM_TX);
                         last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
                         transfer_metrics.record_upstream(len);
                         transfer_metrics.flush_if_due(server_id, false);
@@ -1806,6 +2282,8 @@ impl UdpProxyManager {
                             continue;
                         }
                     };
+                    #[cfg(target_os = "linux")]
+                    af_xdp_udp_diag::bump(&af_xdp_udp_diag::UPSTREAM_RX);
                     let len_u64 = len as u64;
                     if let Some(cids) = crate::quic_probe::quic_packet_cids(&buf[..len], 0) {
                         if let Some(scid) = cids.scid.as_ref()
@@ -1831,8 +2309,13 @@ impl UdpProxyManager {
                     }
                     let current_client_addr = **client_addr.load();
                     match downstream_sender.send_to(&buf[..len], current_client_addr).await {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            #[cfg(target_os = "linux")]
+                            af_xdp_udp_diag::bump(&af_xdp_udp_diag::DOWNSTREAM_ENQ);
+                        }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            #[cfg(target_os = "linux")]
+                            af_xdp_udp_diag::bump(&af_xdp_udp_diag::DOWNSTREAM_SHED);
                             debug!(
                                 "UDP downstream sender queue full for {}, dropping backend packet",
                                 current_client_addr
@@ -3021,6 +3504,8 @@ mod tests {
             listen_addr,
             peer_addr,
             payload: Bytes::from_static(b"queued"),
+            #[cfg(target_os = "linux")]
+            enqueued_ms: udp_activity_now_ms(),
         })
         .unwrap();
         let sender = UdpDownstreamSender::channel(listen_addr, tx);
@@ -3246,6 +3731,124 @@ mod tests {
         assert_eq!(first, "No load balancer found for server id 999");
         assert_eq!(second, first);
         assert_eq!(manager.session_creation_attempts.load(Ordering::Relaxed), 1);
+        assert!(manager.inflight_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn af_xdp_datagram_new_flow_queues_pending_and_drains_via_worker() {
+        let store = ConfigStore::new();
+        let udp_server = Arc::new(ServerConfig {
+            id: Some(10),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "udp.example.com".to_string(),
+                ..Default::default()
+            }],
+            udp: Some(UDPConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("udp".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+            }),
+            ..Default::default()
+        });
+        let mut servers = HashMap::new();
+        servers.insert("udp.example.com".to_string(), udp_server.clone());
+        store
+            .update_config(
+                1,
+                1,
+                0,
+                0,
+                vec![udp_server],
+                servers,
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                false,
+                "random".to_string(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+
+        let manager = UdpProxyManager::new(store, Arc::new(WafStateManager::new()), 1);
+        let (downstream_tx, _downstream_rx) = mpsc::channel(8);
+        let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
+        let datagram = |payload: &'static [u8]| crate::xdp::af_xdp::AfXdpDatagram {
+            listen_addr: "127.0.0.1:443".parse().unwrap(),
+            peer_addr: "127.0.0.1:53000".parse().unwrap(),
+            payload: Bytes::from_static(payload),
+            ecn: None,
+        };
+
+        // Both datagrams must be accepted immediately (Sent) even though no
+        // session exists yet — creation runs on the worker pool, not the
+        // caller's ingress loop.
+        let first = manager
+            .receive_af_xdp_datagram(
+                datagram(b"one"),
+                downstream_tx.clone(),
+                listener_shutdown_rx.clone(),
+            )
+            .await
+            .unwrap();
+        let second = manager
+            .receive_af_xdp_datagram(datagram(b"two"), downstream_tx, listener_shutdown_rx)
+            .await
+            .unwrap();
+        assert_eq!(first, UdpIngressDatagramStatus::Sent);
+        assert_eq!(second, UdpIngressDatagramStatus::Sent);
+
+        // The worker resolves the (LB-less) creation, fails it honestly,
+        // and reaps the pending entry — no stuck map state.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while manager.session_creation_attempts.load(Ordering::Relaxed) == 0
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(manager.session_creation_attempts.load(Ordering::Relaxed), 1);
+        while manager.pending_sessions_count.load(Ordering::Relaxed) != 0
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(manager.pending_sessions_count.load(Ordering::Relaxed), 0);
         assert!(manager.inflight_sessions.is_empty());
     }
 }

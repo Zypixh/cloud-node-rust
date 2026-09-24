@@ -2313,6 +2313,7 @@ fn af_xdp_dial_registry_udp_owner_demuxes_payload() {
         af_xdp::AfXdpUdpDatagram {
             payload: bytes::Bytes::from_static(b"pong"),
             ecn: Some(0b10),
+            enqueued_ms: crate::udp_proxy::udp_activity_now_ms(),
         },
     ))
     .expect("deliver");
