@@ -1,5 +1,46 @@
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 use super::*;
+
+/// Resolves when SIGINT or SIGTERM arrives. Smoke paths must observe
+/// termination *before* process exit: an XDP program attached via a
+/// pinned BPF link survives exit and keeps redirecting into dead AF_XDP
+/// sockets — the restart blackhole shape. Returning early lets the
+/// caller's existing `detach(false)` cleanup actually run (observed
+/// on-node: `systemctl stop` left prog id attached and blackholed the
+/// next kernel-arm run).
+#[cfg(target_os = "linux")]
+async fn smoke_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+    let sig = match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = term.recv() => "SIGTERM",
+            }
+        }
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
+    };
+    SMOKE_SIGNAL_RECEIVED.store(true, Ordering::Relaxed);
+    sig
+}
+
+#[cfg(target_os = "linux")]
+static SMOKE_SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+/// Pollable form of `smoke_shutdown_signal` for loops that cannot
+/// `.await` a select — arms a one-shot watcher on first call.
+#[cfg(target_os = "linux")]
+fn smoke_signal_received() -> bool {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tokio::spawn(smoke_shutdown_signal());
+    });
+    SMOKE_SIGNAL_RECEIVED.load(Ordering::Relaxed)
+}
+
 #[cfg(target_os = "linux")]
 pub async fn raw_smoke(
     duration: std::time::Duration,
@@ -51,6 +92,9 @@ async fn raw_smoke_inner(
     let mut samples = Vec::new();
 
     while tokio::time::Instant::now() < deadline {
+        if smoke_signal_received() {
+            break;
+        }
         let mut frames = Vec::with_capacity(64);
         let stats = {
             let mut runtime = manager.af_xdp.lock();
@@ -298,7 +342,12 @@ async fn proxy_reload_smoke_inner(
     let result = async {
         wait_for_proxy_smoke_ready(&after_manager, duration, &old_bridge).await?;
         write_ready_file(ready_file.as_ref())?;
-        tokio::time::sleep(duration).await;
+        tokio::select! {
+            _ = tokio::time::sleep(duration) => {}
+            sig = smoke_shutdown_signal() => {
+                tracing::info!("proxy reload smoke received {sig}; detaching dataplane");
+            }
+        }
         let after_reload = after_manager.status();
         anyhow::ensure!(
             before_reload.proxy_ready && before_reload.proxy_redirect_enabled,
@@ -652,7 +701,12 @@ async fn proxy_smoke_inner(
     wait_for_proxy_smoke_ready(&manager, duration, bridge).await?;
     write_ready_file(ready_file.as_ref())?;
 
-    tokio::time::sleep(duration).await;
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => {}
+        sig = smoke_shutdown_signal() => {
+            tracing::info!("proxy smoke received {sig}; detaching dataplane");
+        }
+    }
     let status = manager.status();
     let report = serde_json::json!({
         "durationMillis": duration.as_millis(),
@@ -712,6 +766,20 @@ async fn proxy_smoke_kernel(
     ready_file: Option<std::path::PathBuf>,
     remote: Option<std::net::IpAddr>,
 ) -> anyhow::Result<serde_json::Value> {
+    // A kernel arm must not inherit a stale XDP program: a predecessor
+    // that died without detaching leaves the dataplane redirecting into
+    // dead AF_XDP sockets and blackholes this listener (observed on-node
+    // after `systemctl stop` on an afxdp arm). Reclaim before serving.
+    if let Err(err) = detach(false).await {
+        tracing::warn!("kernel proxy smoke: stale XDP detach failed: {err}");
+    }
+    // The kernel arm has no AF_XDP dataplane: report XDP disabled so
+    // `upstream_mode()` resolves kernel instead of the enabled→afxdp
+    // short-circuit. Without this every upstream dial takes the unarmed
+    // AF_XDP registry and the arm 502s before a SYN leaves the node.
+    let mut kernel_runtime = RuntimeConfig::current().unwrap_or_default();
+    kernel_runtime.xdp.enabled = false;
+    RuntimeConfig::set_current(kernel_runtime);
     let services = XdpProxySmokeServices::start(remote).await?;
     let (quic_demux, tcp_manager, http_manager) =
         xdp_proxy_smoke_managers(&services, &ports).await?;
@@ -751,7 +819,12 @@ async fn proxy_smoke_kernel(
     }
     write_ready_file(ready_file.as_ref())?;
 
-    tokio::time::sleep(duration).await;
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => {}
+        sig = smoke_shutdown_signal() => {
+            tracing::info!("kernel proxy smoke received {sig}; exiting");
+        }
+    }
     let report = serde_json::json!({
         "durationMillis": duration.as_millis(),
         "dataplane": "kernel",
