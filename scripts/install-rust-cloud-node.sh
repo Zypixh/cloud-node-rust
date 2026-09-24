@@ -1722,6 +1722,19 @@ kernel_xdp_sockets_enabled() {
     return 2
 }
 
+xdp_driver_min_kernel() {
+    # Minimum kernel whose driver can bind an AF_XDP socket (XSK), not just
+    # run native XDP. virtio_net only gained XSK support in 6.11 — Debian 12
+    # stock (6.1) and every older virtio guest cannot bind at all. The big
+    # server NICs got XSK around the 5.4 floor already enforced above.
+    case "$1" in
+        virtio_net) printf '6 11' ;;
+        i40e|ice|ixgbe|ixgbevf|iavf|mlx4_en|mlx5_core|bnxt_en|qede|sfc|sfc_ef100|nfp|nfp_netvf|ena|gve|mvneta|mvpp2|stmmac|enetc|atlantic|axgbe|amd-xgbe|bcmgenet|cpsw|am65-cpsw|fec|dpaa2-eth|xilinx_axienet|netdevsim)
+            printf '5 4' ;;
+        *) printf '' ;;
+    esac
+}
+
 probe_xdp_kernel() {
     local kver sockets_rc
     kver="$(uname -r 2>/dev/null || printf 'unknown')"
@@ -1744,7 +1757,31 @@ probe_xdp_kernel() {
         XDP_KERNEL_REASON="kernel $kver < 5.4: the bidirectional AF_XDP dataplane needs >= 5.4"
         return
     fi
-    if [ "$sockets_rc" -eq 2 ]; then
+
+    # Driver-level XSK capability: kernel >= 5.4 only proves the socket API
+    # exists; the NIC driver must also implement xsk bind. virtio_net gained
+    # it in 6.11, so e.g. Debian 12 stock (6.1) passes the floor above yet
+    # cannot attach — downgrade the verdict before xdp.enabled is written.
+    local iface driver floor floor_maj floor_min
+    iface="$XDP_IFACE"
+    [ -n "$iface" ] || iface="$(default_route_iface || true)"
+    if [ -n "$iface" ]; then
+        driver="$(nic_driver "$iface")"
+        floor="$(xdp_driver_min_kernel "$driver")"
+        if [ -n "$floor" ]; then
+            floor_maj="${floor%% *}"
+            floor_min="${floor##* }"
+            if ! kernel_version_ge "$floor_maj" "$floor_min"; then
+                XDP_KERNEL_VERDICT="unsupported"
+                XDP_KERNEL_REASON="$iface uses $driver, which needs kernel >= $floor_maj.$floor_min for AF_XDP sockets; kernel $kver cannot bind an XSK"
+                return
+            fi
+        elif [ "$driver" != "unknown" ]; then
+            XDP_KERNEL_REASON="$iface driver '$driver' has no known AF_XDP capability floor — the runtime attach path verifies it"
+        fi
+    fi
+
+    if [ -z "$XDP_KERNEL_REASON" ] && [ "$sockets_rc" -eq 2 ]; then
         XDP_KERNEL_REASON="kernel $kver meets the version floor; CONFIG_XDP_SOCKETS unreadable — the runtime attach path verifies it"
     fi
 }
