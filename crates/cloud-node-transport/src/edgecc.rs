@@ -665,7 +665,7 @@ impl EdgeCc {
             .into_iter()
             .flatten()
             .max()
-            .map(|s| (s as u128 * base.as_micros().max(1) as u128 / 1_000_000).min(u64::MAX as u128) as u64);
+            .map(|s| (s as u128 * base.as_micros().max(1) / 1_000_000).min(u64::MAX as u128) as u64);
             if let Some(p) = proven {
                 target = target.min(p.saturating_mul(3));
             }
@@ -924,7 +924,7 @@ impl CongestionController for EdgeCc {
                     });
                     let floor_rtt = rtt_d.max(Duration::from_millis(1));
                     let implied = (self.inflight_target as u128 * 1_000_000
-                        / floor_rtt.as_micros() as u128)
+                        / floor_rtt.as_micros())
                         .min(u64::MAX as u128) as u64;
                     // Blind paths pace at min(delivery, window-implied):
                     // before any slope exists the delivery sample is the
@@ -1024,7 +1024,7 @@ impl CongestionController for EdgeCc {
             .flatten()
             .max()
             .zip(self.model.base_rtt().or(self.last_srtt))
-            .map(|(s, b)| s as u128 * b.as_micros().max(1) as u128 / 1_000_000);
+            .map(|(s, b)| s as u128 * b.as_micros().max(1) / 1_000_000);
             if proven.is_some_and(|p| pre_loss_inflight > p.saturating_mul(3) / 2) {
                 self.loss_clamp_until_us = now_us.saturating_add(2 * srtt_us);
                 self.loss_clamp_judge_us = now_us.saturating_add(srtt_us);
