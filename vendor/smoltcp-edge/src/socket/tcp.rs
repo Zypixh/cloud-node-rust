@@ -3530,6 +3530,21 @@ impl<'a> Socket<'a> {
             State::FinWait2 | State::TimeWait => {}
         }
 
+        // smoltcp-edge: a pending TLP probe that could not occupy
+        // sequence space this round (zero peer window AND no emittable
+        // tail record) must be consumed anyway — left pending it makes
+        // `seq_to_transmit`/`poll_at` report Now forever while dispatch
+        // can never emit the probe, which pinned an afxdp reactor at
+        // ~101% with zero wire traffic (EN-27). The RTO timer remains
+        // the retry backstop.
+        if repr.payload.is_empty()
+            && repr.control == TcpControl::None
+            && let Some(ext) = &mut self.ext_transport
+            && ext.tlp_probe_pending()
+        {
+            ext.clear_tlp_probe();
+        }
+
         // There might be more than one reason to send a packet. E.g. the keep-alive timer
         // has expired, and we also have data in transmit buffer. Since any packet that occupies
         // sequence space will elicit an ACK, we only need to send an explicit packet if we

@@ -1751,6 +1751,92 @@ fn af_xdp_tcp_reactor_reaps_stalled_closing_sessions() {
 
 #[cfg(any(test, target_os = "linux"))]
 #[test]
+fn af_xdp_tcp_reactor_reaps_silent_peer_eof_sessions() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    use std::time::Duration;
+    // EN-27 regression: a proxy-started session whose peer FIN'd into
+    // CLOSE-WAIT and then went silent was immortal — `reapable` needs
+    // closing + Closed/TimeWait, while retransmits kept `last_activity`
+    // fresh, so the session pinned ~1 MiB of buffer charge and the
+    // reactor's poll-delay floor indefinitely (afxdp worker at ~101%
+    // with zero wire traffic). Peer silence past the EOF deadline must
+    // reap it.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let clock = reactor.install_manual_clock_for_test();
+    let t0 = smoltcp::time::Instant::from_micros(clock.now_micros());
+    let frame = ipv4_tcp_syn_frame_with_source_port(false, 53510);
+    let af_xdp::AfXdpProxyFrame::Tcp { route, flow, .. } =
+        af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    assert!(reactor.ensure_session_at(route, flow, af_xdp::AfXdpTcpProxyClass::TcpPlain, t0));
+    reactor.force_peer_eof_for_test(&flow);
+
+    clock.advance(af_xdp::AF_XDP_TCP_PEER_EOF_SILENT_REAP_AFTER + Duration::from_millis(1));
+    let now = smoltcp::time::Instant::from_micros(clock.now_micros());
+    let _ = reactor.poll_at_for_test(now);
+    assert_eq!(reactor.session_count(), 0);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_peer_eof_absolute_deadline() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    use std::time::Duration;
+    // Companion to the silent reap: a peer-EOF session whose peer keeps
+    // ACKing (inbound packets refresh `last_peer_activity`) must
+    // survive the silence deadline yet still be bounded by the absolute
+    // EOF reap — a drain that never finishes cannot live forever.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let clock = reactor.install_manual_clock_for_test();
+    let t0 = smoltcp::time::Instant::from_micros(clock.now_micros());
+    let frame = ipv4_tcp_syn_frame_with_source_port(false, 53511);
+    let af_xdp::AfXdpProxyFrame::Tcp { route, flow, .. } =
+        af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    assert!(reactor.ensure_session_at(
+        route.clone(),
+        flow,
+        af_xdp::AfXdpTcpProxyClass::TcpPlain,
+        t0
+    ));
+    reactor.force_peer_eof_for_test(&flow);
+
+    // The peer keeps ACKing: an inbound packet every 10s resets the
+    // silence clock — the session must survive each sweep while the
+    // absolute EOF deadline (60s) has not elapsed.
+    for step in 1..=5 {
+        clock.advance(Duration::from_secs(10));
+        let tick = smoltcp::time::Instant::from_micros(clock.now_micros());
+        assert!(reactor.ensure_session_at(
+            route.clone(),
+            flow,
+            af_xdp::AfXdpTcpProxyClass::TcpPlain,
+            tick
+        ));
+        let _ = reactor.poll_at_for_test(tick);
+        assert_eq!(reactor.session_count(), 1, "step {step}");
+    }
+
+    // 11s past the last ACK: eof clock at 61s, silence only 11s — the
+    // reap can only come from the absolute EOF deadline.
+    clock.advance(Duration::from_secs(11));
+    let end = smoltcp::time::Instant::from_micros(clock.now_micros());
+    let _ = reactor.poll_at_for_test(end);
+    assert_eq!(reactor.session_count(), 0);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
 fn af_xdp_tcp_reactor_reaps_closing_time_wait_sessions() {
     assert!(af_xdp::af_xdp_tcp_session_reapable(
         true,
@@ -1978,6 +2064,68 @@ fn af_xdp_tcp_reactor_dial_times_out_past_deadline() {
         Ok(Err(err)) => assert_eq!(err.kind(), std::io::ErrorKind::TimedOut),
         _ => panic!("dial deadline must fail with TimedOut"),
     }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_pumps_deadline_sessions_ahead_of_data() {
+    // EN-27: with the hot queue saturated by established sessions, a
+    // dialed flow must still be pumped in the first round — under a
+    // single FIFO it lands behind PUMP_BUDGET data sessions and its 4s
+    // deadline expires before the queue ever reaches it, which is the
+    // connect-burst 502 shape observed on the live node.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 4096);
+    let clock = reactor.install_manual_clock_for_test();
+    let t0 = smoltcp::time::Instant::from_micros(clock.now_micros());
+
+    // Fill the data queue beyond one pump budget with established
+    // (proxy_started) sessions — wake marks push them through mark_hot
+    // exactly like real traffic.
+    let local_addr: std::net::SocketAddr = "198.51.100.5:443".parse().unwrap();
+    for i in 0..af_xdp::AF_XDP_TCP_PUMP_BUDGET + 8 {
+        let flow = af_xdp::AfXdpTcpFlowKey {
+            local_addr,
+            peer_addr: format!("192.0.2.10:{}", 10_000 + i).parse().unwrap(),
+        };
+        assert!(reactor.ensure_session_at(
+            af_xdp_dial_route_meta(),
+            flow,
+            af_xdp::AfXdpTcpProxyClass::TcpPlain,
+            t0
+        ));
+        reactor.wake_set.insert(flow, ());
+    }
+    assert_eq!(reactor.session_count(), af_xdp::AF_XDP_TCP_PUMP_BUDGET + 8);
+
+    let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let local: std::net::SocketAddr = "198.51.100.5:49000".parse().unwrap();
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    reactor.dial(af_xdp::AfXdpTcpDialRequest {
+        remote,
+        local,
+        route: af_xdp_dial_route_meta(),
+        syn_extra_options: Vec::new(),
+        reply: reply_tx,
+    });
+
+    // Let the dial deadline lapse, then run exactly one poll round — the
+    // deadline-bound session is pumped before the 520 queued data
+    // sessions and the timeout fires immediately instead of after the
+    // whole data queue drains.
+    clock.advance(af_xdp::AF_XDP_TCP_DIAL_TIMEOUT + std::time::Duration::from_millis(1));
+    let _ = reactor.poll();
+    match reply_rx.try_recv() {
+        Ok(Err(err)) => assert_eq!(err.kind(), std::io::ErrorKind::TimedOut),
+        _ => panic!("deadline-bound dial must resolve in the first pump round"),
+    }
+    // The shared budget still bounds the round — leftover data sessions
+    // remain queued for the next one rather than the deadline class
+    // widening the budget.
+    assert!(reactor.hot_session_count() > 0);
 }
 
 #[cfg(any(test, target_os = "linux"))]

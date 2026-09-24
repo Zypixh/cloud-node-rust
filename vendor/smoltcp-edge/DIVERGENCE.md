@@ -84,7 +84,11 @@ tests at the end of `socket::tcp::test`.
   `pending_fast_retransmit` under ext; send selection order is
   scoreboard-lost records (cwnd-gated) → new data (cwnd + pacing gated)
   → TLP tail probe; post-emit `note_sent` + `pace_after_send` +
-  `mark_app_limited` + `clear_tlp_probe`.
+  `mark_app_limited` + `clear_tlp_probe`. A pending TLP probe that the
+  round cannot turn into a sequence-occupying segment (zero window and
+  no tail record — the silent-peer zombie shape) is consumed anyway:
+  left pending it made `poll_at` report Now forever and pinned an
+  afxdp reactor at ~101% with no wire traffic (EN-27).
 - `cwnd_remaining()`: under ext returns `cc.cwnd() - pipe` instead of
   `controller.window() - flight_size`.
 - `seq_to_transmit()`: admits cwnd-admissible lost records and pending

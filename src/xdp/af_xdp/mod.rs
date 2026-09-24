@@ -151,6 +151,17 @@ pub(crate) const AF_XDP_TCP_IDLE_SHRINK_AFTER: Duration = Duration::from_secs(2)
 /// 60s mirrors the Linux TCP_LINGER2 default for the same zombie shape.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_CLOSING_REAP_AFTER: Duration = Duration::from_secs(60);
+/// EN-27: a session whose peer signalled EOF (read side closed) and
+/// then went completely silent is dead — no inbound packets means the
+/// remaining send-queue can never drain, while the socket's
+/// retransmit/probe timers keep the reactor's poll-delay at the idle
+/// floor (measured: afxdp worker pinned ~101% with zero wire traffic).
+/// Reap once peer silence outlasts this deadline. 15s is far beyond any
+/// plausible ACK gap on a connection still making progress, and far
+/// below the 300s idle timeout the zombie shape used to hide behind —
+/// it bounds both the buffer charge and the poll-storm window.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_PEER_EOF_SILENT_REAP_AFTER: Duration = Duration::from_secs(15);
 /// T9: after a refused growth charge, wait this long before trying
 /// again. Per-pump retries against a full ledger were measured at
 /// ~11M CAS attempts/min — enough to starve the single reactor thread
@@ -384,6 +395,10 @@ pub fn tcp_diag_scalars() -> serde_json::Value {
         "drainCapParks": AF_XDP_TCP_DIAG_CAP_PARKS.load(Ordering::Relaxed),
         "drainCapReaped": AF_XDP_TCP_DIAG_CAP_REAPED.load(Ordering::Relaxed),
         "bufferShrinks": AF_XDP_TCP_DIAG_BUFFER_SHRINKS.load(Ordering::Relaxed),
+        "fdSoftLimit": crate::memory_governor::MEMORY_GOVERNOR.fd_soft_limit(),
+        "fdClamped": crate::memory_governor::fd_clamped_class_names(
+            crate::memory_governor::MEMORY_GOVERNOR.fd_clamped_mask()
+        ),
         "tcpQueueBytes": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes(),
         "tcpQueueBytesBudget": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes_budget(),
         "accountGrantable": crate::memory_governor::MEMORY_GOVERNOR.account_view().grantable_bytes,
@@ -513,6 +528,10 @@ pub(crate) fn tcp_diag_snapshot() -> serde_json::Value {
         "bufferGrowth": AF_XDP_TCP_DIAG_BUFFER_GROWTH.load(Ordering::Relaxed),
         "bufferGrowStall": AF_XDP_TCP_DIAG_BUFFER_GROW_STALL.load(Ordering::Relaxed),
         "budgetStallReaped": AF_XDP_TCP_DIAG_STALL_REAPED.load(Ordering::Relaxed),
+        "fdSoftLimit": crate::memory_governor::MEMORY_GOVERNOR.fd_soft_limit(),
+        "fdClamped": crate::memory_governor::fd_clamped_class_names(
+            crate::memory_governor::MEMORY_GOVERNOR.fd_clamped_mask()
+        ),
         "tcpQueueBytes": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes(),
         "tcpQueueBytesBudget": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes_budget(),
         "sessions": tcp_session_snapshots_json(),

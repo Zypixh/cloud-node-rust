@@ -234,6 +234,18 @@ pub(crate) struct AfXdpTcpSession {
     pub(crate) pending_egress: AfXdpTcpChargedBytes,
     pub(crate) created_at: SmoltcpInstant,
     pub(crate) last_activity: SmoltcpInstant,
+    /// EN-27: last *inbound-packet* activity. Unlike `last_activity`
+    /// (which local app egress also refreshes) this measures true peer
+    /// silence — the zombie signal for the peer-EOF reap deadline.
+    pub(crate) last_peer_activity: SmoltcpInstant,
+    /// EN-27: first instant the socket reached a peer-EOF state
+    /// (CLOSE-WAIT/CLOSING/LAST-ACK/TIME-WAIT/CLOSED). Once set it
+    /// bounds the session's remaining life independently of
+    /// `last_activity`: a peer that FIN'd and went silent leaves a
+    /// CLOSE-WAIT socket whose unacked send-queue would otherwise pin
+    /// its buffer charge forever — `reapable` alone only covers
+    /// Closed/TimeWait once `closing` is set.
+    pub(crate) peer_eof_since: Option<SmoltcpInstant>,
     pub(crate) proxy_started: bool,
     pub(crate) closing: bool,
     pub(crate) egress_closed: bool,
@@ -571,6 +583,14 @@ pub(crate) struct AfXdpTcpReactor {
     /// EN-17: sessions with observed work (ingress packet or egress wake).
     /// Entries are dedup'd by `AfXdpTcpSession.hot`; stale keys are skipped.
     hot_sessions: std::collections::VecDeque<AfXdpTcpFlowKey>,
+    /// Deadline-bound sessions — a dialed flow awaiting handshake
+    /// resolution and an accepted flow still pre-proxy both die on a
+    /// fixed deadline, so queueing them behind thousands of established
+    /// data sessions converts a saturated round into guaranteed dial
+    /// timeouts/502s (EN-27: ~200 conn/s burst on one queue). They get a
+    /// dedicated FIFO drained before `hot_sessions` inside the same
+    /// pump budget; dedup stays on the shared `hot` flag.
+    hot_deadline: std::collections::VecDeque<AfXdpTcpFlowKey>,
     /// EN-17: shared dirty set — proxy tasks insert their flow key after
     /// queueing egress bytes. Hard-bounded by `session_limit` (at most one
     /// entry per live flow plus in-flight stale keys), insert is lossless
@@ -698,6 +718,7 @@ impl AfXdpTcpReactor {
             device,
             sessions: HashMap::new(),
             hot_sessions: std::collections::VecDeque::new(),
+            hot_deadline: std::collections::VecDeque::new(),
             wake_set,
             wake_notify: Arc::new(tokio::sync::Notify::new()),
             sweep_keys: Vec::new(),
@@ -1344,12 +1365,19 @@ impl AfXdpTcpReactor {
     }
 
     /// EN-17: queue `flow` for pumping this round (dedup via `hot` flag).
+    /// Deadline-bound sessions (dial handshake pending, inbound pre-proxy)
+    /// go to `hot_deadline` so a saturated data round cannot starve them
+    /// past their timeout.
     fn mark_hot(&mut self, flow: AfXdpTcpFlowKey) {
         if let Some(session) = self.sessions.get_mut(&flow)
             && !session.hot
         {
             session.hot = true;
-            self.hot_sessions.push_back(flow);
+            if af_xdp_tcp_session_deadline_pending(session) {
+                self.hot_deadline.push_back(flow);
+            } else {
+                self.hot_sessions.push_back(flow);
+            }
         }
     }
 
@@ -1441,6 +1469,7 @@ impl AfXdpTcpReactor {
     /// non-empty.
     pub(crate) fn has_queued_work(&self) -> bool {
         !self.hot_sessions.is_empty()
+            || !self.hot_deadline.is_empty()
             || !self.wake_set.is_empty()
             || !self.device.ingress.is_empty()
     }
@@ -1468,7 +1497,7 @@ impl AfXdpTcpReactor {
     /// EN-17 test hooks: observe hot-set scheduling state.
     #[cfg(test)]
     pub(crate) fn hot_session_count(&self) -> usize {
-        self.hot_sessions.len()
+        self.hot_sessions.len() + self.hot_deadline.len()
     }
 
     /// EN-17 test hook: observe the batched sweep cursor.
@@ -1574,6 +1603,17 @@ impl AfXdpTcpReactor {
         }
     }
 
+    /// Test hook: arm the peer-EOF clock and mark `flow` closing —
+    /// the CLOSE-WAIT zombie shape (peer FIN'd, send-queue undrained,
+    /// socket still non-terminal).
+    #[cfg(test)]
+    pub(crate) fn force_peer_eof_for_test(&mut self, flow: &AfXdpTcpFlowKey) {
+        if let Some(session) = self.sessions.get_mut(flow) {
+            session.peer_eof_since = Some(SmoltcpInstant::from_micros(self.clock.now_micros()));
+            session.closing = true;
+        }
+    }
+
     /// Test hook: stage an unflushed app-egress chunk — the shape a
     /// send-buffer-full session presents to `session_still_active`.
     #[cfg(test)]
@@ -1631,6 +1671,7 @@ impl AfXdpTcpReactor {
         if let Some(session) = self.sessions.get_mut(&flow) {
             session.route = route;
             session.last_activity = now;
+            session.last_peer_activity = now;
             return true;
         }
         let peer_ip = flow.peer_addr.ip();
@@ -1710,6 +1751,8 @@ impl AfXdpTcpReactor {
             pending_egress: AfXdpTcpChargedBytes::empty(),
             created_at: now,
             last_activity: now,
+            last_peer_activity: now,
+            peer_eof_since: None,
             proxy_started: {
                 #[cfg(test)]
                 {
@@ -1948,6 +1991,8 @@ impl AfXdpTcpReactor {
             pending_egress: AfXdpTcpChargedBytes::empty(),
             created_at: now,
             last_activity: now,
+            last_peer_activity: now,
+            peer_eof_since: None,
             proxy_started: false,
             closing: false,
             egress_closed: false,
@@ -2246,7 +2291,17 @@ impl AfXdpTcpReactor {
         }
         let mut budget = AF_XDP_TCP_PUMP_BUDGET;
         while budget > 0 {
-            let Some(flow) = self.hot_sessions.pop_front() else {
+            // Deadline-bound sessions first: a dial waiting on handshake
+            // resolution or an accepted flow waiting to spawn its proxy
+            // both expire on fixed deadlines — behind a saturated data
+            // queue the wait *is* the 502/timeout (EN-27 burst finding).
+            // The shared budget still bounds total work per round, so a
+            // connect storm cannot monopolize the reactor either.
+            let Some(flow) = self
+                .hot_deadline
+                .pop_front()
+                .or_else(|| self.hot_sessions.pop_front())
+            else {
                 break;
             };
             let Some(session) = self.sessions.get_mut(&flow) else {
@@ -2742,17 +2797,19 @@ impl AfXdpTcpReactor {
             let tx_demand = socket.send_queue() * 4 >= socket.send_capacity() * 3
                 || !session.pending_egress.is_empty();
             Self::grow_socket_buffers(socket, session, live_sessions, rx_demand, tx_demand, now);
-            // A proxy-started socket that reached a terminal state on its
-            // own (peer RST → Closed, or TimeWait drain finished) is dead
-            // weight: it can neither receive nor send, so mark it closing
-            // and let the sweep reap it on cadence instead of waiting out
-            // the idle timeout. Reaping drops the stream channels, which
-            // wakes a writer parked in `poll_write` with BrokenPipe — the
-            // task, its upstream socket, and its permits release promptly.
-            if matches!(
-                socket.state(),
-                SmoltcpTcp::State::Closed | SmoltcpTcp::State::TimeWait
-            ) {
+            // A proxy-started socket that reached a terminal or peer-EOF
+            // state on its own is on the close path: mark it closing and
+            // arm the EOF clock on first observation. CLOSE-WAIT counts
+            // too — the peer will never send again, so the session's only
+            // remaining work is flushing our send-queue, and the sweep's
+            // EOF deadlines bound that drain (a silent peer can never
+            // finish it). Reaping drops the stream channels, which wakes
+            // a writer parked in `poll_write` with BrokenPipe — the task,
+            // its upstream socket, and its permits release promptly.
+            if af_xdp_tcp_stream_read_side_closed(socket.state()) {
+                if session.peer_eof_since.is_none() {
+                    session.peer_eof_since = Some(now);
+                }
                 session.closing = true;
             }
         }
@@ -2775,6 +2832,7 @@ impl AfXdpTcpReactor {
         let mut finished = Vec::new();
         let mut pre_proxy_timeouts = Vec::new();
         let mut shrink_candidates = Vec::new();
+        let mut eof_marks = Vec::new();
         for (flow, session) in &self.sessions {
             let socket = self
                 .sockets
@@ -2790,6 +2848,36 @@ impl AfXdpTcpReactor {
                 session.created_at
             };
             let idle_for = session_idle_for(now, idle_since);
+            // EN-27: first sweep observation of a peer-EOF state arms
+            // the EOF clock and moves the session to closing — applied
+            // after the loop (the session map is borrowed). Pre-proxy
+            // sessions are excluded: an unverified socket keeps its
+            // short pre-proxy idle timeout rather than hiding behind
+            // the EOF deadlines.
+            if af_xdp_tcp_stream_read_side_closed(socket.state())
+                && (session.proxy_started || session.dialed)
+                && session.peer_eof_since.is_none()
+            {
+                eof_marks.push(*flow);
+            }
+            // EN-27 zombie reap — a peer that FIN'd and then went
+            // silent can never drain our send-queue: the connection is
+            // dead while its socket's retransmit/probe timers hold the
+            // reactor at the idle-wait floor and its buffer charge
+            // stays pinned. `last_peer_activity` (inbound packets only)
+            // measures the silence; the absolute EOF bound additionally
+            // catches a peer that keeps ACKing a pathologically slow
+            // drain. Runs before the generic idle/closing checks — the
+            // zombie's retransmits can otherwise keep `last_activity`
+            // fresh forever.
+            if let Some(eof_since) = session.peer_eof_since
+                && (session_idle_for(now, session.last_peer_activity)
+                    >= AF_XDP_TCP_PEER_EOF_SILENT_REAP_AFTER
+                    || session_idle_for(now, eof_since) >= AF_XDP_TCP_CLOSING_REAP_AFTER)
+            {
+                finished.push(*flow);
+                continue;
+            }
             // T9: a session parked on the queue ledger past the stall
             // deadline is a zombie — retransmissions keep refreshing
             // `last_activity` so the idle timeout below can never fire,
@@ -2886,6 +2974,12 @@ impl AfXdpTcpReactor {
                 finished.push(*flow);
             } else if af_xdp_tcp_session_reapable(session.closing, socket.state()) {
                 finished.push(*flow);
+            }
+        }
+        for flow in eof_marks {
+            if let Some(session) = self.sessions.get_mut(&flow) {
+                session.peer_eof_since = Some(now);
+                session.closing = true;
             }
         }
         let pre_proxy_timed_out: std::collections::HashSet<AfXdpTcpFlowKey> =
@@ -3088,6 +3182,20 @@ pub(crate) fn af_xdp_tcp_session_reapable(closing: bool, state: SmoltcpTcp::Stat
             state,
             SmoltcpTcp::State::Closed | SmoltcpTcp::State::TimeWait
         )
+}
+
+/// Session whose pump is deadline-bound: a dialed flow still waiting for
+/// handshake resolution (`dial_reply` held until Established/timeout) or
+/// an accepted flow that has not spawned its proxy task yet (pre-proxy
+/// idle timeout). Established/dialed-post-handshake sessions carry no
+/// such deadline and take the regular hot queue.
+#[cfg(any(test, target_os = "linux"))]
+fn af_xdp_tcp_session_deadline_pending(session: &AfXdpTcpSession) -> bool {
+    if session.dialed {
+        session.dial_reply.is_some()
+    } else {
+        !session.proxy_started
+    }
 }
 
 #[cfg(any(test, target_os = "linux"))]
