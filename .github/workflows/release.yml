@@ -1,12 +1,18 @@
 name: Release
 
-# Tags only: pushing v* is the release decision; main/PR coverage lives in
-# ci.yml. No paths filter — a tag push always means "build this release",
-# regardless of which files the tagged diff touches.
+# Tags: pushing v* is the release decision. main: the same matrix warms the
+# mbx store under `release-mbx-v1-<leg>-*` keys on the default branch —
+# actions/cache restores are ref-scoped, and tag runs may read default-branch
+# entries, so a tag cut from main restores the most recent main-push store
+# via the restore-key prefix instead of building cold. The `release` job
+# below stays gated on refs/tags/v, so main pushes only build and cache.
 on:
   push:
     tags:
       - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}
@@ -139,13 +145,15 @@ jobs:
           done
 
       # mbx shared build cache. `backend: local` only installs mbx; cache
-      # transport is the actions/cache step below. The action's `github`
-      # backend would be restore-only here — it saves solely on
-      # default-branch pushes, and this workflow is tag-only by design, so
-      # tag builds must own their save policy or the store stays cold
-      # forever. Each matrix leg keeps its own store (RUSTFLAGS differ per
-      # leg, so compilation fingerprints do too); a respin restores the
-      # previous run's entry via the restore-key prefix.
+      # transport is the actions/cache step below. Cache entries are
+      # ref-scoped: a run restores entries saved on its own ref or on the
+      # default branch. This workflow runs on main pushes as well as tags,
+      # so the store is warmed on refs/heads/main where every future tag
+      # run can reach it — before that change, tag-only runs could only see
+      # their own tag's store and every first build of a new tag ran cold.
+      # Each matrix leg keeps its own store (RUSTFLAGS differ per leg, so
+      # compilation fingerprints do too); the restore-key prefix matches
+      # the most recent entry for the leg regardless of the sha suffix.
       - name: Install mbx
         uses: jdx/mr-boxington-action@v1
         with:
