@@ -2920,6 +2920,52 @@ WorkingDirectory='/opt/cloud-node'
     }
 }
 
+/// Raise RLIMIT_NOFILE to the node's working target. Every entry path
+/// that opens sockets needs this — the daemon used to be the only
+/// caller, which left `xdp proxy-smoke` and friends running under the
+/// systemd/interactive default of 1024 and silently crushing every
+/// fd-derived admission budget (EN-27: HTTP=179, Origin=128).
+#[cfg(target_family = "unix")]
+fn raise_nofile_limit() {
+    unsafe {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+            let target = 1048576;
+            let old_cur = rlim.rlim_cur;
+
+            if rlim.rlim_max < target {
+                rlim.rlim_max = target;
+            }
+            if rlim.rlim_cur < target {
+                rlim.rlim_cur = target;
+            }
+
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
+                if old_cur < target {
+                    info!(
+                        "Successfully raised RLIMIT_NOFILE (file descriptor limit) from {} to {}",
+                        old_cur, target
+                    );
+                }
+            } else {
+                let err = std::io::Error::last_os_error();
+                warn!(
+                    "Failed to raise RLIMIT_NOFILE to {}. Current limit: cur={}, max={}. Error: {}. (You may need 'ulimit -n 1048576' or root privileges)",
+                    target, rlim.rlim_cur, rlim.rlim_max, err
+                );
+            }
+        } else {
+            warn!("Failed to get RLIMIT_NOFILE");
+        }
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn raise_nofile_limit() {}
+
 fn main() -> anyhow::Result<()> {
     // Must run before any worker/runtime threads spawn: enables mimalloc's
     // abandoned-page purge on thread termination so RSS does not plateau on
@@ -2927,6 +2973,7 @@ fn main() -> anyhow::Result<()> {
     cloud_node_rust::memory_reclaim::configure_allocator();
     let cli = Cli::parse();
     Language::set_current(Language::detect());
+    raise_nofile_limit();
 
     match cli.command {
         None => {
@@ -3377,49 +3424,6 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     init_logging(&node_paths);
 
     info!("Starting CloudNode Rust v{}...", env!("CARGO_PKG_VERSION"));
-
-    #[cfg(target_family = "unix")]
-    {
-        unsafe {
-            let mut rlim = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-                let target = 1048576;
-                let old_cur = rlim.rlim_cur;
-
-                if rlim.rlim_max < target {
-                    rlim.rlim_max = target;
-                }
-                if rlim.rlim_cur < target {
-                    rlim.rlim_cur = target;
-                }
-
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
-                    if old_cur < target {
-                        info!(
-                            "Successfully raised RLIMIT_NOFILE (file descriptor limit) from {} to {}",
-                            old_cur, target
-                        );
-                    } else {
-                        info!(
-                            "RLIMIT_NOFILE (file descriptor limit) is already {} (>= {})",
-                            old_cur, target
-                        );
-                    }
-                } else {
-                    let err = std::io::Error::last_os_error();
-                    warn!(
-                        "Failed to raise RLIMIT_NOFILE to {}. Current limit: cur={}, max={}. Error: {}. (You may need 'ulimit -n 1048576' or root privileges)",
-                        target, rlim.rlim_cur, rlim.rlim_max, err
-                    );
-                }
-            } else {
-                warn!("Failed to get RLIMIT_NOFILE");
-            }
-        }
-    }
 
     // Create the runtime to spawn background tasks
     let rt = tokio::runtime::Builder::new_multi_thread()

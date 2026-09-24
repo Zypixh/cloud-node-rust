@@ -84,6 +84,10 @@ pub struct GovernorSnapshot {
     pub fd_used: u64,
     pub fd_used_pct: u64,
     pub fd_pressure_level: MemoryPressureLevel,
+    /// Fd-gated classes clamped below their nominal floor by
+    /// RLIMIT_NOFILE — decode with `fd_clamped_class_names`. Nonzero is a
+    /// deployment defect (raise nofile), not load.
+    pub fd_clamped_mask: u64,
     pub http_fd_budget: u64,
     pub tcp_fd_budget: u64,
     pub udp_fd_budget: u64,
@@ -764,6 +768,14 @@ struct GovernorLimits {
     /// shared account instead of sitting checked out.
     ticket_float_bytes: u64,
     ticket_float_cap_bytes: u64,
+    /// Bitmask (1 << class_index) of fd-gated admission classes whose
+    /// materialized limit sits below the nominal floor — only the fd
+    /// budget can push below the floor (memory/cpu clamp *to* it), so a
+    /// set bit names a live fd starvation squeeze (e.g. nofile left at
+    /// 1024). Recomputed on every limits rebuild so status surfaces show
+    /// the current squeeze including recovery, unlike the once-per-class
+    /// warn.
+    fd_clamped_mask: u64,
 }
 
 pub struct MemoryGovernor {
@@ -1319,6 +1331,9 @@ impl MemoryGovernor {
                 memory_pressure_level: MemoryPressureLevel::Critical,
                 ticket_float_bytes: 0,
                 ticket_float_cap_bytes: 0,
+                // All-zero limits clamp every fd-gated class below its
+                // floor — the mask mirrors the same fail-closed posture.
+                fd_clamped_mask: fd_clamped_mask(&[0; N_ADMISSION_CLASSES]),
             }),
             #[cfg(test)]
             fd_count_reads: AtomicU64::new(0),
@@ -1414,7 +1429,7 @@ impl MemoryGovernor {
     /// fail-closed.
     fn account_grantable_bytes(&self) -> u64 {
         let headroom = match self.cached_account_headroom_bytes.load(Ordering::Relaxed) {
-            u64::MAX => return 0,
+            u64::MAX => self.unobservable_account_bound(),
             value => value,
         };
         let outstanding = self
@@ -1480,10 +1495,28 @@ impl MemoryGovernor {
     /// headroom − margin, without re-adding the counters being raced on.
     fn account_grantable_from_outstanding(&self) -> u64 {
         let headroom = match self.cached_account_headroom_bytes.load(Ordering::Relaxed) {
-            u64::MAX => return 0,
+            u64::MAX => self.unobservable_account_bound(),
             value => value,
         };
         headroom.saturating_sub(self.account_safety_margin_bytes())
+    }
+
+    /// Bounded grantable pool for a landed-but-blind memory observation:
+    /// `headroom == u64::MAX` with generation > 0 means snapshots are
+    /// publishing but memory stayed unobservable (`Unknown`). A zero
+    /// grantable there would refuse every admission while class
+    /// ceilings still admit on the documented cpu fallback — the gates
+    /// contradict and the node wedges. The honest bound is what
+    /// admission policy itself can charge: the aggregate materialized
+    /// ceiling. Before the first snapshot (generation 0) the account
+    /// keeps its deliberate fail-closed posture and returns 0.
+    fn unobservable_account_bound(&self) -> u64 {
+        let observed_but_unknown = self.cached_generation.load(Ordering::Acquire) != 0
+            && self.cached_memory_availability.load(Ordering::Relaxed) == 0;
+        if !observed_but_unknown {
+            return 0;
+        }
+        admission_capacity_bytes(&self.limits().class_limit, class_estimated_bytes)
     }
 
     /// Grant `bytes` against the shared account. The returned credential
@@ -1933,6 +1966,21 @@ impl MemoryGovernor {
 
     pub fn limit_for(&self, class: AdmissionClass) -> usize {
         self.limit_for_in(class, &self.memory_snapshot())
+    }
+
+    /// Live fd-starvation mask from the materialized limits table —
+    /// nonzero bits name fd-gated classes squeezed below their nominal
+    /// floor by RLIMIT_NOFILE. Read via `limits()` so the mask always
+    /// reflects the table admission checks actually use.
+    pub fn fd_clamped_mask(&self) -> u64 {
+        self.limits().fd_clamped_mask
+    }
+
+    /// RLIMIT_NOFILE the materialized limits were derived from — pairs
+    /// with `fd_clamped_mask` so status can show both the squeeze and its
+    /// source without a fresh `getrlimit`.
+    pub fn fd_soft_limit(&self) -> u64 {
+        self.limits().fd_soft_limit
     }
 
     /// `limit_for` against a caller-supplied snapshot so hot paths can fetch
@@ -2790,6 +2838,7 @@ impl MemoryGovernor {
             fd_used: fd_snapshot.used,
             fd_used_pct: fd_snapshot.used_pct,
             fd_pressure_level: fd_snapshot.pressure_level,
+            fd_clamped_mask: self.limits().fd_clamped_mask,
             http_fd_budget: fd_budget(&mem, HTTP_FD_BUDGET_PCT),
             tcp_fd_budget: fd_budget(&mem, TCP_FD_BUDGET_PCT),
             udp_fd_budget: fd_budget(&mem, UDP_FD_BUDGET_PCT),
@@ -2983,7 +3032,21 @@ impl MemoryGovernor {
         self.cached_limits.store(std::sync::Arc::new(GovernorLimits {
             generation,
             class_limit,
-            shared_connection_budget_bytes: shared_connection_admission_budget(&snapshot),
+            // A landed-but-blind observation (availability Unknown and
+            // no headroom reading at all) collapses the derived byte
+            // budget toward ~1B and would refuse every charged admission
+            // while class ceilings still admit on the cpu fallback.
+            // Bound the aggregate by what the materialized ceilings can
+            // charge — bounded by policy, never a phantom physical bound.
+            shared_connection_budget_bytes: if matches!(
+                snapshot.availability,
+                MemoryAvailability::Unknown
+            ) && snapshot.account_headroom_bytes.is_none()
+            {
+                admission_capacity_bytes(&class_limit, shared_connection_charge_bytes)
+            } else {
+                shared_connection_admission_budget(&snapshot)
+            },
             cache_read_memory_budget_bytes: cache_read_memory_budget_bytes(&snapshot),
             cache_read_memory_object_limit_bytes: cache_read_memory_object_limit_bytes(
                 &snapshot,
@@ -3000,6 +3063,7 @@ impl MemoryGovernor {
             ticket_float_cap_bytes: ticket_float_cap_bytes_for(
                 memory_pressure_level(&snapshot),
             ),
+            fd_clamped_mask: fd_clamped_mask(&class_limit),
         }));
         self.cached_limits.load()
     }
@@ -4738,6 +4802,56 @@ fn runtime_limit(
     target.clamp(1, max_limit)
 }
 
+/// Aggregate byte ceiling the materialized class ceilings can charge —
+/// the bounded fallback for shared ledgers when memory observation is
+/// unavailable (`availability == Unknown`). With no trustworthy physical
+/// bound, the honest bound is what admission policy itself admits; the
+/// `charge` selector matches the caller's accounting unit (the shared
+/// connection ledger vs the shared account charge different per-class
+/// bytes).
+fn admission_capacity_bytes(
+    class_limit: &[u64; N_ADMISSION_CLASSES],
+    charge: fn(AdmissionClass) -> u64,
+) -> u64 {
+    ALL_ADMISSION_CLASSES
+        .iter()
+        .map(|class| class_limit[class_index(*class)].saturating_mul(charge(*class)))
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Fd-gated classes and their nominal floors. The fd budget gate in
+/// `runtime_limit` is the only path that can pull an effective limit
+/// below the floor (memory/cpu targets clamp *to* it), so a below-floor
+/// materialized limit is exactly "this class is starved by RLIMIT_NOFILE".
+fn fd_clamped_mask(class_limit: &[u64; N_ADMISSION_CLASSES]) -> u64 {
+    const FD_GATED: &[(AdmissionClass, usize)] = &[
+        (AdmissionClass::HttpConnection, MIN_HTTP_CONNECTION_LIMIT),
+        (AdmissionClass::TcpConnection, MIN_TCP_CONNECTION_LIMIT),
+        (AdmissionClass::UdpSession, MIN_UDP_SESSION_LIMIT),
+        (AdmissionClass::OriginConnect, MIN_ORIGIN_CONNECT_LIMIT),
+        (AdmissionClass::SniRelay, MIN_TCP_CONNECTION_LIMIT),
+    ];
+    let mut mask = 0u64;
+    for (class, floor) in FD_GATED {
+        if class_limit[class_index(*class)] < *floor as u64 {
+            mask |= 1u64 << class_index(*class) as u64;
+        }
+    }
+    mask
+}
+
+/// Comma-joined class names for the clamped mask — the status/log decode
+/// so a wedged deployment reads "HttpConnection,TcpConnection" instead of
+/// a raw bitmask.
+pub fn fd_clamped_class_names(mask: u64) -> String {
+    ALL_ADMISSION_CLASSES
+        .iter()
+        .filter(|class| mask & (1u64 << class_index(**class) as u64) != 0)
+        .map(|class| format!("{class:?}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 static FD_CLAMPED_LIMIT_WARNED: AtomicU64 = AtomicU64::new(0);
 
 fn warn_fd_clamped_limit_once(
@@ -6471,6 +6585,52 @@ mod en16_pool_tests {
             "no observation → no grant"
         );
         assert_eq!(governor.account_view().rejects_total, 1);
+    }
+
+    /// A landed-but-blind observation (snapshots publish, availability
+    /// stays Unknown, no headroom reading) must not wedge the node: the
+    /// shared ledger and account fall back to the aggregate materialized
+    /// admission ceiling — bounded by policy — instead of a phantom ~1B
+    /// physical bound that refuses every healthy connection while class
+    /// ceilings still admit on the cpu fallback.
+    #[test]
+    fn blind_observation_admits_within_policy_ceilings() {
+        let governor = MemoryGovernor::new();
+        // Publish a blind snapshot directly: generation advances,
+        // availability stays Unknown (0), headroom stays unobserved
+        // (u64::MAX). cpu_parallelism drives the class-ceiling fallback.
+        governor
+            .cached_cpu_parallelism
+            .store(4, Ordering::Release);
+        governor.cached_at_millis.store(
+            crate::utils::time::system_timestamp_millis().max(0) as u64,
+            Ordering::Release,
+        );
+        governor.cached_generation.store(1, Ordering::Release);
+
+        let permit = governor
+            .try_admit(AdmissionClass::HttpConnection)
+            .expect("blind observation must not refuse a healthy connection");
+        assert!(governor.account_view().grantable_bytes > 0);
+        assert_eq!(governor.admission_reject_snapshot().http_connection, 0);
+        drop(permit);
+        assert_eq!(
+            governor
+                .counter(AdmissionClass::HttpConnection)
+                .load(Ordering::Acquire),
+            0,
+            "permit drop releases the class counter"
+        );
+
+        // Still bounded: the fallback pool is the aggregate ceiling, so
+        // a grant beyond it is refused rather than unlimited.
+        let bound = governor.account_view().grantable_bytes;
+        assert!(
+            governor
+                .try_grant_shared(SharedGrantPurpose::KernelBpf, bound + 1)
+                .is_none(),
+            "fallback pool is finite — oversize grants still refuse"
+        );
     }
 
     /// Pending grants deduct capacity immediately; dropping an
