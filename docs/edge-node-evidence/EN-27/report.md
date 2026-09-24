@@ -17,6 +17,11 @@ Base: `9dd1508`（EN-26 EdgeCC 法则重写 + memgov 空闲降频）。
 | 内存治理 | 干净关闭路径账目归零；CLOSE-WAIT 僵尸各持 1MB charge 且不收割 |
 | 丢包 | edgecc 干净路径 4× 快于 bbr3；5% 均匀丢包打平；≥20% 两者都崩 |
 
+**修复后回归（§8）**：CLOSE-WAIT 收割+自旋已修（僵尸后 afxdp 线程 0% CPU）；
+SIGTERM→detach 真机通过；突发 300/400conn/s 拨号全 200 零 502；
+nofile 全入口 1M + fd 钳制状态可见；blind 内存观测不再误拒；
+kernel BBR 对照臂修复后完成同口径矩阵——edgecc 干净/低损/时变丢包均占优。
+
 ---
 
 ## 1. 干净基线：真实 XDP 请求处理
@@ -126,21 +131,83 @@ idle-timeout 兜底也不触发（与 T9 ledger-stall 僵尸同形）。
 读法：edgecc 干净/低损路径显著占优（短 RTT 快启动收益），≥20% 独立随机丢包下
 任何无 FEC 的单流都会坍缩，两者都不具生产意义——该区间属于多路径/FEC 领域。
 
-## 7. 待修复清单（按严重度）
+## 7. 待修复清单（按严重度）— 修复后状态
 
-1. **CLOSE-WAIT 僵尸 + reactor 10µs 自旋**：对端 FIN 后 `session.closing` 应置位
-   （或 reapable 直接覆盖 CLOSE-WAIT+无进度），僵尸会话收割时限应与
-   FIN-WAIT-2 一致走 60s closing 期限；同时 `last_activity` 不应被本端
-   重传刷新到让 idle-timeout 失效。
-2. **部署缺省 nofile=1024**：systemd 单元/安装脚本需 `LimitNOFILE>=64k`；
-   fd 钳制告警应进 ready/status 可见面（当前只在 info 日志一次性告警）。
-3. **单队列热点**：单源 IP 全部流挤一个 reactor——限流/拨号/握手都在该核上排队。
-   virtio 无 RSS 配置面，缓解路径：dial 会话分布到多个队列、或网关侧多源 IP。
-4. **突发连接速率 ~200/s 时拨号 4s deadline 不足**：慢爬坡 3000/3000 全通，
-   说明是流水线吞吐瓶颈而非容量瓶颈；考虑拨号 deadline 随队列深度自适应
-   或 pre-proxy→dial 的优先级隔离。
+1. ~~**CLOSE-WAIT 僵尸 + reactor 10µs 自旋**~~ **已修**（`a007da1` + `f244bb0`）：
+   peer-EOF 时间戳跟踪，静默 15s 收割、closing 绝对 60s 期限；
+   smoltcp-edge 消费无法发射的 TLP 探针（零窗无尾记录时不再永远 `Now`）。
+   真机回归见 §8.1。
+2. ~~**部署缺省 nofile=1024**~~ **已修**（`d5a4a42`）：
+   `raise_nofile_limit()` 提到 `main()` 全入口（含 `xdp proxy-smoke`）；
+   `fd_clamped_mask` 进 `GovernorSnapshot`→`fdClamped`/`fdSoftLimit` 状态面。
+   真机回归见 §8.2。
+3. **单队列热点**：**平台限制**，virtio `receive-hashing: off [fixed]` 无配置面，
+   XSKMAP 不可跨队列 redirect——非软件 bug，维持网关侧多源 IP 缓解建议。
+4. ~~**突发 ~200conn/s 拨号 4s deadline 饥饿**~~ **已修**（`a007da1`）：
+   deadline 绑定会话走独立 hot 队列先 pump（总预算不扩）。真机回归见 §8.3。
+5. **新增：内存治理 blind 观测误拒** **已修**（`d5a4a42`）：观测已落地但
+   availability=Unknown 且无账户 headroom 时，共享账本/账户回退到
+   物化类上限聚合容量（有界），启动前仍 fail-closed。
+6. **新增：kernel 对照臂 502** **已修**（`f244bb0`）：`xdp.enabled=true` 使
+   `upstream_mode()` 短路为 afxdp，上游拨号全走进未武装的 AF_XDP registry。
+   kernel 臂现在把 runtime 的 `xdp.enabled` 置 false。
 
-## 8. 复现脚本（均在测试机保留）
+## 8. 修复后回归验证（真机）
+
+### 8.1 CLOSE-WAIT 僵尸 + 自旋
+
+注入 ~187 个僵尸形态会话（客户端收部分数据后 `shutdown` + iptables DROP
+模拟静默对端），持续观测：
+
+```
+修复前: afxdp-ens17-3 101-102% 永久，~2kHz epoll+poll 空转，会话永不收割
+修复后: 收割期限内会话排空，afxdp 线程瞬时 CPU=0.0%
+        RSS 537MB → 517MB 回落，无残留 charge
+```
+
+SIGTERM 生命周期（旧 bug 真机复现过：stop 后 prog id 856 仍挂 ens17）：
+
+```
+修复后: systemctl stop → XDP_DETACHED, pinned link 删除, 服务干净退出
+        新 attach 自动回收上一代残留 pinned link（id 856→877）
+```
+
+### 8.2 nofile 全入口 + fd 状态面
+
+```
+修复前: xdp proxy-smoke 路径 Max open files=1024 → HTTP 上限 179
+修复后: 运行中进程 /proc/<pid>/limits Max open files=1048576
+        3000 conn/s 慢爬坡 3000/3000 全通（§2 已验证）
+```
+
+### 8.3 突发连接拨号饥饿（502 复现路径）
+
+同形状回归（修复前 3000@~200conn/s：1835 ok / **1015×502** / 150 SYN 超时）：
+
+| 突发速率 | 请求数 | 修复后结果 |
+|---|---|---|
+| ~300 conn/s | 3000 | **3000×200**，p50=23ms p99=49ms，零 502 |
+| ~400 conn/s | 4000 | **4000×200**，p99=48ms，零 502 |
+
+### 8.4 kernel BBR 对照臂（同口径 netem 矩阵，单流 4MB +40ms）
+
+kernel 臂修复后（`xdp.enabled=false` → 上游拨号走内核 TCP，
+`.90` `net.ipv4.tcp_congestion_control=bbr`）：
+
+| 模型 | edgecc (AF_XDP) | kernel BBR |
+|---|---|---|
+| 基线 | **4.9s / 852KB/s** | 6.5–12.3s / 342–645KB/s |
+| uniform 5% | **~82KB/s** | 62–76KB/s（55–68s） |
+| uniform 20% | 8.7KB/s 超时 | 3–6KB/s 超时 |
+| GE burst ~20% | 4.6–15KB/s 超时 | 15–28KB/s 超时 |
+| normal N(20,10)/10s | **42.6s 完成 + 1 fail** | 4.6–10.5KB/s 超时 |
+
+kernel 臂负载：11–13% CPU，RSS 446MB。读法与 §6 一致：干净/低损/时变
+丢包 edgecc 占优（BBR 基线慢 ~2×，normal 时变下 BBR 三次全超时而
+edgecc 有完成样本）；≥20% 独立/突发丢包两者都坍缩（GE 单元 BBR 略高
+但同处不可用区间）。该区间属 FEC/多路径领域。
+
+## 9. 复现脚本（均在测试机保留）
 
 - `.120`: `/root/netem2.sh`（uniform/gemodel/normal）、`/root/ws_echo.py`、
   `/root/ws_load.py`（RAMP_S 环境变量控制爬坡）、`/root/fast_origin.py`
