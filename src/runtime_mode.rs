@@ -146,9 +146,11 @@ pub struct XdpInterfaceConfig {
     /// overrides are meaningless without local-IP filtering.
     #[serde(rename = "protectedServices", default)]
     pub protected_services: Vec<XdpProtectedService>,
-    /// AF_XDP socket bind mode (EN-12): "auto" (default) probes zero-copy and
-    /// falls back to copy explicitly when the driver rejects it; "copy" never
-    /// attempts zero-copy; "zero-copy" fails queue setup if unsupported.
+    /// AF_XDP socket bind mode (EN-12): "auto" (default) probes zero-copy
+    /// then the driver's copy path; "zero-copy" requires the driver to
+    /// advertise ZEROCOPY; "copy" binds copy mode directly AND bypasses the
+    /// driver-native-XSK gate — an explicit diagnostic/test override that can
+    /// land on the kernel-emulated generic path on driver-less NICs.
     #[serde(rename = "xskMode", default)]
     pub xsk_mode: XdpXskMode,
 }
@@ -164,9 +166,13 @@ pub enum XdpFragmentAction {
     Drop,
 }
 
-/// AF_XDP bind-mode policy (EN-12). `Auto` probes zero-copy at bind time and
-/// falls back to copy mode with an explicit status record — the landed mode
-/// is reported per queue so operators can see what the NIC actually granted.
+/// AF_XDP bind-mode policy. `Auto` and `ZeroCopy` bind XDP_ZEROCOPY only —
+/// the dataplane runs exclusively on driver-managed zero-copy and anything
+/// else (copy-only drivers like virtio_net < 6.13, or the kernel-emulated
+/// generic path) keeps traffic on the kernel stack. The bind is additionally
+/// gated on `xsk_driver_zerocopy_floor` so unsupported driver/kernel pairs
+/// are refused before bind. `Copy` skips the gate as an explicit
+/// diagnostic/test override (veth, netns).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum XdpXskMode {
@@ -183,6 +189,46 @@ impl XdpXskMode {
             Self::Copy => "copy",
             Self::ZeroCopy => "zero-copy",
         }
+    }
+}
+
+/// Kernel version floor at which a NIC driver gained native AF_XDP (XSK)
+/// support — driver-managed xsk pool ops, for zero-copy OR driver copy
+/// mode. Below the floor (or for a driver absent from this table) an XSK
+/// bind could only land on the kernel-emulated generic path, which is not
+/// a supported dataplane (its skb TX path saturated under production SNI
+/// load on Debian 6.1 + virtio_net). Mirrors
+/// `xdp_driver_native_xsk_floor` in `scripts/install-rust-cloud-node.sh`;
+/// keep both in sync.
+///
+/// virtio_net gained driver XSK in 6.11 (copy); ena in 5.16, gve in 6.2;
+/// the big server NICs shipped it around the 5.4 floor.
+pub fn xsk_driver_native_floor(driver: &str) -> Option<(u32, u32)> {
+    match driver {
+        "virtio_net" => Some((6, 11)),
+        "ena" => Some((5, 16)),
+        "gve" => Some((6, 2)),
+        "i40e" | "ice" | "ixgbe" | "ixgbevf" | "iavf" | "mlx4_en" | "mlx5_core"
+        | "bnxt_en" | "qede" | "sfc" | "sfc_ef100" | "nfp" | "nfp_netvf"
+        | "mvneta" | "mvpp2" | "stmmac" | "enetc" | "atlantic" | "axgbe" | "amd-xgbe"
+        | "bcmgenet" | "cpsw" | "am65-cpsw" | "fec" | "dpaa2-eth" | "xilinx_axienet"
+        | "netdevsim" => Some((5, 4)),
+        _ => None,
+    }
+}
+
+/// Kernel version floor at which a NIC driver advertises
+/// NETDEV_XDP_ACT_XSK_ZEROCOPY — used for capability DISPLAY and upgrade
+/// planning, not for gating: `auto` binds zero-copy first and falls back
+/// to the driver's copy path. virtio_net advertises the flag from 6.13
+/// (RX merged in 6.11, flag + TX/wakeup in 6.13) — and still needs the
+/// hypervisor to negotiate VIRTIO_F_ACCESS_PLATFORM, so the runtime bind
+/// is always the authoritative verdict. Mirrors
+/// `xdp_driver_zerocopy_floor` in `scripts/install-rust-cloud-node.sh`.
+pub fn xsk_driver_zerocopy_floor(driver: &str) -> Option<(u32, u32)> {
+    match driver {
+        "virtio_net" => Some((6, 13)),
+        _ => xsk_driver_native_floor(driver),
     }
 }
 

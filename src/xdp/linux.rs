@@ -1,6 +1,7 @@
 use super::*;
 use crate::runtime_mode::{
-    XdpAttachMode, XdpInterfaceConfig, XdpRuntimeMode, XdpStateTables,
+    XdpAttachMode, XdpInterfaceConfig, XdpRuntimeMode, XdpStateTables, XdpXskMode,
+    xsk_driver_native_floor,
 };
 use aya::maps::lpm_trie::Key as LpmKey;
 use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, PerCpuArray, XskMap};
@@ -35,7 +36,15 @@ const AF_XDP_RX_BATCH: usize = 64;
 /// and collapsed peer congestion windows). Spill-over goes to the bridge's
 /// bounded defer queue where CoDel applies real AQM backpressure instead
 /// of unobserved queueing.
-const AF_XDP_TX_INFLIGHT_CAP: usize = 256;
+///
+/// Sized for the measured completion cadence: on virtio_net copy mode the
+/// TX completion path (skb destruct → NAPI reclaim) runs ~16ms behind, so
+/// 256 in-flight capped egress near ~200Mbps and the defer queue shed TCP
+/// frames under ordinary speedtest load — every shed frame is a TCP loss.
+/// 768 buys ~3x headroom (~45ms worst-case queueing at that drain rate,
+/// still far below RTO) while staying well under the 2048 ring and the
+/// UMEM frame pool.
+const AF_XDP_TX_INFLIGHT_CAP: usize = 768;
 const AF_XDP_MAX_SOCKETS: usize = 4096;
 const AF_XDP_SOCKET_CREATE_ATTEMPTS: usize = 80;
 const AF_XDP_SOCKET_CREATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
@@ -389,6 +398,16 @@ pub(crate) struct AfXdpQueueHandle {
     /// TX wakeup syscalls that returned a real error (benign transient
     /// errnos are filtered inside the wakeup itself).
     tx_kick_errors: u64,
+    /// Cumulative TX completions drained from the completion queue —
+    /// distinguishes "kernel never returns completions" from
+    /// "completions arrive but lag behind produces" in wedge diagnosis.
+    tx_completed_total: u64,
+    /// Debug wire dump — `CLOUD_NODE_XDP_PCAP=<path>` writes every
+    /// RX/TX frame to `<path>.q<N>` in pcap (DLT_EN10MB) so AF_XDP
+    /// traffic can be inspected even though dev_direct_xmit and XDP
+    /// redirect are both invisible to packet taps (tcpdump sees
+    /// nothing on this dataplane).
+    pcap: Option<std::io::BufWriter<std::fs::File>>,
 }
 
 impl AfXdpQueueHandle {
@@ -425,6 +444,9 @@ impl AfXdpQueueHandle {
                 stats.parsed += 1;
             } else {
                 stats.parse_errors += 1;
+            }
+            if let Some(w) = self.pcap.as_mut() {
+                Self::pcap_write(w, frame);
             }
             on_packet(&self.interface, self.queue, frame.to_vec());
         }
@@ -487,6 +509,7 @@ impl AfXdpQueueHandle {
         self.free_frames
             .extend_from_slice(&self.tx_completion_batch[..completed]);
         self.tx_inflight = self.tx_inflight.saturating_sub(completed);
+        self.tx_completed_total = self.tx_completed_total.saturating_add(completed as u64);
         completed
     }
 
@@ -543,6 +566,34 @@ impl AfXdpQueueHandle {
         self.tx_inflight
     }
 
+    /// Free UMEM frames available to the TX path — distinguishes
+    /// allocator starvation from ring backpressure in diagnostics.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn free_frames_len(&self) -> usize {
+        self.free_frames.len()
+    }
+
+    /// Kernel-side XSK statistics (XDP_STATISTICS getsockopt) —
+    /// `tx_ring_empty_descs` counts the times the kernel drained the TX
+    /// ring in `xsk_generic_xmit`; `tx_invalid_descs` counts descriptors
+    /// the kernel rejected. During a TX wedge these tell whether the
+    /// kernel consumed the produced descriptors (completions then lost
+    /// on the CQ path) or never entered the consume loop.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn xdp_stats(&self) -> Option<(u64, u64, u64)> {
+        self.tx
+            .fd()
+            .xdp_statistics()
+            .ok()
+            .map(|s| {
+                (
+                    s.tx_ring_empty_descs(),
+                    s.tx_invalid_descs(),
+                    self.tx_completed_total,
+                )
+            })
+    }
+
     fn submit_raw_frame(&mut self, mut desc: FrameDesc, frame: &[u8]) -> anyhow::Result<bool> {
         desc.set_options(0);
         {
@@ -562,6 +613,9 @@ impl AfXdpQueueHandle {
         match unsafe { self.tx.produce_one(&desc) } {
             1 => {
                 self.tx_inflight += 1;
+                if let Some(w) = self.pcap.as_mut() {
+                    Self::pcap_write(w, frame);
+                }
                 // The driver kick is deferred to `flush_tx_kick` (one
                 // sendto per loop round): the producer flag does not
                 // reliably reflect a stalled TX ring on virtio_net, so
@@ -578,13 +632,52 @@ impl AfXdpQueueHandle {
         }
     }
 
-    /// Kick the kernel TX path once if this round produced any frames.
-    /// The socket was bound with XDP_USE_NEED_WAKEUP, so the kick is a
-    /// `sendto(MSG_DONTWAIT)` that schedules the driver's TX processing;
-    /// calling it unconditionally keeps TX latency bounded on drivers
-    /// whose `needs_wakeup` flag does not track a stranded ring.
+    /// Append one frame to the debug pcap (see the `pcap` field).
+    fn pcap_write(w: &mut std::io::BufWriter<std::fs::File>, frame: &[u8]) {
+        use std::io::Write;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let len = frame.len().min(u16::MAX as usize) as u32;
+        let _ = w.write_all(&(now.as_secs() as u32).to_le_bytes());
+        let _ = w.write_all(&(now.subsec_micros()).to_le_bytes());
+        let _ = w.write_all(&len.to_le_bytes());
+        let _ = w.write_all(&len.to_le_bytes());
+        let _ = w.write_all(&frame[..len as usize]);
+        let _ = w.flush();
+    }
+
+    /// Open `<path>.q<queue>` with the pcap global header. Returns None
+    /// when the env var is unset or the file cannot be created — dump is
+    /// strictly optional diagnostics.
+    fn pcap_open(queue: u32) -> Option<std::io::BufWriter<std::fs::File>> {
+        use std::io::Write;
+        let base = std::env::var("CLOUD_NODE_XDP_PCAP").ok()?;
+        let mut w = std::io::BufWriter::new(
+            std::fs::File::create(format!("{base}.q{queue}")).ok()?,
+        );
+        // magic(LE) ver 2.4, snaplen 65535, linktype EN10MB
+        let hdr: [u8; 24] = [
+            0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0,
+            0, 0,
+        ];
+        w.write_all(&hdr).ok()?;
+        Some(w)
+    }
+
+    /// Kick the kernel TX path whenever it may hold produced descriptors:
+    /// a successful produce set `tx_kick_pending`, or earlier descriptors
+    /// are still in flight. The socket was bound with XDP_USE_NEED_WAKEUP,
+    /// so the kick is a `sendto(MSG_DONTWAIT)` that schedules TX
+    /// processing. Gating the kick on a produce this round is a deadlock
+    /// in generic (XDP_SKB) mode — the kernel drains the TX ring only
+    /// inside sendto/poll syscalls there, so a round whose sends are all
+    /// refused by the in-flight cap or a full ring never kicks, the ring
+    /// never drains, and every later send fails the same way (observed on
+    /// Debian 12 kernel 6.1 + virtio_net: TX wedged permanently with zero
+    /// sendto syscalls while egress backpressure shed all traffic).
     pub(crate) fn flush_tx_kick(&mut self) {
-        if !self.tx_kick_pending {
+        if !self.tx_kick_pending && self.tx_inflight == 0 {
             return;
         }
         self.tx_kick_pending = false;
@@ -669,6 +762,23 @@ pub fn prepare_af_xdp_sockets(config: &XdpConfig) -> anyhow::Result<AfXdpRuntime
         .iter()
         .filter(|interface| interface.mode == XdpRuntimeMode::Proxy)
     {
+        // Fail closed before any socket exists: without driver-native XSK
+        // the kernel silently lands the bind on the emulated generic path —
+        // the dataplane that saturated under production SNI load on Debian
+        // 6.1 + virtio_net. The refusal is recorded per queue so `xdp
+        // status` shows exactly why this interface carries no sockets.
+        if let Err(gate_err) = af_xdp_driver_gate(interface) {
+            for queue in &interface.queues {
+                statuses.push(XdpQueueStatus {
+                    interface: interface.name.clone(),
+                    queue: *queue,
+                    configured: true,
+                    detail: format!("AF_XDP socket setup refused: {gate_err}"),
+                    ..XdpQueueStatus::default()
+                });
+            }
+            continue;
+        }
         for queue in &interface.queues {
             match create_af_xdp_queue_with_retry(interface, *queue) {
                 Ok((handle, status)) => {
@@ -769,6 +879,83 @@ pub fn register_af_xdp_sockets(
     Ok(())
 }
 
+/// AF_XDP bind attempts for a configured `xskMode`. `auto` probes
+/// zero-copy first and falls back to the driver's copy path — both are
+/// driver-managed XSK, so a host whose hypervisor blocks zero-copy
+/// (virtio_net without VIRTIO_F_ACCESS_PLATFORM, or any driver below its
+/// zc floor) still gets a working dataplane. `copy` pins the copy path
+/// explicitly (test environments without driver XSK — veth, netns —
+/// bypass `af_xdp_driver_gate` only via this mode). The landed mode is
+/// recorded in queue status.
+pub(crate) fn xsk_bind_attempts(mode: XdpXskMode) -> &'static [(&'static str, BindFlags)] {
+    const ZERO_COPY_FLAGS: BindFlags = BindFlags::from_bits_retain(
+        BindFlags::XDP_USE_NEED_WAKEUP.bits() | BindFlags::XDP_ZEROCOPY.bits(),
+    );
+    const COPY_FLAGS: BindFlags = BindFlags::from_bits_retain(
+        BindFlags::XDP_USE_NEED_WAKEUP.bits() | BindFlags::XDP_COPY.bits(),
+    );
+    const ZERO_COPY: &[(&str, BindFlags)] = &[("zero-copy", ZERO_COPY_FLAGS)];
+    const COPY: &[(&str, BindFlags)] = &[("copy", COPY_FLAGS)];
+    const AUTO: &[(&str, BindFlags)] =
+        &[("zero-copy", ZERO_COPY_FLAGS), ("copy", COPY_FLAGS)];
+    match mode {
+        XdpXskMode::Auto => AUTO,
+        XdpXskMode::Copy => COPY,
+        XdpXskMode::ZeroCopy => ZERO_COPY,
+    }
+}
+
+/// Driver/kernel support gate for the AF_XDP dataplane. Binds are only
+/// meaningful when the NIC driver implements native XSK (xsk pool ops and
+/// wakeup): below the per-driver floor a bind could only land on the
+/// kernel-emulated generic path, whose skb TX path is not a supported
+/// dataplane. `xskMode: copy` is the explicit escape hatch for test
+/// environments whose virtual NICs have no driver XSK (veth, netns
+/// smoke) — it bypasses this gate.
+///
+/// Returns Err with the refusal reason; the caller surfaces it per queue.
+fn af_xdp_driver_gate(interface: &XdpInterfaceConfig) -> anyhow::Result<()> {
+    if interface.xsk_mode == XdpXskMode::Copy {
+        return Ok(());
+    }
+    let driver = std::fs::read_link(format!("/sys/class/net/{}/device/driver", interface.name))
+        .ok()
+        .and_then(|target| {
+            target
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+    let kver = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut parts = kver.split('.');
+    let major: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts
+        .next()
+        .and_then(|v| v.split(['-', '+']).next().and_then(|v| v.parse().ok()))
+        .unwrap_or(0);
+    let Some(driver) = driver else {
+        anyhow::bail!(
+            "interface {} has no NIC driver (virtual interface?); AF_XDP needs driver-managed XSK (zero-copy or copy) — the generic kernel path is not a supported dataplane",
+            interface.name
+        );
+    };
+    let Some((floor_maj, floor_min)) = xsk_driver_native_floor(&driver) else {
+        anyhow::bail!(
+            "interface {iface} driver '{driver}' has no known native XSK support on kernel {kver}; the generic kernel path is not a supported dataplane — disable xdp.enabled or use a supported NIC/driver",
+            iface = interface.name,
+        );
+    };
+    if (major, minor) < (floor_maj, floor_min) {
+        anyhow::bail!(
+            "interface {iface} driver '{driver}' needs kernel >= {floor_maj}.{floor_min} for native XSK (have {kver}); the generic kernel path is not a supported dataplane — upgrade the kernel or disable xdp.enabled",
+            iface = interface.name,
+        );
+    }
+    Ok(())
+}
+
 fn create_af_xdp_queue(
     interface: &crate::runtime_mode::XdpInterfaceConfig,
     queue: u32,
@@ -779,7 +966,13 @@ fn create_af_xdp_queue(
     umem_config
         .frame_size(frame_size)
         .fill_queue_size(ring_size)
-        .comp_queue_size(ring_size);
+        .comp_queue_size(ring_size)
+        // virtio_net zero-copy refuses the bind with EINVAL when the UMEM
+        // headroom is smaller than its virtnet header (vi->hdr_len = 12
+        // for mrg_rxbuf). Reserve a little extra for alignment; the TX
+        // path writes only the data segment, so the reserved bytes cost
+        // nothing on send.
+        .frame_headroom(32);
     let umem_config = umem_config.build()?;
     let frame_count = NonZeroU32::new(AF_XDP_FRAME_COUNT)
         .ok_or_else(|| anyhow::anyhow!("AF_XDP frame count must be non-zero"))?;
@@ -807,26 +1000,13 @@ fn create_af_xdp_queue(
             anyhow::anyhow!(detail)
         })
     };
-    // EN-12 real bind-mode probing: `auto` asks the kernel for zero-copy and
-    // falls back to copy explicitly when the driver rejects it; the landed
-    // mode is recorded in queue status. `zero-copy` fails queue setup when
-    // unsupported — a configured hard requirement, not a silent downgrade.
-    use crate::runtime_mode::XdpXskMode;
+    // Real bind-mode probing: `auto` tries zero-copy first and falls back
+    // to the driver-managed copy path; the landed mode is recorded in
+    // queue status. `af_xdp_driver_gate` ran before this: a driver below
+    // the native-XSK floor never reaches bind, so a copy bind here is
+    // driver-managed, never the kernel-emulated generic path.
     let mut socket_probe = None;
-    let bind_attempts: &[(&str, BindFlags)] = match interface.xsk_mode {
-        XdpXskMode::Auto => &[
-            (
-                "zero-copy",
-                BindFlags::XDP_USE_NEED_WAKEUP | BindFlags::XDP_ZEROCOPY,
-            ),
-            ("copy", BindFlags::XDP_USE_NEED_WAKEUP | BindFlags::XDP_COPY),
-        ],
-        XdpXskMode::Copy => &[("copy", BindFlags::XDP_USE_NEED_WAKEUP | BindFlags::XDP_COPY)],
-        XdpXskMode::ZeroCopy => &[(
-            "zero-copy",
-            BindFlags::XDP_USE_NEED_WAKEUP | BindFlags::XDP_ZEROCOPY,
-        )],
-    };
+    let bind_attempts = xsk_bind_attempts(interface.xsk_mode);
     let mut last_bind_error: Option<(&str, anyhow::Error)> = None;
     let mut landed_mode = "";
     let mut socket_parts = None;
@@ -894,6 +1074,9 @@ fn create_af_xdp_queue(
         aqm_drops: 0,
         aqm_ce_marks: 0,
         tx_inflight: 0,
+        stale_dwells: 0,
+        steered_frames: 0,
+        steer_sheds: 0,
     };
     Ok((
         AfXdpQueueHandle {
@@ -911,6 +1094,8 @@ fn create_af_xdp_queue(
             tx_inflight: 0,
             tx_kick_pending: false,
             tx_kick_errors: 0,
+            tx_completed_total: 0,
+            pcap: AfXdpQueueHandle::pcap_open(queue),
         },
         status,
     ))

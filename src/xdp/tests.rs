@@ -1890,7 +1890,7 @@ fn af_xdp_tcp_reactor_resolves_egress_route_before_reaping_session() {
 
     assert!(egress
         .iter()
-        .any(|(egress_route, ip_packet)| *egress_route == route && *ip_packet == reply_packet));
+        .any(|(egress_route, ip_packet, _)| *egress_route == route && *ip_packet == reply_packet));
     assert_eq!(reactor.session_count(), 0);
 }
 
@@ -2488,6 +2488,49 @@ fn xdp_interface_xsk_mode_parses_and_defaults_to_auto() {
     let cfg: XdpInterfaceConfig = serde_json::from_str(r#"{"xskMode":"zero-copy"}"#).unwrap();
     assert_eq!(cfg.xsk_mode, XdpXskMode::ZeroCopy);
     assert!(serde_json::from_str::<XdpInterfaceConfig>(r#"{"xskMode":"bogus"}"#).is_err());
+}
+
+/// `auto` probes zero-copy then the driver's copy path — both attempts
+/// run after the driver-native gate passes, so a landed copy bind is the
+/// driver-managed path, never the kernel-emulated generic one.
+#[cfg(target_os = "linux")]
+#[test]
+fn xsk_bind_attempts_auto_probes_zero_copy_then_driver_copy() {
+    use crate::runtime_mode::XdpXskMode;
+    use xsk_rs::config::BindFlags;
+    let attempts = super::linux::xsk_bind_attempts(XdpXskMode::Auto);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].0, "zero-copy");
+    assert!(attempts[0].1.contains(BindFlags::XDP_ZEROCOPY));
+    assert_eq!(attempts[1].0, "copy");
+    assert!(attempts[1].1.contains(BindFlags::XDP_COPY));
+    let attempts = super::linux::xsk_bind_attempts(XdpXskMode::ZeroCopy);
+    assert_eq!(attempts.len(), 1);
+    assert!(attempts[0].1.contains(BindFlags::XDP_ZEROCOPY));
+    let attempts = super::linux::xsk_bind_attempts(XdpXskMode::Copy);
+    assert_eq!(attempts.len(), 1);
+    assert!(attempts[0].1.contains(BindFlags::XDP_COPY));
+}
+
+/// The driver floor tables gate AF_XDP away from the emulated generic
+/// path: native XSK (virtio_net 6.11, server NICs 5.4) is the attach
+/// gate; the zero-copy floor (virtio_net 6.13) is display/planning
+/// only. Unknown drivers have no floor — the gate refuses them.
+#[test]
+fn xsk_driver_floor_tables_match_installer() {
+    use crate::runtime_mode::{xsk_driver_native_floor, xsk_driver_zerocopy_floor};
+    assert_eq!(xsk_driver_native_floor("virtio_net"), Some((6, 11)));
+    assert_eq!(xsk_driver_native_floor("ena"), Some((5, 16)));
+    assert_eq!(xsk_driver_native_floor("gve"), Some((6, 2)));
+    for driver in ["i40e", "ice", "ixgbe", "mlx5_core", "bnxt_en"] {
+        assert_eq!(xsk_driver_native_floor(driver), Some((5, 4)), "{driver}");
+    }
+    for driver in ["veth", "tun", "unknown_nic", "lo"] {
+        assert_eq!(xsk_driver_native_floor(driver), None, "{driver}");
+        assert_eq!(xsk_driver_zerocopy_floor(driver), None, "{driver}");
+    }
+    assert_eq!(xsk_driver_zerocopy_floor("virtio_net"), Some((6, 13)));
+    assert_eq!(xsk_driver_zerocopy_floor("ena"), Some((5, 16)));
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -3634,8 +3677,8 @@ fn ipv4_tcp_payload_frame(vlan: bool, seq: u32, ack: u32, payload: &[u8]) -> Vec
 /// the client's ACK/data segments must acknowledge it for smoltcp to
 /// accept them into the receive buffer.
 #[cfg(any(test, target_os = "linux"))]
-fn synack_seq(egress: &[(af_xdp::AfXdpRouteMeta, Vec<u8>)]) -> u32 {
-    let (_, ip_packet) = egress
+fn synack_seq(egress: &[(af_xdp::AfXdpRouteMeta, Vec<u8>, i64)]) -> u32 {
+    let (_, ip_packet, _) = egress
         .first()
         .expect("reactor emitted no SYN-ACK frame");
     let tcp_off = ((ip_packet[0] & 0x0f) as usize) * 4;
