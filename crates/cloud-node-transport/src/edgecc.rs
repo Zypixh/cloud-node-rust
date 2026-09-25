@@ -981,7 +981,7 @@ impl CongestionController for EdgeCc {
             // RTO sweeps bypass `rs.lost` — feed the model's loss
             // columns directly so p_rand sees the real loss process.
             self.model
-                .note_rto_loss(lost_bytes, self.model.loss_congested(in_flight));
+                .note_rto_loss(now, lost_bytes, self.model.loss_congested(in_flight));
             self.on_rto(now, in_flight);
             return;
         }

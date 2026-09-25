@@ -295,6 +295,14 @@ pub struct PathModel {
     // --- lt_bw / policer (BBRv1) ---
     lt_bw: Option<u64>,
     lt_candidate: f64,
+    /// Peak confirmed-delivery slope this episode — what actually gets
+    /// pinned. Anchoring the pin to the *current* slope lets a stall-
+    /// diluted window pin the pacer near zero and the lift test can
+    /// never fire (delivery capped at the pin keeps the slope at the
+    /// pin — a self-fulfilling ~0 ceiling, seen in production as
+    /// paceBps ~5KB/s). Decays toward current delivery each round so a
+    /// genuine slowdown re-anchors within a few rounds.
+    lt_slope_peak: f64,
     lt_rounds: u32,
     lt_round_end_us: u64,
     lt_round_had_loss: bool,
@@ -352,6 +360,7 @@ impl PathModel {
             alpha: Ewma::default(),
             lt_bw: None,
             lt_candidate: 0.0,
+            lt_slope_peak: 0.0,
             lt_rounds: 0,
             lt_round_end_us: 0,
             lt_round_had_loss: false,
@@ -517,7 +526,20 @@ impl PathModel {
             .as_micros()
             .max(1) as u64;
         if self.lt_round_end_us > 0 && now_us >= self.lt_round_end_us {
-            let bw = self.bw_est.get().unwrap_or(0.0);
+            // lt tracking needs a compression-immune estimator: per-ACK
+            // delivery samples are bimodal on policers (trickle
+            // survivors vs catch-up bursts) so the EWMA never holds
+            // ±LT_BW_RATIO for the required rounds and the verdict can
+            // never pin. The slope window's confirmed-delivery rate is
+            // stable by construction — it is the honest bound.
+            let bw = self
+                .bw_slope()
+                .map(|v| v as f64)
+                .unwrap_or_else(|| self.bw_est.get().unwrap_or(0.0));
+            // The episode peak decays toward current delivery: bursts
+            // keep it high, a true slowdown re-anchors within a few
+            // rounds — the PIN uses this, not the stall-diluted slope.
+            self.lt_slope_peak = bw.max(self.lt_slope_peak * 0.75);
             if self.lt_round_had_loss
                 && self.lt_candidate > 0.0
                 && (bw - self.lt_candidate).abs() <= self.lt_candidate * LT_BW_RATIO
@@ -527,8 +549,20 @@ impl PathModel {
                 self.lt_rounds = 0;
                 self.lt_candidate = bw;
             }
-            if self.lt_rounds >= LT_INTVL_MIN_RTT && self.lt_candidate > 0.0 {
-                self.lt_bw = Some(self.lt_candidate as u64);
+            if self.lt_rounds >= LT_INTVL_MIN_RTT && self.lt_slope_peak > 0.0 {
+                // Pin value = the *injection* rate that produced the peak
+                // confirmed delivery: slope measures what got through,
+                // not what the policer forwards. Scaling by (1−loss)
+                // estimates the policed rate itself; the lift test then
+                // sits only ~25% above it, so a pinned flow can still
+                // observe the improvement that unlocks the ceiling.
+                // Uses the TOTAL loss ratio — on policers the drops are
+                // congestion-attributed (inflight > BDP) and never reach
+                // the quiet columns, so quiet_loss_rate under-reads.
+                let p = (self.lost_total as f64
+                    / (self.delivered_total + self.lost_total).max(1) as f64)
+                    .clamp(0.0, 0.8);
+                self.lt_bw = Some((self.lt_slope_peak / (1.0 - p)) as u64);
             }
             self.lt_round_had_loss = false;
             self.lt_round_end_us = now_us + rtt_us;
@@ -581,9 +615,16 @@ impl PathModel {
             self.lt_round_had_loss = true;
             if self.lt_round_end_us == 0 {
                 self.lt_round_end_us = now_us + rtt_us;
-                self.lt_candidate = self.bw_est.get().unwrap_or_else(|| {
-                    self.bw_max.value().unwrap_or(0.0)
-                });
+                let anchor = self
+                    .bw_slope()
+                    .map(|v| v as f64)
+                    .unwrap_or_else(|| {
+                        self.bw_est
+                            .get()
+                            .unwrap_or_else(|| self.bw_max.value().unwrap_or(0.0))
+                    });
+                self.lt_candidate = anchor;
+                self.lt_slope_peak = self.lt_slope_peak.max(anchor);
             }
         }
 
@@ -594,12 +635,19 @@ impl PathModel {
         }
 
         // A policer verdict is lifted when the path later delivers
-        // clearly more than the pinned rate (BBRv1 does the same).
+        // clearly more than the pinned rate (BBRv1 does the same) —
+        // judged on the same compression-immune slope that set it.
         if let Some(lt) = self.lt_bw
-            && self.bw_est.get().unwrap_or(0.0) > lt as f64 * (1.0 + LT_BW_RATIO * 2.0)
+            && self
+                .bw_slope()
+                .map(|v| v as f64)
+                .or_else(|| self.bw_est.get())
+                .unwrap_or(0.0)
+                > lt as f64 * (1.0 + LT_BW_RATIO * 2.0)
         {
             self.lt_bw = None;
             self.lt_rounds = 0;
+            self.lt_slope_peak = 0.0;
         }
     }
 
@@ -618,7 +666,11 @@ impl PathModel {
     /// a small fraction of the real loss process and `p_rand` could
     /// never converge. Feed them here, split by the same congestion
     /// test; `delivered` denominators still come from rate samples.
-    pub fn note_rto_loss(&mut self, lost: u64, congested: bool) {
+    /// It also counts toward the lt_bw policer verdict — on ACK-sparse
+    /// paths dupack rounds essentially never occur, so without this the
+    /// verdict can never see a "lossy round" and stays permanently
+    /// unpinned while the pacer overshoots a real policer.
+    pub fn note_rto_loss(&mut self, now: TransportInstant, lost: u64, congested: bool) {
         if lost == 0 {
             return;
         }
@@ -630,6 +682,25 @@ impl PathModel {
             self.loss_quiet_bytes += lost;
             self.loss_quiet_events += 1;
             self.quiet_lost += lost;
+        }
+        self.lt_round_had_loss = true;
+        if self.lt_round_end_us == 0 {
+            let rtt_us = self
+                .cached_srtt_us
+                .map(|s| s as u64)
+                .unwrap_or(200_000)
+                .clamp(2_000, 4_000_000);
+            self.lt_round_end_us = now.micros() + rtt_us;
+            let anchor = self
+                .bw_slope()
+                .map(|v| v as f64)
+                .unwrap_or_else(|| {
+                    self.bw_est
+                        .get()
+                        .unwrap_or_else(|| self.bw_max.value().unwrap_or(0.0))
+                });
+            self.lt_candidate = anchor;
+            self.lt_slope_peak = self.lt_slope_peak.max(anchor);
         }
     }
 
