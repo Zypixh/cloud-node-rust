@@ -4,10 +4,10 @@ set -euo pipefail
 # CloudNode Rust installer / CloudNode Rust 安装脚本
 #
 # Single unified flow / 统一流程:
-#   detect existing deployment -> backup -> download release -> stop legacy
+#   detect existing deployment -> download release -> stop legacy
 #   -> install binary + eBPF object -> install GeoIP (always) -> register
 #   service -> start/restart -> verify.
-#   检测现有部署 -> 备份 -> 下载 Release -> 停止旧进程 -> 安装二进制和
+#   检测现有部署 -> 下载 Release -> 停止旧进程 -> 安装二进制和
 #   eBPF 对象 -> 安装 GeoIP（默认必装）-> 注册服务 -> 启动/重启 -> 校验。
 #
 # When no existing cloud-node is found the script performs a fresh install
@@ -18,14 +18,11 @@ set -euo pipefail
 REPO="${REPO:-Zypixh/cloud-node-rust}"
 VERSION="${VERSION:-latest}"
 SERVICE_NAME="${SERVICE_NAME:-cloud-node}"
-BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/cloud-node-rust-migration}"
 INSTALL_DIR="${INSTALL_DIR:-}"
 INSTALL_BINARY="${INSTALL_BINARY:-}"
 AUTO_START="${AUTO_START:-yes}"
 GEOIP_DIR="${GEOIP_DIR:-}"
 GEOIP_BASE_URL="${GEOIP_BASE_URL:-}"
-ACTION="install"
-RESTORE_BACKUP="${RESTORE_BACKUP:-}"
 API_ENDPOINTS="${API_ENDPOINTS:-}"
 NODE_ID="${NODE_ID:-}"
 NODE_SECRET="${NODE_SECRET:-}"
@@ -36,18 +33,25 @@ DRY_RUN=0
 # outbound AF_XDP upstream). --no-xdp / ENABLE_XDP=no opts out explicitly.
 # When XDP is enabled the dataplane is always bidirectional — there is no
 # kernel-outbound mode to select. XDP_EXPLICIT records whether the
-# operator actually asked for XDP (flag or env) — it decides whether a
-# degraded kernel may keep the default or must flip it to disabled.
+# operator actually asked for XDP (flag or env) — below the 5.4 dataplane
+# floor it decides whether the default flips to disabled; driver-level
+# degradation below a native-XSK floor never flips it.
 XDP_EXPLICIT=0
 if [ -n "${ENABLE_XDP+x}" ]; then
     XDP_EXPLICIT=1
 fi
 ENABLE_XDP="${ENABLE_XDP:-yes}"
 XDP_IFACE="${XDP_IFACE:-}"
-# --upgrade-kernel / UPGRADE_KERNEL=yes lets the installer install a newer
-# distribution kernel when the running one cannot host the AF_XDP
-# dataplane. A kernel upgrade always needs a reboot, so XDP stays disabled
-# for that run either way.
+# XDP work mode written to api_node.yaml: proxy (full dataplane via XSK
+# sockets) or protect (defense only — classification/ACL/rate-limit at the
+# driver, all traffic stays on the kernel stack). Non-interactive default
+# is proxy; the interactive prompt offers both.
+XDP_MODE="${XDP_MODE:-proxy}"
+# --upgrade-kernel / UPGRADE_KERNEL=yes lets the installer upgrade the
+# kernel (or the whole OS release when no kernel package on this release
+# suffices) when the running one cannot host the AF_XDP
+# dataplane. The full plan is shown and double-confirmed; once confirmed
+# the upgrade executes and the host reboots automatically.
 UPGRADE_KERNEL="${UPGRADE_KERNEL:-no}"
 
 # Backwards-compatible environment mappings from the previous installer.
@@ -55,9 +59,18 @@ case "${START_MODE:-}" in
     always|preserve) AUTO_START="yes" ;;
     never) AUTO_START="no" ;;
 esac
+# MODE was the old installer's mode selector. install|fresh were always
+# no-ops and stay harmless aliases for the unified flow; every other value
+# — restore, list-backups, or anything else — must not silently fall
+# through to an install. warn/die are not defined yet at this point, so
+# print directly and exit.
 case "${MODE:-}" in
-    restore) ACTION="restore" ;;
-    list-backups) ACTION="list-backups" ;;
+    ""|install|fresh) ;;
+    *)
+        printf '[error] MODE=%s is obsolete: the installer no longer has modes or backup/restore; unset MODE and re-run\n' "$MODE" >&2
+        printf '[error] MODE=%s 已废弃：安装器已无模式或备份/恢复概念；请取消 MODE 后重新运行\n' "$MODE" >&2
+        exit 1
+        ;;
 esac
 
 usage() {
@@ -70,19 +83,12 @@ install when no existing deployment is found.
 
 Usage / 用法:
   sudo scripts/install-rust-cloud-node.sh
-  sudo scripts/install-rust-cloud-node.sh --restore
 
 Run directly from GitHub / 直接从 GitHub 运行:
   curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash
   curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret
 
 Options / 选项:
-  --restore              Restore the Go original from a previous backup.
-                         从备份恢复 Go 原版。
-  --restore-backup DIR   Restore from this backup dir. Default: latest backup.
-                         从指定备份目录恢复；默认最近备份。
-  --list-backups         List available backup dirs and exit.
-                         列出可用备份目录后退出。
   --repo OWNER/REPO      GitHub repo. Default: Zypixh/cloud-node-rust
                          GitHub 仓库；默认 Zypixh/cloud-node-rust。
   --version VERSION      Release tag, for example v1.3.0. Default: latest
@@ -94,8 +100,6 @@ Options / 选项:
                          运行目录；默认沿用现有目录，全新安装为 /root/cloud-node。
   --install-binary PATH  Installed binary path. Default: INSTALL_DIR/cloud-node-rust
                          二进制安装路径；默认 INSTALL_DIR/cloud-node-rust。
-  --backup-root DIR      Backup root. Default: /var/backups/cloud-node-rust-migration
-                         备份根目录；默认 /var/backups/cloud-node-rust-migration。
   --geoip-dir DIR        GeoIP target dir. Default: INSTALL_DIR/data
                          GeoIP 目标目录；默认 INSTALL_DIR/data。
   --api-endpoint URL     API RPC endpoint for fresh install. Can be repeated.
@@ -115,13 +119,16 @@ Options / 选项:
                          default-route interface.
                          XDP 绑定的网卡名；默认自动探测默认路由网卡。
   --upgrade-kernel       If the running kernel cannot host the AF_XDP
-                         dataplane, install a newer distribution kernel
-                         (Debian backports / Ubuntu HWE / ELRepo kernel-ml).
-                         A reboot is required afterwards; XDP stays disabled
-                         until the host runs the new kernel.
-                         运行内核无法承载 AF_XDP 数据面时，安装发行版更新内核
-                         （Debian backports / Ubuntu HWE / ELRepo kernel-ml）。
-                         升级后需要重启；重启前 XDP 保持禁用。
+                         dataplane, upgrade the kernel first when a
+                         satisfying package exists (Debian backports /
+                         Ubuntu HWE / ELRepo kernel-ml); otherwise offer a
+                         full OS release upgrade. Either path shows the
+                         plan, needs double confirmation, then executes
+                         and reboots automatically.
+                         运行内核无法承载 AF_XDP 数据面（驱动管理 XSK）时，优先升级内核
+                         （Debian backports / Ubuntu HWE / ELRepo kernel-ml）；
+                         内核包无法达标时提供系统发行版升级。两条路径均显示
+                         完整计划并需二次确认，确认后自动执行并重启。
   --no-start             Do not start/restart the service after install.
                          安装后不启动/重启服务。
   --dry-run              Print actions without changing files.
@@ -132,8 +139,8 @@ Options / 选项:
   -h, --help             Show this help. / 显示本帮助。
 
 Environment variables with the same names are also supported:
-  REPO, VERSION, SERVICE_NAME, INSTALL_DIR, INSTALL_BINARY, BACKUP_ROOT,
-  AUTO_START, GEOIP_DIR, GEOIP_BASE_URL, RESTORE_BACKUP, API_ENDPOINTS,
+  REPO, VERSION, SERVICE_NAME, INSTALL_DIR, INSTALL_BINARY,
+  AUTO_START, GEOIP_DIR, GEOIP_BASE_URL, API_ENDPOINTS,
   NODE_ID, NODE_SECRET, TIMEZONE, ENABLE_XDP, XDP_IFACE, UPGRADE_KERNEL.
 USAGE
 }
@@ -215,10 +222,6 @@ read_prompt_secret() {
 # Bilingual output helpers / 双语输出辅助
 # Every user-facing message prints Chinese and English together.
 # 所有面向用户的消息同时输出中文和英文。
-bi() {
-    printf '%s | %s\n' "$1" "$2"
-}
-
 title() {
     printf '\n%s%s%s\n' "$BOLD" "CloudNode Rust Installer / 安装脚本" "$RESET"
     printf '%s\n\n' "============================================================"
@@ -402,21 +405,165 @@ apply_timezone() {
     ok "system timezone set to $TIMEZONE" "系统时区已设置为 $TIMEZONE"
 }
 
+# --- Kernel/XDP support gate ---
+# The AF_XDP dataplane needs AF_XDP sockets (>= 4.18 minimum, >= 5.4 in
+# practice for the bidirectional path) plus CONFIG_XDP_SOCKETS. The probe
+# runs early — before any prompt or service change — so every invocation
+# (fresh, upgrade, --xdp, --no-xdp, --upgrade-kernel, --help) on a
+# below-floor host surfaces the same upgrade recommendation. The verdict
+# still gates xdp.enabled on verifiably unsupported kernels.
+XDP_KERNEL_VERDICT="unknown"   # ok | degraded | unsupported
+XDP_KERNEL_REASON=""
+KERNEL_UPGRADED=0
+
+default_route_iface() {
+    command -v ip >/dev/null 2>&1 || return 0
+    ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+nic_driver() {
+    local iface="$1"
+    local driver=""
+    if command -v ethtool >/dev/null 2>&1; then
+        driver="$(ethtool -i "$iface" 2>/dev/null | sed -n 's/^driver:[[:space:]]*//p' | head -n 1)"
+    fi
+    if [ -z "$driver" ] && [ -e "/sys/class/net/$iface/device/driver" ]; then
+        driver="$(basename "$(readlink "/sys/class/net/$iface/device/driver" 2>/dev/null || true)" 2>/dev/null || true)"
+    fi
+    printf '%s' "${driver:-unknown}"
+}
+
+kernel_version_ge() {
+    local want_major="$1" want_minor="$2" release maj min
+    release="$(uname -r 2>/dev/null || true)"
+    maj="$(printf '%s' "$release" | cut -d. -f1)"
+    min="$(printf '%s' "$release" | cut -d. -f2)"
+    case "$maj" in ''|*[!0-9]*) maj=0 ;; esac
+    case "$min" in ''|*[!0-9]*) min=0 ;; esac
+    [ "$maj" -gt "$want_major" ] || { [ "$maj" -eq "$want_major" ] && [ "$min" -ge "$want_minor" ]; }
+}
+
+kernel_xdp_sockets_enabled() {
+    # 0 = enabled, 1 = verifiably disabled, 2 = unknown (no readable config).
+    local cfg="/boot/config-$(uname -r 2>/dev/null)"
+    if [ -r "$cfg" ]; then
+        grep -q '^CONFIG_XDP_SOCKETS=y' "$cfg" 2>/dev/null && return 0
+        grep -q '^CONFIG_XDP_SOCKETS=' "$cfg" 2>/dev/null && return 1
+        return 2
+    fi
+    if [ -r /proc/config.gz ]; then
+        if zcat /proc/config.gz 2>/dev/null | grep -q '^CONFIG_XDP_SOCKETS=y'; then
+            return 0
+        fi
+        if zcat /proc/config.gz 2>/dev/null | grep -q '^CONFIG_XDP_SOCKETS='; then
+            return 1
+        fi
+    fi
+    return 2
+}
+
+xdp_driver_native_xsk_floor() {
+    # Hard floor for driver-managed AF_XDP (XSK) binding — zero-copy OR
+    # driver copy mode. A driver/kernel below this floor can only produce
+    # the kernel-emulated generic path, which is not a supported dataplane
+    # (its skb TX path saturated under production load on Debian 6.1 +
+    # virtio_net). virtio_net gained driver XSK in 6.11; ena in 5.16, gve
+    # in 6.2; the big server NICs shipped it around the 5.4 floor.
+    # Mirrors `xsk_driver_native_floor` in src/runtime_mode.rs.
+    case "$1" in
+        virtio_net) printf '6 11' ;;
+        ena) printf '5 16' ;;
+        gve) printf '6 2' ;;
+        i40e|ice|ixgbe|ixgbevf|iavf|mlx4_en|mlx5_core|bnxt_en|qede|sfc|sfc_ef100|nfp|nfp_netvf|mvneta|mvpp2|stmmac|enetc|atlantic|axgbe|amd-xgbe|bcmgenet|cpsw|am65-cpsw|fec|dpaa2-eth|xilinx_axienet|netdevsim)
+            printf '5 4' ;;
+        *) printf '' ;;
+    esac
+}
+
+xdp_driver_zerocopy_floor() {
+    # Kernel floor at which the driver advertises NETDEV_XDP_ACT_XSK_ZEROCOPY.
+    # Display/planning only — `auto` probes zero-copy then driver copy at
+    # bind. virtio_net advertises the flag from 6.13 AND additionally needs
+    # the hypervisor to negotiate VIRTIO_F_ACCESS_PLATFORM, so the runtime
+    # bind is always the authoritative verdict.
+    # Mirrors `xsk_driver_zerocopy_floor` in src/runtime_mode.rs.
+    case "$1" in
+        virtio_net) printf '6 13' ;;
+        *) xdp_driver_native_xsk_floor "$1" ;;
+    esac
+}
+
+probe_xdp_kernel() {
+    local kver sockets_rc
+    kver="$(uname -r 2>/dev/null || printf 'unknown')"
+    XDP_KERNEL_VERDICT="ok"
+    XDP_KERNEL_REASON=""
+    if ! kernel_version_ge 4 18; then
+        XDP_KERNEL_VERDICT="unsupported"
+        XDP_KERNEL_REASON="kernel $kver < 4.18: AF_XDP sockets do not exist"
+        return
+    fi
+    # kernel_xdp_sockets_enabled reports via return codes 1/2 — capture the
+    # status explicitly; a bare call under `set -e` would abort the script
+    # instead of recording the disabled/unknown verdict.
+    sockets_rc=0
+    kernel_xdp_sockets_enabled || sockets_rc=$?
+    if [ "$sockets_rc" -eq 1 ]; then
+        XDP_KERNEL_VERDICT="unsupported"
+        XDP_KERNEL_REASON="kernel $kver was built without CONFIG_XDP_SOCKETS"
+        return
+    fi
+    if ! kernel_version_ge 5 4; then
+        XDP_KERNEL_VERDICT="degraded"
+        XDP_KERNEL_REASON="kernel $kver < 5.4: the bidirectional AF_XDP dataplane needs >= 5.4"
+        return
+    fi
+
+    # Driver-level XSK capability: kernel >= 5.4 only proves the socket API
+    # exists; the dataplane requires driver-managed XSK (zero-copy or copy —
+    # never the kernel-emulated generic path). virtio_net gained driver XSK
+    # in 6.11, so e.g. Debian 12 stock (6.1) + virtio cannot host the
+    # dataplane at all. Below the floor the verdict is unsupported: the run
+    # surfaces an upgrade recommendation and does not offer the dataplane.
+    local iface driver floor floor_maj floor_min
+    iface="$XDP_IFACE"
+    [ -n "$iface" ] || iface="$(default_route_iface || true)"
+    if [ -n "$iface" ]; then
+        driver="$(nic_driver "$iface")"
+        floor="$(xdp_driver_native_xsk_floor "$driver")"
+        if [ -n "$floor" ]; then
+            floor_maj="${floor%% *}"
+            floor_min="${floor##* }"
+            if ! kernel_version_ge "$floor_maj" "$floor_min"; then
+                XDP_KERNEL_VERDICT="unsupported"
+                XDP_KERNEL_REASON="$iface uses $driver, whose native AF_XDP (XSK) needs kernel >= $floor_maj.$floor_min; kernel $kver is below that floor and the generic kernel path is not supported — XDP cannot attach"
+                return
+            fi
+        elif [ "$driver" != "unknown" ]; then
+            XDP_KERNEL_REASON="$iface driver '$driver' has no known native AF_XDP floor — the runtime attach path verifies it"
+        fi
+    fi
+
+    if [ -z "$XDP_KERNEL_REASON" ] && [ "$sockets_rc" -eq 2 ]; then
+        XDP_KERNEL_REASON="kernel $kver meets the version floor; CONFIG_XDP_SOCKETS unreadable — the runtime attach path verifies it"
+    fi
+}
+
+# Every run reports the kernel-upgrade path when the gate is not clean —
+# including runs where XDP is disabled, forced on, or governed by an
+# existing config. The hint is a host-capability notice, not an XDP choice.
+report_kernel_upgrade_hint() {
+    case "$XDP_KERNEL_VERDICT" in
+        degraded|unsupported) ;;
+        *) return 0 ;;
+    esac
+    [ "$KERNEL_UPGRADED" -eq 0 ] || return 0
+    warn "kernel $(uname -r) cannot host the AF_XDP dataplane ($XDP_KERNEL_REASON) — pass --upgrade-kernel to upgrade the kernel (or the OS release when no kernel suffices), with double confirmation and an automatic reboot" \
+        "内核 $(uname -r) 无法承载 AF_XDP 数据面（${XDP_KERNEL_REASON}）——可传 --upgrade-kernel 升级内核（内核包不足时升级为系统发行版），需二次确认并自动重启"
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --restore)
-            ACTION="restore"
-            shift
-            ;;
-        --restore-backup)
-            RESTORE_BACKUP="${2:?missing restore backup dir}"
-            ACTION="restore"
-            shift 2
-            ;;
-        --list-backups)
-            ACTION="list-backups"
-            shift
-            ;;
         --repo)
             REPO="${2:?missing repo}"
             shift 2
@@ -435,10 +582,6 @@ while [ "$#" -gt 0 ]; do
             ;;
         --install-binary)
             INSTALL_BINARY="${2:?missing install binary}"
-            shift 2
-            ;;
-        --backup-root)
-            BACKUP_ROOT="${2:?missing backup root}"
             shift 2
             ;;
         --geoip-dir)
@@ -525,7 +668,9 @@ while [ "$#" -gt 0 ]; do
             fi
             ;;
         -h|--help)
+            probe_xdp_kernel
             usage
+            report_kernel_upgrade_hint
             exit 0
             ;;
         *)
@@ -536,9 +681,14 @@ done
 
 title
 
-if [ "$ACTION" != "list-backups" ]; then
-    [ "$(uname -s)" = "Linux" ] || [ "$DRY_RUN" -eq 1 ] || die "this installer supports Linux only" "本安装脚本仅支持 Linux"
-fi
+[ "$(uname -s)" = "Linux" ] || [ "$DRY_RUN" -eq 1 ] || die "this installer supports Linux only" "本安装脚本仅支持 Linux"
+
+# Probe the kernel/NIC once, up front: a below-floor host gets the upgrade
+# recommendation here — before dependency/root checks, any API-config
+# prompt, or service change — on every run, whatever the XDP choice or
+# install mode is.
+probe_xdp_kernel
+report_kernel_upgrade_hint
 
 need_cmd mktemp
 need_cmd date
@@ -546,12 +696,10 @@ need_cmd cp
 need_cmd mkdir
 need_cmd install
 need_cmd uname
-if [ "$ACTION" = "install" ]; then
-    need_cmd curl
-    need_cmd tar
-fi
+need_cmd curl
+need_cmd tar
 
-if [ "$ACTION" != "list-backups" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+if [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
     die "root is required; run with sudo" "需要 root 权限；请使用 sudo 运行"
 fi
 
@@ -568,6 +716,19 @@ systemd_value() {
 
 first_exec_token() {
     local line="$1"
+    # systemctl show --value ExecStart prints a structured record on newer
+    # systemd: `{ path=/usr/bin/foo ; argv[]=/usr/bin/foo ... ; ... }`.
+    case "$line" in
+        \{*)
+            local token=""
+            token="$(printf '%s\n' "$line" | sed -n 's/.*path=\([^ ;}]*\).*/\1/p' | head -n 1)"
+            [ -n "$token" ] || token="$(printf '%s\n' "$line" | sed -n 's/.*argv\[\]=\([^ ;}]*\).*/\1/p' | head -n 1)"
+            if [ -n "$token" ]; then
+                printf '%s\n' "$token"
+                return
+            fi
+            ;;
+    esac
     line="${line#-}"
     line="${line#+}"
     line="${line#!}"
@@ -879,7 +1040,7 @@ stop_legacy_deployment() {
     local binary_stop_ok=0
 
     read_lines_into units < <(discover_legacy_units || true)
-    read_lines_into pids < <(discover_legacy_pids || true)
+    read_lines_into pids < <((discover_legacy_pids || true) | awk '!seen[$0]++')
 
     if systemctl_available; then
         for unit in "${units[@]}"; do
@@ -933,12 +1094,12 @@ stop_legacy_deployment() {
         done
     fi
 
-    read_lines_into pids < <(discover_legacy_pids || true)
+    read_lines_into pids < <((discover_legacy_pids || true) | awk '!seen[$0]++')
     if [ "${#pids[@]}" -gt 0 ]; then
         signal_pids TERM "${pids[@]}"
         if [ "$DRY_RUN" -eq 0 ]; then
             wait_for_pids_exit 10 "${pids[@]}" || true
-            read_lines_into pids < <(discover_legacy_pids || true)
+            read_lines_into pids < <((discover_legacy_pids || true) | awk '!seen[$0]++')
             if [ "${#pids[@]}" -gt 0 ]; then
                 warn "forcing kill of remaining legacy pids: ${pids[*]}" "强制结束剩余旧进程: ${pids[*]}"
                 signal_pids KILL "${pids[@]}"
@@ -949,8 +1110,8 @@ stop_legacy_deployment() {
 
     if [ "$DRY_RUN" -eq 0 ]; then
         if ! wait_for_ports_release 15; then
-            die "legacy cloud-node still holds ports 80/443 after stop; aborting before overwrite. Restore with: $0 --restore --restore-backup $BACKUP_DIR" \
-                "旧 cloud-node 停止后仍占用 80/443 端口；覆盖前中止。可用以下命令恢复: $0 --restore --restore-backup $BACKUP_DIR"
+            die "legacy cloud-node still holds ports 80/443 after stop; aborting before overwrite" \
+                "旧 cloud-node 停止后仍占用 80/443 端口；覆盖前中止"
         fi
         ok "legacy cloud-node stopped" "旧 cloud-node 已停止"
     fi
@@ -961,8 +1122,7 @@ unregister_legacy_services() {
     local unit=""
     local unit_file=""
     local dropin_dir=""
-    local backed_up=0
-    local dest=""
+    local removed_unit=0
 
     read_lines_into units < <(discover_legacy_units || true)
     [ "${#units[@]}" -gt 0 ] || return 0
@@ -982,10 +1142,7 @@ unregister_legacy_services() {
             "/usr/lib/systemd/system/$unit"
         do
             [ -e "$unit_file" ] || continue
-            backed_up=1
-            dest="$BACKUP_DIR/legacy-units$unit_file"
-            run mkdir -p "$(dirname "$dest")"
-            run cp -a "$unit_file" "$dest"
+            removed_unit=1
             # Only remove admin-managed units under /etc; leave vendor units in /lib.
             case "$unit_file" in
                 /etc/systemd/system/*)
@@ -996,10 +1153,7 @@ unregister_legacy_services() {
 
         dropin_dir="/etc/systemd/system/${unit}.d"
         if [ -d "$dropin_dir" ]; then
-            backed_up=1
-            dest="$BACKUP_DIR/legacy-units$dropin_dir"
-            run mkdir -p "$(dirname "$dest")"
-            run cp -a "$dropin_dir" "$dest"
+            removed_unit=1
             run rm -rf "$dropin_dir"
         fi
     done
@@ -1008,8 +1162,8 @@ unregister_legacy_services() {
         run systemctl daemon-reload || true
         run systemctl reset-failed || true
     fi
-    if [ "$backed_up" -eq 1 ]; then
-        ok "legacy service registration removed (backed up under $BACKUP_DIR/legacy-units)" "旧服务注册已移除（已备份到 $BACKUP_DIR/legacy-units）"
+    if [ "$removed_unit" -eq 1 ]; then
+        ok "legacy service registration removed" "旧服务注册已移除"
     fi
 }
 
@@ -1072,7 +1226,7 @@ verify_service_started() {
             if command -v journalctl >/dev/null 2>&1; then
                 journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
             fi
-            die "start verification failed; restore with: $0 --restore --restore-backup $BACKUP_DIR" "启动校验失败；可用以下命令恢复: $0 --restore --restore-backup $BACKUP_DIR"
+            die "start verification failed" "启动校验失败"
         fi
         ok "service ${SERVICE_NAME} is active" "服务 ${SERVICE_NAME} 已运行"
         return 0
@@ -1083,7 +1237,7 @@ verify_service_started() {
             ok "cloud-node status reports running" "cloud-node status 显示运行中"
             return 0
         fi
-        die "cloud-node status check failed; restore with: $0 --restore --restore-backup $BACKUP_DIR" "cloud-node status 检查失败；可用以下命令恢复: $0 --restore --restore-backup $BACKUP_DIR"
+        die "cloud-node status check failed" "cloud-node status 检查失败"
     fi
 }
 
@@ -1242,10 +1396,6 @@ download_checked() {
         warn "download of $label failed; retrying ($attempt/$attempts)" "$label 下载失败；重试 ($attempt/$attempts)"
         sleep 2
     done
-}
-
-sanitize_path() {
-    printf '%s' "$1" | sed 's#/#_#g; s#^_##'
 }
 
 script_cd_workdir() {
@@ -1456,23 +1606,6 @@ geoip_url_for() {
     fi
 }
 
-default_route_iface() {
-    command -v ip >/dev/null 2>&1 || return 0
-    ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
-}
-
-nic_driver() {
-    local iface="$1"
-    local driver=""
-    if command -v ethtool >/dev/null 2>&1; then
-        driver="$(ethtool -i "$iface" 2>/dev/null | sed -n 's/^driver:[[:space:]]*//p' | head -n 1)"
-    fi
-    if [ -z "$driver" ] && [ -e "/sys/class/net/$iface/device/driver" ]; then
-        driver="$(basename "$(readlink "/sys/class/net/$iface/device/driver" 2>/dev/null || true)" 2>/dev/null || true)"
-    fi
-    printf '%s' "${driver:-unknown}"
-}
-
 nic_xdp_verdict() {
     # Driver allowlist for native (drv) XDP attach; everything else only gets
     # generic/skb mode at best. Advisory only — the runtime still probes the
@@ -1491,13 +1624,9 @@ nic_xdp_verdict() {
 }
 
 nic_afxdp_zc() {
-    # AF_XDP zero-copy capable drivers (subset of native-XDP drivers).
-    case "$1" in
-        i40e|ice|ixgbe|mlx5_core|bnxt_en|stmmac|sfc|sfc_ef100)
-            return 0
-            ;;
-    esac
-    return 1
+    # Zero-copy-capable drivers = the floor table itself — one source of
+    # truth for both the survey display and the kernel gate.
+    [ -n "$(xdp_driver_zerocopy_floor "$1")" ]
 }
 
 nic_is_virtual_noise() {
@@ -1536,6 +1665,8 @@ report_nic_xdp() {
     local real_nics=0
     local native_nics=0
     local marker=""
+    local floor=""
+    local zc_floor=""
 
     section "网卡 XDP 能力检测 / NIC XDP Capability"
 
@@ -1544,7 +1675,7 @@ report_nic_xdp() {
     kminor="$(printf '%s' "$kernel" | cut -d. -f2)"
     case "$kmajor$kminor" in ''|*[!0-9]*) kmajor=0; kminor=0 ;; esac
     if [ "$kmajor" -gt 5 ] || { [ "$kmajor" -eq 5 ] && [ "$kminor" -ge 4 ]; }; then
-        ok "kernel $kernel" "内核 $kernel 满足 AF_XDP 要求"
+        ok "kernel $kernel has the AF_XDP socket API" "内核 $kernel 具备 AF_XDP socket API"
     elif [ "$kmajor" -gt 4 ] || { [ "$kmajor" -eq 4 ] && [ "$kminor" -ge 18 ]; }; then
         warn "kernel $kernel supports AF_XDP but >= 5.4 is recommended" "内核 $kernel 支持 AF_XDP，建议 >= 5.4"
     else
@@ -1574,17 +1705,27 @@ report_nic_xdp() {
         case "$verdict" in
             native)
                 native_nics=$((native_nics + 1))
-                if nic_afxdp_zc "$driver"; then
-                    ok "  $iface$marker  driver=$driver  state=$state  native XDP (drv) + AF_XDP zero-copy" "  $iface$marker  驱动=$driver  状态=$state  支持 native XDP (drv) + AF_XDP 零拷贝"
+                floor="$(xdp_driver_native_xsk_floor "$driver")"
+                zc_floor="$(xdp_driver_zerocopy_floor "$driver")"
+                if [ -n "$floor" ] && ! kernel_version_ge ${floor%% *} ${floor##* }; then
+                    warn "  $iface$marker  driver=$driver  state=$state  listed for native XDP (drv) program attach; driver-managed XSK needs kernel >= ${floor%% *}.${floor##* } (have $kernel) — the runtime requires driver-managed XSK, so the AF_XDP dataplane cannot attach here" "  $iface$marker  驱动=$driver  状态=$state  驱动登记支持 native XDP (drv) 程序挂载；驱动管理 XSK 需要内核 >= ${floor%% *}.${floor##* }（当前 ${kernel}）——运行时要求驱动管理 XSK，AF_XDP 数据面在此无法 attach"
+                elif [ -n "$zc_floor" ] && kernel_version_ge ${zc_floor%% *} ${zc_floor##* }; then
+                    ok "  $iface$marker  driver=$driver  state=$state  zero-copy capable (kernel >= ${zc_floor%% *}.${zc_floor##* }); auto bind probes zero-copy first, driver copy fallback — runtime reports the landed mode" "  $iface$marker  驱动=$driver  状态=$state  支持零拷贝（内核 >= ${zc_floor%% *}.${zc_floor##* }）；auto 优先探测零拷贝、回退驱动 copy——运行时报实际落地模式"
+                elif [ -n "$floor" ]; then
+                    ok "  $iface$marker  driver=$driver  state=$state  driver-managed copy mode (kernel >= ${floor%% *}.${floor##* }); zero-copy needs kernel >= ${zc_floor%% *}.${zc_floor##* } — runtime reports the landed mode" "  $iface$marker  驱动=$driver  状态=$state  驱动管理 copy 模式可用（内核 >= ${floor%% *}.${floor##* }）；零拷贝需内核 >= ${zc_floor%% *}.${zc_floor##* }——运行时报实际落地模式"
                 else
-                    ok "  $iface$marker  driver=$driver  state=$state  native XDP (drv); AF_XDP copy-mode" "  $iface$marker  驱动=$driver  状态=$state  支持 native XDP (drv)；AF_XDP 为拷贝模式"
+                    ok "  $iface$marker  driver=$driver  state=$state  listed for native XDP (drv) program attach; AF_XDP capability unverified — runtime probes the actual bind" "  $iface$marker  驱动=$driver  状态=$state  驱动登记支持 native XDP (drv) 程序挂载；AF_XDP 能力未确认——运行时探测实际绑定"
                 fi
                 ;;
             conditional)
                 warn "  $iface$marker  driver=$driver  state=$state  native XDP depends on kernel (veth/tun need >= 5.11)" "  $iface$marker  驱动=$driver  状态=$state  native XDP 依赖内核版本（veth/tun 需 >= 5.11）"
                 ;;
             *)
-                warn "  $iface$marker  driver=$driver  state=$state  no native XDP; generic/skb mode only" "  $iface$marker  驱动=$driver  状态=$state  不支持 native XDP；仅 generic/skb 模式"
+                if [ "$driver" = "unknown" ]; then
+                    warn "  $iface$marker  driver=unknown  state=$state  driver unidentified; XDP/XSK capability unknown — the runtime requires driver-managed XSK and refuses attach without it" "  $iface$marker  驱动=unknown  状态=$state  无法识别驱动；XDP/XSK 能力未知——运行时要求驱动管理 XSK，缺失时拒绝 attach"
+                else
+                    warn "  $iface$marker  driver=$driver  state=$state  no known native XDP program attach; the runtime requires driver-managed XSK — the AF_XDP dataplane will refuse to attach on this driver" "  $iface$marker  驱动=$driver  状态=$state  未识别到 native XDP 程序挂载支持；运行时要求驱动管理 XSK——AF_XDP 数据面在此驱动上将拒绝 attach"
+                fi
                 ;;
         esac
         if [ -n "$attached" ]; then
@@ -1595,18 +1736,18 @@ report_nic_xdp() {
     if [ "$real_nics" -eq 0 ]; then
         warn "no physical NIC detected" "未检测到物理网卡"
     elif [ "$native_nics" -eq 0 ]; then
-        warn "no NIC supports native XDP; use xdp.attachMode: auto or skb" "没有网卡支持 native XDP；xdp.attachMode 请使用 auto 或 skb"
+        warn "no NIC supports native XDP; the AF_XDP dataplane cannot attach on this host" "没有网卡支持 native XDP；AF_XDP 数据面在本机无法 attach"
     fi
     if [ -n "$default_iface" ]; then
         kv "default route iface" "$default_iface"
     fi
     if [ "$XDP_KERNEL_VERDICT" != "ok" ] && [ -n "$XDP_KERNEL_REASON" ]; then
         warn "XDP kernel gate: $XDP_KERNEL_VERDICT — $XDP_KERNEL_REASON" \
-            "XDP 内核门控：$XDP_KERNEL_VERDICT——$XDP_KERNEL_REASON"
+            "XDP 内核门控：${XDP_KERNEL_VERDICT}——${XDP_KERNEL_REASON}"
     fi
     if [ "$KERNEL_UPGRADED" -eq 1 ]; then
-        warn "a newer kernel was installed; XDP stays disabled until reboot — re-run this installer after rebooting" \
-            "已安装新内核；重启前 XDP 保持禁用——重启后请重新运行本安装脚本"
+        warn "a newer kernel was installed — reboot, then re-run this installer so the new kernel is used" \
+            "已安装新内核——请重启后重新运行本安装脚本以使用新内核"
     fi
 }
 
@@ -1636,9 +1777,7 @@ download_geoip_files() {
         url="$(geoip_url_for "$name")"
         target="$GEOIP_DIR/$name"
         tmp_target="$TMP_DIR/$name"
-        if [ -e "$target" ]; then
-            run cp -a "$target" "$BACKUP_DIR/$name.geoip-original"
-        fi
+
         if [ "$DRY_RUN" -eq 0 ]; then
             download_checked "$url" "$tmp_target" "$name"
             if [ -n "$sums_file" ]; then
@@ -1685,211 +1824,334 @@ collect_api_config() {
     [ -n "$NODE_SECRET" ] || die "no existing api_node.yaml found; fresh install requires --secret" "未找到可迁移的 api_node.yaml；全新安装需要 --secret"
 }
 
-# --- Kernel/XDP support gate ---
-# The AF_XDP dataplane needs AF_XDP sockets (>= 4.18 minimum, >= 5.4 in
-# practice for the bidirectional path) plus CONFIG_XDP_SOCKETS. The probe
-# is advisory-free: the verdict below actually gates xdp.enabled.
-XDP_KERNEL_VERDICT="unknown"   # ok | degraded | unsupported
-XDP_KERNEL_REASON=""
-KERNEL_UPGRADED=0
+# --- Kernel/OS upgrade machinery ---
+# Invoked only when the running kernel failed the XDP native-XSK gate AND
+# the operator passed --upgrade-kernel. Two paths, kernel-first:
+#   A) install a newer kernel from the distro's own channel when a
+#      satisfying candidate exists (Debian backports / Ubuntu HWE /
+#      ELRepo kernel-ml);
+#   B) upgrade the whole OS release when no kernel package on the current
+#      release can cross the floor (e.g. Debian bookworm + virtio_net:
+#      its backports ceiling is 6.12 < the 6.11 native-XSK floor, so only
+#      a release upgrade can reach a capable kernel).
+# Both paths display the full plan, require TWO explicit confirmations,
+# then execute and reboot automatically.
 
-kernel_version_ge() {
-    local want_major="$1" want_minor="$2" release maj min
-    release="$(uname -r 2>/dev/null || true)"
-    maj="$(printf '%s' "$release" | cut -d. -f1)"
-    min="$(printf '%s' "$release" | cut -d. -f2)"
-    case "$maj" in ''|*[!0-9]*) maj=0 ;; esac
-    case "$min" in ''|*[!0-9]*) min=0 ;; esac
-    [ "$maj" -gt "$want_major" ] || { [ "$maj" -eq "$want_major" ] && [ "$min" -ge "$want_minor" ]; }
+DISTRO_ID=""
+DISTRO_CODENAME=""
+DISTRO_VERSION_ID=""
+DISTRO_MAJOR=""
+
+load_distro() {
+    if [ -r /etc/os-release ]; then
+        DISTRO_ID="$(. /etc/os-release; printf '%s' "${ID:-}")"
+        DISTRO_CODENAME="$(. /etc/os-release; printf '%s' "${VERSION_CODENAME:-}")"
+        DISTRO_VERSION_ID="$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")"
+        DISTRO_MAJOR="$(printf '%s' "$DISTRO_VERSION_ID" | cut -d. -f1)"
+    fi
 }
 
-kernel_xdp_sockets_enabled() {
-    # 0 = enabled, 1 = verifiably disabled, 2 = unknown (no readable config).
-    local cfg="/boot/config-$(uname -r 2>/dev/null)"
-    if [ -r "$cfg" ]; then
-        grep -q '^CONFIG_XDP_SOCKETS=y' "$cfg" 2>/dev/null && return 0
-        grep -q '^CONFIG_XDP_SOCKETS=' "$cfg" 2>/dev/null && return 1
-        return 2
-    fi
-    if [ -r /proc/config.gz ]; then
-        if zcat /proc/config.gz 2>/dev/null | grep -q '^CONFIG_XDP_SOCKETS=y'; then
-            return 0
-        fi
-        if zcat /proc/config.gz 2>/dev/null | grep -q '^CONFIG_XDP_SOCKETS='; then
-            return 1
-        fi
-    fi
-    return 2
+# Kernel (maj.min) the dataplane needs for this host's NIC driver — the
+# native-XSK floor: an upgrade is required when the running kernel cannot
+# even bind a driver-managed (copy) socket. Unknown driver → generic 5.4
+# baseline; the runtime attach path verifies capability.
+xdp_required_kernel() {
+    local iface driver floor
+    iface="${XDP_IFACE:-}"
+    [ -n "$iface" ] || iface="$(default_route_iface || true)"
+    driver=""
+    [ -n "$iface" ] && driver="$(nic_driver "$iface")"
+    floor="$(xdp_driver_native_xsk_floor "${driver:-}")"
+    printf '%s' "${floor:-5 4}"
 }
 
-xdp_driver_min_kernel() {
-    # Minimum kernel whose driver can bind an AF_XDP socket (XSK), not just
-    # run native XDP. virtio_net only gained XSK support in 6.11 — Debian 12
-    # stock (6.1) and every older virtio guest cannot bind at all. The big
-    # server NICs got XSK around the 5.4 floor already enforced above.
+# "6.12.95-1~bpo12+1" style package version >= wanted maj.min?
+pkg_version_ge() {
+    local maj min
+    maj="$(printf '%s' "$1" | sed -n 's/^\([0-9][0-9]*\)\..*/\1/p')"
+    min="$(printf '%s' "$1" | sed -n 's/^[0-9][0-9]*\.\([0-9][0-9]*\).*/\1/p')"
+    [ -n "$maj" ] && [ -n "$min" ] || return 1
+    [ "$maj" -gt "$2" ] || { [ "$maj" -eq "$2" ] && [ "$min" -ge "$3" ]; }
+}
+
+apt_kernel_candidate_version() {
+    apt-cache madison linux-image-amd64 2>/dev/null | awk '{print $3}' | sort -V | tail -n 1
+}
+
+# Newest kernel line each Debian release's backports pocket carries —
+# read-only estimate used when the pocket is not enabled locally (madison
+# output takes precedence when it is). Keep current; erring low steers
+# toward the OS-upgrade path, which is safe.
+debian_backports_kernel_line() {
     case "$1" in
-        virtio_net) printf '6 11' ;;
-        i40e|ice|ixgbe|ixgbevf|iavf|mlx4_en|mlx5_core|bnxt_en|qede|sfc|sfc_ef100|nfp|nfp_netvf|ena|gve|mvneta|mvpp2|stmmac|enetc|atlantic|axgbe|amd-xgbe|bcmgenet|cpsw|am65-cpsw|fec|dpaa2-eth|xilinx_axienet|netdevsim)
-            printf '5 4' ;;
-        *) printf '' ;;
+        bullseye) printf '6.1' ;;
+        bookworm) printf '6.12' ;;
+        trixie)   printf '6.16' ;;
+        *) return 1 ;;
     esac
 }
 
-probe_xdp_kernel() {
-    local kver sockets_rc
-    kver="$(uname -r 2>/dev/null || printf 'unknown')"
-    XDP_KERNEL_VERDICT="ok"
-    XDP_KERNEL_REASON=""
-    if ! kernel_version_ge 4 18; then
-        XDP_KERNEL_VERDICT="unsupported"
-        XDP_KERNEL_REASON="kernel $kver < 4.18: AF_XDP sockets do not exist"
-        return
-    fi
-    kernel_xdp_sockets_enabled
-    sockets_rc=$?
-    if [ "$sockets_rc" -eq 1 ]; then
-        XDP_KERNEL_VERDICT="unsupported"
-        XDP_KERNEL_REASON="kernel $kver was built without CONFIG_XDP_SOCKETS"
-        return
-    fi
-    if ! kernel_version_ge 5 4; then
-        XDP_KERNEL_VERDICT="degraded"
-        XDP_KERNEL_REASON="kernel $kver < 5.4: the bidirectional AF_XDP dataplane needs >= 5.4"
-        return
-    fi
-
-    # Driver-level XSK capability: kernel >= 5.4 only proves the socket API
-    # exists; the NIC driver must also implement xsk bind. virtio_net gained
-    # it in 6.11, so e.g. Debian 12 stock (6.1) passes the floor above yet
-    # cannot attach — downgrade the verdict before xdp.enabled is written.
-    local iface driver floor floor_maj floor_min
-    iface="$XDP_IFACE"
-    [ -n "$iface" ] || iface="$(default_route_iface || true)"
-    if [ -n "$iface" ]; then
-        driver="$(nic_driver "$iface")"
-        floor="$(xdp_driver_min_kernel "$driver")"
-        if [ -n "$floor" ]; then
-            floor_maj="${floor%% *}"
-            floor_min="${floor##* }"
-            if ! kernel_version_ge "$floor_maj" "$floor_min"; then
-                XDP_KERNEL_VERDICT="unsupported"
-                XDP_KERNEL_REASON="$iface uses $driver, which needs kernel >= $floor_maj.$floor_min for AF_XDP sockets; kernel $kver cannot bind an XSK"
-                return
-            fi
-        elif [ "$driver" != "unknown" ]; then
-            XDP_KERNEL_REASON="$iface driver '$driver' has no known AF_XDP capability floor — the runtime attach path verifies it"
-        fi
-    fi
-
-    if [ -z "$XDP_KERNEL_REASON" ] && [ "$sockets_rc" -eq 2 ]; then
-        XDP_KERNEL_REASON="kernel $kver meets the version floor; CONFIG_XDP_SOCKETS unreadable — the runtime attach path verifies it"
-    fi
+debian_next_codename() {
+    case "$1" in
+        bullseye) printf 'bookworm' ;;
+        bookworm) printf 'trixie' ;;
+        trixie)   printf 'forky' ;;
+        *) return 1 ;;
+    esac
 }
 
-# Distribution-aware kernel install. Only invoked when the running kernel
-# failed the XDP gate AND the operator passed --upgrade-kernel. Success
-# still leaves XDP disabled for this run — the new kernel is not running
-# until the host reboots.
-maybe_upgrade_kernel() {
-    [ "$UPGRADE_KERNEL" = "yes" ] || return 1
-    [ "$XDP_KERNEL_VERDICT" != "ok" ] || return 1
-    section "内核升级 / Kernel Upgrade"
-    local id="" codename="" version_id="" major="" list=""
-    if [ -r /etc/os-release ]; then
-        id="$(. /etc/os-release; printf '%s' "${ID:-}")"
-        codename="$(. /etc/os-release; printf '%s' "${VERSION_CODENAME:-}")"
-        version_id="$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")"
-        major="$(printf '%s' "$version_id" | cut -d. -f1)"
-    fi
-    if [ "$DRY_RUN" -ne 0 ]; then
-        log "+ kernel upgrade would run for distro '${id:-unknown}' (dry-run)"
-        return 1
-    fi
-    case "$id" in
+# Read-only probe: can this distro install a kernel >= req WITHOUT an OS
+# upgrade? Prints the candidate version on success.
+kernel_upgrade_candidate() {
+    local req_maj="$1" req_min="$2" cand=""
+    case "$DISTRO_ID" in
         debian)
-            if [ -z "$codename" ]; then
-                warn "cannot identify the Debian codename; upgrade the kernel manually" "无法识别 Debian 代号；请手动升级内核"
-                return 1
+            if grep -rqs "${DISTRO_CODENAME}-backports" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+                apt-get update -qq || return 1
+                cand="$(apt_kernel_candidate_version)"
             fi
-            list="/etc/apt/sources.list.d/${codename}-backports.list"
-            if ! grep -rqs "${codename}-backports" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
-                printf 'deb http://deb.debian.org/debian %s-backports main\n' "$codename" > "$list"
-                log "enabled ${codename}-backports" "已启用 ${codename}-backports 源"
+            [ -n "$cand" ] || cand="$(debian_backports_kernel_line "${DISTRO_CODENAME:-}")"
+            ;;
+        ubuntu)
+            apt-get update -qq || return 1
+            # The HWE image metapackage version tracks the kernel line.
+            cand="$(apt-cache madison "linux-image-generic-hwe-${DISTRO_VERSION_ID}" 2>/dev/null | awk '{print $3}' | sort -V | tail -n 1)"
+            [ -n "$cand" ] || cand="$(apt_kernel_candidate_version)"
+            ;;
+        rhel|centos|rocky|almalinux|ol)
+            command -v dnf >/dev/null 2>&1 || return 1
+            # kernel-ml tracks mainline, which is always newer than any
+            # dataplane floor — viable by construction once installable.
+            printf 'kernel-ml (ELRepo mainline)'
+            return 0
+            ;;
+        fedora)
+            # Fedora's kernel already tracks upstream closely.
+            cand="$(uname -r)"
+            ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$cand" ] && pkg_version_ge "$cand" "$req_maj" "$req_min"; then
+        printf '%s' "$cand"
+        return 0
+    fi
+    return 1
+}
+
+install_distro_kernel() {
+    case "$DISTRO_ID" in
+        debian)
+            local list="/etc/apt/sources.list.d/${DISTRO_CODENAME}-backports.list"
+            if ! grep -rqs "${DISTRO_CODENAME}-backports" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+                printf 'deb http://deb.debian.org/debian %s-backports main\n' "$DISTRO_CODENAME" > "$list"
+                log "enabled ${DISTRO_CODENAME}-backports" "已启用 ${DISTRO_CODENAME}-backports 源"
             fi
             apt-get update -qq || warn "apt-get update failed" "apt-get update 失败"
-            if DEBIAN_FRONTEND=noninteractive apt-get install -y -t "${codename}-backports" linux-image-amd64; then
-                KERNEL_UPGRADED=1
-            else
-                warn "backports kernel install failed" "backports 内核安装失败"
-                return 1
-            fi
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -t "${DISTRO_CODENAME}-backports" linux-image-amd64
             ;;
         ubuntu)
             apt-get update -qq || warn "apt-get update failed" "apt-get update 失败"
-            if DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-generic-hwe-${version_id}"; then
-                KERNEL_UPGRADED=1
-            else
-                warn "HWE kernel install failed (HWE only exists on Ubuntu LTS)" "HWE 内核安装失败（HWE 仅适用于 Ubuntu LTS）"
-                return 1
-            fi
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-generic-hwe-${DISTRO_VERSION_ID}"
             ;;
-        rhel|centos|rocky|almalinux|ol|fedora)
-            if [ "$id" = "fedora" ]; then
-                warn "Fedora already ships recent kernels; upgrade with 'dnf upgrade kernel'" "Fedora 内核已较新；请用 'dnf upgrade kernel' 升级"
-                return 1
-            fi
-            [ -n "$major" ] || { warn "cannot identify the EL major version" "无法识别 EL 主版本"; return 1; }
+        rhel|centos|rocky|almalinux|ol)
             rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org 2>/dev/null || true
             if ! rpm -q elrepo-release >/dev/null 2>&1; then
-                dnf install -y "https://www.elrepo.org/elrepo-release-${major}.el${major}.elrepo.noarch.rpm" || {
-                    warn "elrepo-release install failed" "elrepo-release 安装失败"
-                    return 1
-                }
+                dnf install -y "https://www.elrepo.org/elrepo-release-${DISTRO_MAJOR}.el${DISTRO_MAJOR}.elrepo.noarch.rpm" || return 1
             fi
-            if dnf --enablerepo=elrepo-kernel install -y kernel-ml; then
-                KERNEL_UPGRADED=1
-                warn "kernel-ml installed — ensure the bootloader default selects it before rebooting" "已安装 kernel-ml——重启前请确认引导默认项选中新内核"
-            else
-                warn "kernel-ml install failed" "kernel-ml 安装失败"
-                return 1
-            fi
+            dnf --enablerepo=elrepo-kernel install -y kernel-ml
+            warn "kernel-ml installed — ensure the bootloader default selects it before rebooting" "已安装 kernel-ml——重启前请确认引导默认项选中新内核"
             ;;
-        *)
-            warn "automatic kernel upgrade is unsupported on distro '${id:-unknown}'; install a >= 5.4 kernel manually and reboot" "发行版 '${id:-unknown}' 不支持自动内核升级；请手动安装 >= 5.4 内核并重启"
-            return 1
-            ;;
+        *) return 1 ;;
     esac
-    if [ "$KERNEL_UPGRADED" -eq 1 ]; then
-        ok "new kernel installed — REBOOT REQUIRED, then re-run this installer to enable XDP" \
-            "新内核已安装——需要重启，重启后重新运行本安装脚本以启用 XDP"
+}
+
+# Upgrade the whole OS release, then install the newest kernel the new
+# release offers (its backports pocket for Debian — the release's own
+# stable kernel may still be below the native-XSK floor).
+os_upgrade_target() {
+    case "$DISTRO_ID" in
+        debian) debian_next_codename "${DISTRO_CODENAME:-}" ;;
+        ubuntu) printf 'do-release-upgrade' ;;
+        *) return 1 ;;
+    esac
+}
+
+dist_upgrade_os() {
+    local target="$1"
+    case "$DISTRO_ID" in
+        debian)
+            local cur="$DISTRO_CODENAME" f
+            [ -n "$cur" ] || return 1
+            # Rewrite the release codename across every apt source file,
+            # keeping backups beside each original.
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+                [ -f "$f" ] || continue
+                cp "$f" "${f}.pre-xdp-upgrade" 2>/dev/null || true
+                sed -i "s/\b${cur}\b/${target}/g" "$f"
+            done
+            # Ensure the new release's backports pocket exists — its newest
+            # kernel is what crosses the native-XSK floor.
+            printf 'deb http://deb.debian.org/debian %s-backports main\n' "$target" > "/etc/apt/sources.list.d/${target}-backports.list"
+            apt-get update || return 1
+            DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y || return 1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -t "${target}-backports" linux-image-amd64 \
+                || DEBIAN_FRONTEND=noninteractive apt-get install -y linux-image-amd64
+            ;;
+        ubuntu)
+            command -v do-release-upgrade >/dev/null 2>&1 || {
+                DEBIAN_FRONTEND=noninteractive apt-get install -y ubuntu-release-upgrader-core || return 1
+            }
+            do-release-upgrade -f DistUpgradeViewNonInteractive || return 1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y linux-generic-hwe-"$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")" 2>/dev/null \
+                || DEBIAN_FRONTEND=noninteractive apt-get install -y linux-image-generic || true
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Two-step interactive confirmation for a destructive upgrade: full plan is
+# shown, the operator answers yes/no, then must type the exact phrase
+# UPGRADE. Non-interactive runs refuse — a guarded upgrade cannot start
+# unattended.
+confirm_upgrade_plan() {
+    local kind_zh="$1" kind_en="$2" second=""
+    if [ "$DRY_RUN" -ne 0 ]; then
+        log "+ upgrade plan would be shown for confirmation (dry-run)"
+        return 1
+    fi
+    if ! prompt_available; then
+        warn "no interactive terminal — refusing to run an unattended system upgrade; upgrade the kernel/OS manually and reboot" \
+            "无交互终端——拒绝无人值守地执行系统升级；请手动升级内核或系统后重启"
+        return 1
+    fi
+    ask_yes_no \
+        "确认执行上述${kind_zh}并在完成后自动重启系统？" \
+        "Proceed with the ${kind_en} above and reboot automatically when done?" \
+        "no" || {
+        warn "upgrade declined" "已取消升级"
+        return 1
+    }
+    printf '%s' "再次确认：输入 UPGRADE 继续 / second confirmation — type UPGRADE to proceed: "
+    read_prompt second || second=""
+    if [ "$second" != "UPGRADE" ]; then
+        warn "confirmation phrase mismatch — upgrade aborted" "确认短语不匹配——升级已中止"
+        return 1
     fi
     return 0
 }
 
+execute_upgrade_reboot() {
+    local note="$1" count
+    KERNEL_UPGRADED=1
+    mkdir -p "${INSTALL_DIR:-/root/cloud-node}" 2>/dev/null || true
+    printf '%s %s\n' "$(date -Is 2>/dev/null || date)" "$note" \
+        > "${INSTALL_DIR:-/root/cloud-node}/.xdp-upgrade-pending" 2>/dev/null || true
+    warn "升级完成——10 秒后自动重启（Ctrl-C 取消）；重启后请重新运行本安装脚本以启用 XDP" \
+        "upgrade finished — rebooting automatically in 10s (Ctrl-C to cancel); re-run this installer after reboot to enable XDP"
+    count=10
+    while [ "$count" -gt 0 ]; do
+        printf '  reboot in %ss\r' "$count" >&2
+        sleep 1
+        count=$((count - 1))
+    done
+    sync
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl reboot
+    else
+        reboot
+    fi
+}
+
+offer_xdp_upgrade() {
+    [ "$UPGRADE_KERNEL" = "yes" ] || return 1
+    [ "$XDP_KERNEL_VERDICT" != "ok" ] || return 1
+    load_distro
+    section "内核/系统升级 / Kernel or System Upgrade"
+    local req req_maj req_min iface driver candidate target
+    req="$(xdp_required_kernel)"
+    req_maj="${req%% *}"
+    req_min="${req##* }"
+    iface="${XDP_IFACE:-}"
+    [ -n "$iface" ] || iface="$(default_route_iface || true)"
+    driver=""
+    [ -n "$iface" ] && driver="$(nic_driver "$iface")"
+    kv "current kernel / 当前内核" "$(uname -r)"
+    kv "interface / 网卡" "${iface:-unknown}"
+    kv "driver / 驱动" "${driver:-unknown}"
+    kv "distro / 发行版" "${DISTRO_ID:-unknown} ${DISTRO_VERSION_ID:-} (${DISTRO_CODENAME:-n/a})"
+    kv "native XSK requires / 原生 XSK 要求" "kernel >= ${req_maj}.${req_min}"
+
+    # Path A — kernel only. Preferred whenever a satisfying package exists.
+    candidate="$(kernel_upgrade_candidate "$req_maj" "$req_min" || true)"
+    if [ -n "$candidate" ]; then
+        section "升级计划 / Upgrade Plan — 内核升级 Kernel Upgrade"
+        log "install kernel $candidate via the ${DISTRO_ID:-?} channel, then reboot" \
+            "通过 ${DISTRO_ID:-?} 渠道安装内核 $candidate，然后自动重启"
+        confirm_upgrade_plan "内核升级" "kernel upgrade" || return 1
+        if install_distro_kernel; then
+            ok "new kernel installed" "新内核已安装"
+            execute_upgrade_reboot "kernel-upgrade to $candidate for AF_XDP"
+        else
+            warn "kernel install failed — no reboot issued; upgrade manually" \
+                "内核安装失败——未执行重启；请手动升级"
+            return 1
+        fi
+        return 0
+    fi
+
+    # Path B — whole-release upgrade (kernel packages on this release
+    # cannot cross the floor).
+    target="$(os_upgrade_target || true)"
+    if [ -n "$target" ]; then
+        section "升级计划 / Upgrade Plan — 系统升级 OS Upgrade"
+        warn "no kernel package on ${DISTRO_ID:-?} ${DISTRO_VERSION_ID:-} reaches >= ${req_maj}.${req_min} — upgrading the OS release is the only automatic path" \
+            "${DISTRO_ID:-?} ${DISTRO_VERSION_ID:-} 上没有达到 >= ${req_maj}.${req_min} 的内核包——自动路径只剩整体系统升级"
+        log "upgrade ${DISTRO_ID:-?} ${DISTRO_VERSION_ID:-} (${DISTRO_CODENAME:-?}) → $target, install its newest kernel, then reboot" \
+            "将 ${DISTRO_ID:-?} ${DISTRO_VERSION_ID:-} (${DISTRO_CODENAME:-?}) 升级到 $target，安装其最新内核，然后自动重启"
+        warn "a release upgrade replaces most system packages and is NOT reversible from this script — ensure you have console/snapshot access" \
+            "发行版升级会替换大部分系统软件包且本脚本不可回滚——请确认有控制台/快照可回退"
+        confirm_upgrade_plan "系统升级" "OS release upgrade" || return 1
+        if dist_upgrade_os "$target"; then
+            ok "OS release upgrade finished" "系统发行版升级完成"
+            execute_upgrade_reboot "os-upgrade to $target for AF_XDP"
+        else
+            warn "OS upgrade failed — no reboot issued; recover apt sources from *.pre-xdp-upgrade backups if needed" \
+                "系统升级失败——未执行重启；如需回滚请从 *.pre-xdp-upgrade 备份恢复 apt 源"
+            return 1
+        fi
+        return 0
+    fi
+
+    warn "no automatic upgrade path on distro '${DISTRO_ID:-unknown}'; install a kernel >= ${req_maj}.${req_min} manually and reboot" \
+        "发行版 '${DISTRO_ID:-unknown}' 无自动升级路径；请手动安装 >= ${req_maj}.${req_min} 的内核并重启"
+    return 1
+}
+
+
 # Applies the kernel verdict to ENABLE_XDP. Runs after collect_xdp_choice:
-# an unsupported kernel always disables XDP (explicit --xdp cannot conjure
-# AF_XDP sockets); a degraded kernel disables the DEFAULT but honours an
-# explicit operator request with a loud warning.
+# an unsupported kernel/driver always disables XDP (explicit --xdp cannot
+# conjure native XSK support); a degraded kernel only warns —
+# collect_xdp_choice already flipped the < 5.4 default where no explicit
+# opt-in exists.
 decide_xdp_kernel_gate() {
+    # An existing config's xdp: section stays authoritative — collect_xdp_choice
+    # already warned about it; flipping ENABLE_XDP here would only print a
+    # misleading "disabled" message while the file keeps enabled=true.
+    if [ "$IS_FRESH" -eq 0 ] && existing_config_has_xdp; then
+        return 0
+    fi
     case "$XDP_KERNEL_VERDICT" in
         unsupported)
             if [ "$ENABLE_XDP" = "yes" ]; then
                 ENABLE_XDP="no"
                 warn "XDP disabled: $XDP_KERNEL_REASON" \
                     "已禁用 XDP：$XDP_KERNEL_REASON"
-                log "  pass --upgrade-kernel to install a newer kernel, then reboot and re-run this installer" \
-                    "  可传 --upgrade-kernel 安装新内核，重启后重新运行本安装脚本"
             fi
             ;;
         degraded)
-            if [ "$ENABLE_XDP" = "yes" ] && [ "$XDP_EXPLICIT" -eq 0 ]; then
-                ENABLE_XDP="no"
-                warn "XDP disabled: $XDP_KERNEL_REASON" "已禁用 XDP：$XDP_KERNEL_REASON"
-                log "  pass --upgrade-kernel for a newer kernel, or --xdp to force-enable on this kernel" \
-                    "  可传 --upgrade-kernel 升级内核，或传 --xdp 在当前内核上强制启用"
-            elif [ "$ENABLE_XDP" = "yes" ]; then
-                warn "XDP kept enabled on a degraded kernel ($XDP_KERNEL_REASON) — attach may fail; the runtime reports it" \
-                    "内核低于推荐版本仍强制启用 XDP（$XDP_KERNEL_REASON）——attach 可能失败，运行时会如实上报"
+            if [ "$ENABLE_XDP" = "yes" ]; then
+                warn "XDP stays enabled on a below-floor kernel ($XDP_KERNEL_REASON) — the runtime requires driver-managed XSK and will refuse attach if the driver cannot provide it" \
+                    "内核低于推荐版本仍保持启用 XDP（${XDP_KERNEL_REASON}）——运行时要求驱动管理 XSK，驱动不支持时会显式拒绝 attach"
             fi
             ;;
     esac
@@ -1904,8 +2166,13 @@ collect_xdp_choice() {
         existing_cfg="$(existing_api_config_path || true)"
         if [ "$XDP_KERNEL_VERDICT" != "ok" ] && [ -n "$existing_cfg" ] \
             && grep -Eq '^[[:space:]]+enabled:[[:space:]]*true' "$existing_cfg" 2>/dev/null; then
-            warn "existing config enables XDP but $XDP_KERNEL_REASON — the runtime will report attach failures" \
-                "现有配置启用了 XDP，但 $XDP_KERNEL_REASON——运行时会如实上报 attach 失败"
+            if [ "$XDP_KERNEL_VERDICT" = "unsupported" ]; then
+                warn "existing config enables XDP but $XDP_KERNEL_REASON — the runtime will refuse to attach and serve the kernel path" \
+                    "现有配置启用了 XDP，但 ${XDP_KERNEL_REASON}——运行时会拒绝 attach 并留在内核路径"
+            else
+                warn "existing config enables XDP; $XDP_KERNEL_REASON — the runtime requires driver-managed XSK and reports the actual attach mode" \
+                    "现有配置启用了 XDP；${XDP_KERNEL_REASON}——运行时要求驱动管理 XSK 并如实上报实际 attach 模式"
+            fi
         fi
         return 0
     fi
@@ -1914,8 +2181,16 @@ collect_xdp_choice() {
         warn "XDP dataplane not offered: $XDP_KERNEL_REASON" "XDP 数据面不可用：$XDP_KERNEL_REASON"
         return 0
     fi
-    if [ "$XDP_KERNEL_VERDICT" = "degraded" ] && [ "$XDP_EXPLICIT" -eq 0 ]; then
+    # Below the 5.4 bidirectional floor the default flips to disabled unless
+    # the operator explicitly opted in — the same default the previous
+    # installer used. Driver-floor misses (e.g. virtio_net < 6.11) are
+    # already verdict=unsupported above: the runtime requires driver-managed
+    # XSK and refuses the kernel-emulated generic path.
+    if [ "$XDP_KERNEL_VERDICT" = "degraded" ] && ! kernel_version_ge 5 4 \
+        && [ "$XDP_EXPLICIT" -eq 0 ]; then
         ENABLE_XDP="no"
+        warn "kernel < 5.4 cannot reliably host the bidirectional AF_XDP dataplane; XDP defaults to disabled — pass --xdp to force-enable" \
+            "内核 < 5.4 无法可靠承载双向 AF_XDP 数据面；XDP 默认禁用——可传 --xdp 强制启用"
     fi
     if prompt_available && [ "$ASSUME_YES" -eq 0 ]; then
         local default="yes"
@@ -1931,7 +2206,22 @@ collect_xdp_choice() {
         XDP_EXPLICIT=1
     fi
     if [ "$ENABLE_XDP" = "yes" ]; then
-        log "XDP dataplane: enabled (bidirectional)" "XDP 数据面：启用（双向）"
+        XDP_MODE="${XDP_MODE:-proxy}"
+        if prompt_available && [ "$ASSUME_YES" -eq 0 ]; then
+            local mode_answer=""
+            printf '%s\n' "选择 XDP 工作模式 / Select XDP mode:"
+            printf '%s\n' "  1) proxy   — 全量数据面：入向代理 + 出向 AF_XDP 回源（流量经 XSK，不占内核栈）"
+            printf '%s\n' "             full dataplane: inbound proxy + outbound AF_XDP upstream (traffic via XSK sockets)"
+            printf '%s\n' "  2) protect — 仅防御：XDP 程序做分类/ACL/限速，全部流量留在内核栈"
+            printf '%s\n' "             defense only: XDP classifies/ACL/rate-limits, ALL traffic stays on the kernel stack"
+            printf '%s' "XDP mode [1=proxy default, 2=protect]: "
+            read_prompt mode_answer || mode_answer=""
+            case "$mode_answer" in
+                2|protect|p|P) XDP_MODE="protect" ;;
+                *) XDP_MODE="proxy" ;;
+            esac
+        fi
+        log "XDP dataplane: enabled (mode=$XDP_MODE)" "XDP 数据面：启用（模式=$XDP_MODE）"
     else
         log "XDP dataplane: disabled" "XDP 数据面：禁用"
     fi
@@ -1970,7 +2260,6 @@ migrate_runtime_layout() {
         for config_candidate in "${config_candidates[@]}"; do
             if [ -e "$config_candidate" ]; then
                 run cp -a "$config_candidate" "$config_path"
-                run cp -a "$config_candidate" "$BACKUP_DIR/api_node.yaml.migrated-original"
                 break
             fi
         done
@@ -2027,7 +2316,7 @@ write_xdp_config_block() {
         # at runtime by the 30s port-sync task.
         printf '  interfaces:\n'
         printf '    - name: %s\n' "$(yaml_quote "$iface")"
-        printf '      mode: proxy\n'
+        printf '      mode: %s\n' "${XDP_MODE:-proxy}"
         printf '      queues: %s\n' "$(iface_queues_spec "$iface")"
     else
         # Empty interfaces lets ensure_current_xdp_auto_config derive the
@@ -2062,9 +2351,6 @@ write_api_node_config() {
     [ "$first" -eq 0 ] || die "fresh install requires at least one non-empty API endpoint" "全新安装至少需要一个非空 API 地址"
 
     run mkdir -p "$INSTALL_DIR/configs"
-    if [ -e "$config_path" ]; then
-        run cp -a "$config_path" "$BACKUP_DIR/api_node.yaml.config-original"
-    fi
 
     if [ "$DRY_RUN" -eq 0 ]; then
         {
@@ -2150,7 +2436,6 @@ migrate_legacy_runtime_xdp() {
         fi
         if [ "$DRY_RUN" -eq 0 ]; then
             run mkdir -p "$INSTALL_DIR/configs"
-            run cp -a "$api_cfg" "$BACKUP_DIR/api_node.yaml.pre-runtime-xdp-move"
             awk '
                 /^xdp:[[:space:]]*$/ { inblk=1; print; next }
                 inblk && /^[[:alnum:]_.]/ { inblk=0 }
@@ -2165,20 +2450,19 @@ migrate_legacy_runtime_xdp() {
     done < <(legacy_runtime_config_files)
 }
 
-# Deletes every obsolete runtime.yaml/runtime.yml found on disk (each is
-# backed up first). Non-xdp content (runtime.mode, cluster.*) is dropped
-# intentionally — the runtime no longer parses it.
+# Deletes every obsolete runtime.yaml/runtime.yml found on disk. Non-xdp
+# content (runtime.mode, cluster.*) is dropped intentionally — the runtime
+# no longer parses it.
 remove_legacy_runtime_configs() {
     local rt=""
     while IFS= read -r rt; do
         [ -n "$rt" ] || continue
         if [ "$DRY_RUN" -eq 0 ]; then
-            run cp -a "$rt" "$BACKUP_DIR/$(sanitize_path "$rt").removed"
             run rm -f "$rt"
-            warn "removed obsolete runtime config $rt (backup in $BACKUP_DIR)" \
-                "已移除废弃的运行时配置 ${rt}（备份于 ${BACKUP_DIR}）"
+            warn "removed obsolete runtime config $rt" \
+                "已移除废弃的运行时配置 ${rt}"
         else
-            log "+ rm -f $rt (backup first)"
+            log "+ rm -f $rt"
         fi
     done < <(legacy_runtime_config_files)
 }
@@ -2208,7 +2492,6 @@ repair_xdp_interface_entries() {
         log "+ repair xdp.interfaces entries missing mode/queues in $rt"
         return 0
     fi
-    run cp -a "$rt" "$BACKUP_DIR/$(basename "$rt").pre-iface-repair"
     awk '
         function rxq(name,   cmd, n, out, i) {
             cmd = "ls /sys/class/net/" name "/queues 2>/dev/null | grep -c ^rx-"
@@ -2274,207 +2557,12 @@ write_xdp_config() {
     fi
 }
 
-manifest_value() {
-    local backup_dir="$1"
-    local key="$2"
-    local manifest="$backup_dir/manifest.current.txt"
-    if [ ! -f "$manifest" ]; then
-        manifest="$backup_dir/manifest.go-original.txt"
-    fi
-    [ -f "$manifest" ] || return 0
-    sed -n "s/^${key}=//p" "$manifest" | tail -n 1
-}
-
-backup_dirs() {
-    local backup=""
-    [ -d "$BACKUP_ROOT" ] || return 0
-    for backup in "$BACKUP_ROOT"/*; do
-        [ -d "$backup" ] || continue
-        if [ -f "$backup/manifest.current.txt" ] || [ -f "$backup/manifest.go-original.txt" ] || ls "$backup"/*.go-original "$backup"/*.rust-current >/dev/null 2>&1; then
-            printf '%s\n' "$backup"
-        fi
-    done | sort -r
-}
-
-restore_backup_dirs() {
-    local backup=""
-    [ -d "$BACKUP_ROOT" ] || return 0
-    for backup in "$BACKUP_ROOT"/*; do
-        [ -d "$backup" ] || continue
-        if [ -f "$backup/manifest.go-original.txt" ] || ls "$backup"/*.go-original >/dev/null 2>&1; then
-            printf '%s\n' "$backup"
-        fi
-    done | sort -r
-}
-
-list_backups() {
-    local backup=""
-    local created=""
-    local version=""
-    local existing=""
-    section "可用备份 / Available Backups"
-    if ! backup_dirs | grep -q .; then
-        bi "  未找到备份目录：$BACKUP_ROOT" "  No backups found under: $BACKUP_ROOT"
-        return
-    fi
-    while IFS= read -r backup; do
-        [ -d "$backup" ] || continue
-        created="$(manifest_value "$backup" created_at)"
-        version="$(manifest_value "$backup" version)"
-        existing="$(manifest_value "$backup" existing_binary)"
-        printf '  %s\n' "$backup"
-        [ -n "$created" ] && kv "created" "$created"
-        [ -n "$version" ] && kv "rust version" "$version"
-        [ -n "$existing" ] && kv "go original" "$existing"
-    done < <(backup_dirs)
-}
-
-choose_restore_backup() {
-    local backups=()
-    local idx=0
-    local choice=""
-    local backup=""
-
-    if [ -n "$RESTORE_BACKUP" ]; then
-        printf '%s\n' "$RESTORE_BACKUP"
-        return
-    fi
-
-    read_lines_into backups < <(restore_backup_dirs)
-    [ "${#backups[@]}" -gt 0 ] || die "no backups found under $BACKUP_ROOT" "$BACKUP_ROOT 下未找到备份"
-
-    if [ "$ASSUME_YES" -eq 1 ] || ! prompt_available; then
-        printf '%s\n' "${backups[0]}"
-        return
-    fi
-
-    # Display output goes to stderr; only the chosen path is printed to stdout
-    # so the caller's command substitution captures a clean value.
-    section "选择恢复备份 / Choose Restore Backup" >&2
-    idx=1
-    for backup in "${backups[@]}"; do
-        printf '  %s%d)%s %s\n' "$BOLD" "$idx" "$RESET" "$backup" >&2
-        idx=$((idx + 1))
-    done
-    printf '\n输入序号 | Enter choice %s[1]%s: ' "$DIM" "$RESET" >&2
-    read_prompt choice || choice=""
-    choice="${choice:-1}"
-    case "$choice" in
-        ''|*[!0-9]*)
-            choice=1
-            ;;
-    esac
-    if [ "$choice" -lt 1 ] || [ "$choice" -gt "${#backups[@]}" ]; then
-        choice=1
-    fi
-    printf '%s\n' "${backups[$((choice - 1))]}"
-}
-
-restore_file() {
-    local source="$1"
-    local target="$2"
-    local label="$3"
-    local target_dir=""
-    local current_name=""
-
-    if [ ! -e "$source" ]; then
-        warn "missing backup for $label: $source" "$label 的备份缺失: $source"
-        return
-    fi
-
-    target_dir="${target%/*}"
-    if [ "$target_dir" = "$target" ] || [ -z "$target_dir" ]; then
-        target_dir="."
-    fi
-    run mkdir -p "$target_dir"
-
-    if [ -e "$target" ]; then
-        current_name="$(sanitize_path "$target").rust-current"
-        run cp -a "$target" "$RESTORE_CURRENT_DIR/$current_name"
-    fi
-    run cp -a "$source" "$target"
-}
-
-restore_go_original() {
-    local backup_dir=""
-    local existing_binary=""
-    local existing_source=""
-    local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
-    local service_was_active=0
-
-    backup_dir="$(choose_restore_backup)"
-    [ -d "$backup_dir" ] || die "restore backup dir does not exist: $backup_dir" "恢复备份目录不存在: $backup_dir"
-
-    section "恢复摘要 / Restore Summary"
-    kv "backup" "$backup_dir"
-    kv "service" "$SERVICE_NAME"
-
-    if [ "$ASSUME_YES" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-        ask_yes_no "确认从该备份恢复 Go 原版吗？" "Restore Go original from this backup?" "no" || die "aborted" "已中止"
-    fi
-
-    RESTORE_CURRENT_DIR="$BACKUP_ROOT/restore-current-$(date +%Y%m%d-%H%M%S)"
-    run mkdir -p "$RESTORE_CURRENT_DIR"
-
-    if systemctl_available && systemctl is-active --quiet "$SERVICE_NAME"; then
-        service_was_active=1
-        run systemctl stop "$SERVICE_NAME"
-    fi
-
-    existing_binary="$(manifest_value "$backup_dir" existing_binary)"
-    if [ -n "$existing_binary" ] && [ "$existing_binary" != "not found" ]; then
-        existing_source="$backup_dir/$(sanitize_path "$existing_binary").go-original"
-        restore_file "$existing_source" "$existing_binary" "original Go binary"
-    fi
-
-    restore_file "$backup_dir/usr_bin_cloud-node.go-original" "/usr/bin/cloud-node" "/usr/bin/cloud-node"
-    restore_file "$backup_dir/${SERVICE_NAME}.service.go-original" "$service_file" "systemd service"
-
-    # Restore any legacy unit files captured during migration unregister.
-    if [ -d "$backup_dir/legacy-units/etc/systemd/system" ]; then
-        local legacy_src=""
-        local legacy_dst=""
-        for legacy_src in "$backup_dir/legacy-units/etc/systemd/system"/*; do
-            [ -e "$legacy_src" ] || continue
-            legacy_dst="/etc/systemd/system/$(basename "$legacy_src")"
-            if [ -d "$legacy_src" ]; then
-                run mkdir -p "$legacy_dst"
-                run cp -a "$legacy_src/." "$legacy_dst/"
-            else
-                restore_file "$legacy_src" "$legacy_dst" "legacy unit $legacy_dst"
-            fi
-        done
-    fi
-
-    if systemctl_available; then
-        run systemctl daemon-reload
-    fi
-
-    # Restore always preserves prior run state: restart only if it was running.
-    if [ "$service_was_active" -eq 1 ] && systemctl_available; then
-        run systemctl start "$SERVICE_NAME"
-    fi
-
-    ok "restore completed" "恢复完成"
-    log "current Rust files backed up at: $RESTORE_CURRENT_DIR" "当前 Rust 文件已备份到: $RESTORE_CURRENT_DIR"
-}
-
 confirm_install() {
     if [ "$ASSUME_YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
         return
     fi
     ask_yes_no "确认开始安装吗？" "Proceed with install?" "yes" || die "aborted" "已中止"
 }
-
-if [ "$ACTION" = "list-backups" ]; then
-    list_backups
-    exit 0
-fi
-
-if [ "$ACTION" = "restore" ]; then
-    restore_go_original
-    exit 0
-fi
 
 EXISTING_BINARY="$(find_existing_cloud_node || true)"
 SERVICE_WORKDIR="$(systemd_value WorkingDirectory || true)"
@@ -2517,30 +2605,16 @@ if [ -z "$EXISTING_API_CONFIG_DIR" ]; then
 fi
 
 collect_api_config
-probe_xdp_kernel
 collect_xdp_choice
 decide_xdp_kernel_gate
 
-BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
 ASSET_NAME="$(detect_asset_name)"
 NORMALIZED_VERSION="$(normalize_version)"
 DOWNLOAD_URL="$(download_url_for "$NORMALIZED_VERSION" "$ASSET_NAME")"
 EXISTING_RUNTIME="not-found"
-CURRENT_BACKUP_SUFFIX="current"
 if [ -n "$EXISTING_BINARY" ]; then
     EXISTING_RUNTIME="$(detect_runtime "$EXISTING_BINARY")"
 fi
-case "$EXISTING_RUNTIME" in
-    go)
-        CURRENT_BACKUP_SUFFIX="go-original"
-        ;;
-    rust)
-        CURRENT_BACKUP_SUFFIX="rust-current"
-        ;;
-    *)
-        CURRENT_BACKUP_SUFFIX="current"
-        ;;
-esac
 
 SERVICE_WAS_ACTIVE=0
 LEGACY_WAS_RUNNING=0
@@ -2574,7 +2648,6 @@ kv "install binary" "$INSTALL_BINARY"
 kv "config dir" "$INSTALL_DIR/configs"
 kv "data dir" "$INSTALL_DIR/data"
 kv "logs dir" "$INSTALL_DIR/logs"
-kv "backup dir" "$BACKUP_DIR"
 kv "service" "$SERVICE_NAME"
 kv "auto start" "$AUTO_START"
 kv "GeoIP dir" "$GEOIP_DIR"
@@ -2590,15 +2663,16 @@ if [ "$EXISTING_RUNTIME" = "rust" ]; then
 elif [ "$EXISTING_RUNTIME" = "go" ]; then
     ok "existing Go cloud-node will be migrated to the Rust release" "现有 Go 节点将迁移到 Rust 版本"
 elif [ "$EXISTING_RUNTIME" = "unknown" ]; then
-    warn "existing binary runtime is unknown; it will still be backed up before install" "现有二进制运行时未知；安装前仍会备份"
+    warn "existing binary runtime is unknown; it will be replaced by the selected release" "现有二进制运行时未知；将被所选版本替换"
 fi
 
 confirm_install
-# Kernel upgrade attempt — only when the operator opted in AND the running
-# kernel failed the XDP gate. A successful install still cannot enable XDP
-# this run (the new kernel needs a reboot); decide_xdp_kernel_gate already
-# forced xdp.enabled=false, which stays correct.
-maybe_upgrade_kernel || true
+# Kernel/OS upgrade attempt — only when the operator opted in AND the
+# running kernel failed the XDP native-XSK gate. Kernel-first; the OS
+# release upgrade is offered only when no kernel package on this release
+# can cross the floor. Both paths require double confirmation and reboot
+# automatically once confirmed.
+offer_xdp_upgrade || true
 # Install/verify the nftables dial-guard prerequisite before touching
 # anything — when it cannot be satisfied the install aborts here with
 # remediation, leaving the existing deployment fully intact.
@@ -2610,62 +2684,6 @@ cleanup() {
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
-
-run mkdir -p "$BACKUP_DIR"
-
-if [ -n "$EXISTING_BINARY" ] && [ -e "$EXISTING_BINARY" ]; then
-    backup_name="$(sanitize_path "$EXISTING_BINARY").$CURRENT_BACKUP_SUFFIX"
-    run cp -a "$EXISTING_BINARY" "$BACKUP_DIR/$backup_name"
-fi
-
-if [ -e /usr/bin/cloud-node ]; then
-    run cp -a /usr/bin/cloud-node "$BACKUP_DIR/usr_bin_cloud-node.$CURRENT_BACKUP_SUFFIX"
-fi
-
-if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
-    run cp -a "/etc/systemd/system/${SERVICE_NAME}.service" "$BACKUP_DIR/${SERVICE_NAME}.service.$CURRENT_BACKUP_SUFFIX"
-fi
-
-if systemctl_available && systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
-    if [ "$DRY_RUN" -eq 0 ]; then
-        systemctl cat "$SERVICE_NAME" > "$BACKUP_DIR/${SERVICE_NAME}.service.cat.$CURRENT_BACKUP_SUFFIX.txt"
-    else
-        log "+ systemctl cat $SERVICE_NAME > $BACKUP_DIR/${SERVICE_NAME}.service.cat.$CURRENT_BACKUP_SUFFIX.txt"
-    fi
-fi
-
-if [ "$DRY_RUN" -eq 0 ]; then
-    {
-        printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        printf 'repo=%s\n' "$REPO"
-        printf 'version=%s\n' "$NORMALIZED_VERSION"
-        printf 'asset=%s\n' "$ASSET_NAME"
-        printf 'fresh_install=%s\n' "$IS_FRESH"
-        printf 'existing_binary=%s\n' "${EXISTING_BINARY:-not found}"
-        printf 'existing_runtime_guess=%s\n' "$EXISTING_RUNTIME"
-        printf 'backup_suffix=%s\n' "$CURRENT_BACKUP_SUFFIX"
-        if [ -n "$EXISTING_BINARY" ] && [ -f "$EXISTING_BINARY" ]; then
-            printf 'existing_sha256=%s\n' "$(sha256_file "$EXISTING_BINARY")"
-        fi
-        printf 'install_dir=%s\n' "$INSTALL_DIR"
-        printf 'install_binary=%s\n' "$INSTALL_BINARY"
-        printf 'config_dir=%s\n' "$INSTALL_DIR/configs"
-        printf 'data_dir=%s\n' "$INSTALL_DIR/data"
-        printf 'logs_dir=%s\n' "$INSTALL_DIR/logs"
-        printf 'geoip_dir=%s\n' "$GEOIP_DIR"
-        if [ "$IS_FRESH" -eq 1 ]; then
-            printf 'api_config=%s\n' "$INSTALL_DIR/configs/api_node.yaml"
-            printf 'api_endpoints=%s\n' "$API_ENDPOINTS"
-            printf 'node_id=%s\n' "$NODE_ID"
-            printf 'timezone=%s\n' "${TIMEZONE:-keep current}"
-        fi
-    } > "$BACKUP_DIR/manifest.current.txt"
-    if [ "$CURRENT_BACKUP_SUFFIX" = "go-original" ]; then
-        cp -a "$BACKUP_DIR/manifest.current.txt" "$BACKUP_DIR/manifest.go-original.txt"
-    fi
-else
-    log "+ write $BACKUP_DIR/manifest.current.txt"
-fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
     download_checked "$DOWNLOAD_URL" "$TMP_DIR/$ASSET_NAME" "$ASSET_NAME"
@@ -2702,7 +2720,7 @@ fi
 write_api_node_config
 # Carry the xdp: block out of any legacy runtime.yaml/yml into
 # api_node.yaml, write a fresh xdp block when none exists, then delete the
-# obsolete runtime config files (backed up first). Order matters: migrate
+# obsolete runtime config files. Order matters: migrate
 # before write so an existing explicit xdp choice stays authoritative.
 migrate_legacy_runtime_xdp
 write_xdp_config
@@ -2747,11 +2765,7 @@ fi
 report_nic_xdp
 
 ok "done" "完成"
-log "previous binary backup: $BACKUP_DIR" "旧二进制备份: $BACKUP_DIR"
 log "Rust binary installed at: $INSTALL_BINARY" "Rust 二进制已安装到: $INSTALL_BINARY"
 if [ "$AUTO_START" != "yes" ]; then
     log "service was not started. To start later: systemctl start ${SERVICE_NAME} or cd ${INSTALL_DIR} && ${INSTALL_BINARY} start" "服务未启动。需要时执行: systemctl start ${SERVICE_NAME} 或 cd ${INSTALL_DIR} && ${INSTALL_BINARY} start"
-fi
-if [ "$LEGACY_WAS_RUNNING" -eq 1 ] || [ -n "${EXISTING_BINARY:-}" ]; then
-    log "to roll back to the pre-migration backup: $0 --restore --restore-backup $BACKUP_DIR" "如需回滚到迁移前备份: $0 --restore --restore-backup $BACKUP_DIR"
 fi

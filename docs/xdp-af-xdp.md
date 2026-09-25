@@ -46,9 +46,10 @@ xdp:
 - `interfaces[].mode`：`observe`、`protect`、`proxy`。
 - `interfaces[].localIps`：proxy 模式下可限制只旁路目标为这些本机 IP 的包；为空表示不启用本机 IP 过滤。
 - `interfaces[].frameSize`：UMEM frame size，默认 `2048`。
-- `interfaces[].xskMode`（EN-12）：AF_XDP bind 模式探测策略，默认 `auto`。
-  - `auto`：先尝试 zero-copy bind，驱动不支持时显式回退 copy——落地模式记录到每队列状态 `xsk_mode`，探测失败原因写入 `detail`。
-  - `copy`：从不尝试 zero-copy，直接按 copy 模式 bind。
+- `interfaces[].xskMode`（EN-12）：AF_XDP bind 模式策略，默认 `auto`。
+  - 前置门控（`auto`/`zero-copy`）：运行时先验证网卡驱动有原生 XSK 支持（`xsk_driver_native_floor`，如 virtio_net 需内核 ≥6.11、主流服务器网卡 ≥5.4）；不满足时队列 socket 创建显式拒绝并写入状态——内核模拟的 generic 路径不是受支持数据面（曾在 Debian 6.1 + virtio_net 生产负载下 TX 饱和、SNI 断流）。
+  - `auto`：先尝试 zero-copy bind，失败时回退到驱动 copy 路径（virtio_net 自 6.13 起声明 ZEROCOPY 但还要求 hypervisor 协商 VIRTIO_F_ACCESS_PLATFORM，不满足则落 copy；6.11–6.12 的 virtio_net 只有 copy 模式）；落地模式记录到每队列状态 `xsk_mode`。
+  - `copy`：显式诊断/测试选项，直接按 copy 模式 bind 且跳过驱动门控——在无驱动 XSK 的环境（veth、netns 冒烟）会落到 generic 路径，不用于生产。
   - `zero-copy`：强制 zero-copy；驱动不支持时该队列 socket 创建显式失败（状态可见），不静默降级。
 - `proxy.protocols`：允许进入 AF_XDP proxy 数据面的协议族。
 - `proxy.ports`：显式发布到 eBPF map 的协议和端口。

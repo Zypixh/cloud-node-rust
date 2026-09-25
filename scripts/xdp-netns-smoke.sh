@@ -530,6 +530,10 @@ xdp:
     - name: $HOST_IF
       queues: [0]
       mode: proxy
+      # veth has no driver-native XSK — the runtime gate refuses auto/zero-copy
+      # binds; explicit copy opts into the kernel generic path for this
+      # test-only dataplane.
+      xskMode: copy
       localIps:
         - $HOST_IP
         - $HOST_IP6
