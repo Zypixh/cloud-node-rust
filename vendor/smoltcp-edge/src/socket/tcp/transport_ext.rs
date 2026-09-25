@@ -592,8 +592,28 @@ impl ExtTransport {
                     .map(|r| TcpSeqNumber(r as i32))
                 {
                     Some(edge) => {
+                        // A record sent (or re-sent) too recently to be
+                        // judged lost again is still legitimately in
+                        // flight — re-marking it on every dupack batch
+                        // paces re-sends by ACK arrival instead of RTO,
+                        // which turns one hole into a same-seq re-send
+                        // storm under a dupack flood (observed ~300
+                        // copies of a 71-byte hole segment inside 700 ms
+                        // on the afxdp path). Fresh sends use the RACK
+                        // reorder window; a *retransmitted* record gets
+                        // a full srtt of benefit — its evidence can't
+                        // arrive faster than the path returns it.
+                        let reo = to_smol(self.reo_wnd());
+                        let retx_reo = to_smol(
+                            self.reo_wnd()
+                                .max(self.rtt.srtt.unwrap_or_else(|| self.reo_wnd())),
+                        );
                         for rec in self.board.iter_mut() {
                             if rec.sacked || rec.lost || rec.end_seq > edge {
+                                continue;
+                            }
+                            let dwell = if rec.retransmitted { retx_reo } else { reo };
+                            if rec.last_tx + dwell > now {
                                 continue;
                             }
                             rec.lost = true;
@@ -602,9 +622,22 @@ impl ExtTransport {
                         }
                     }
                     None => {
-                        if let Some(rec) =
-                            self.board.iter_mut().find(|r| !r.sacked && !r.lost)
-                        {
+                        // No SACK evidence: mark only the gap head, and
+                        // only if it has dwelled past its recency
+                        // window — same guard as the SACK frontier
+                        // above (retransmitted records get a full srtt).
+                        let reo = to_smol(self.reo_wnd());
+                        let retx_reo = to_smol(
+                            self.reo_wnd()
+                                .max(self.rtt.srtt.unwrap_or_else(|| self.reo_wnd())),
+                        );
+                        if let Some(rec) = self.board.iter_mut().find(|r| {
+                            !r.sacked
+                                && !r.lost
+                                && r.last_tx
+                                    + if r.retransmitted { retx_reo } else { reo }
+                                    <= now
+                        }) {
                             rec.lost = true;
                             self.pipe = self.pipe.saturating_sub(rec.len());
                             lost_now += rec.len();

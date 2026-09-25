@@ -680,6 +680,14 @@ const PMTU_PROBE_MSS: usize = 512;
 /// blackhole probe arms — one strike can still be ordinary loss.
 const PMTU_BLACKHOLE_RTO_THRESHOLD: u8 = 2;
 
+/// Consecutive no-progress RTOs before the connection is abandoned.
+/// Upstream smoltcp retransmits forever; on the AF_XDP dataplane a
+/// dead-peer session keeps burning encode+produce work per RTO cycle
+/// and refreshes its own activity timestamp, so nothing ever reaps it.
+/// ~10 timeouts at backed-off RTO bounds the zombie lifetime to a few
+/// minutes (Linux TCP_RETRIES2 gives up around 15).
+const RTO_NO_PROGRESS_ABORT: u8 = 10;
+
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
@@ -3185,6 +3193,14 @@ impl<'a> Socket<'a> {
                 // PMTU_PROBE_MSS. Skipped while an ICMP cap is installed:
                 // a reported PTB already carries the path's answer.
                 self.rto_no_progress = self.rto_no_progress.saturating_add(1);
+                if self.rto_no_progress >= RTO_NO_PROGRESS_ABORT {
+                    // smoltcp-edge: bound zombie sessions — the peer has
+                    // not acknowledged a single byte across this many
+                    // timeout generations; retransmitting forever only
+                    // burns dataplane CPU. Same give-up as `timed_out`.
+                    net_debug!("retransmit abandon: no ack progress");
+                    self.set_state(State::Closed);
+                }
                 if self.rto_no_progress >= PMTU_BLACKHOLE_RTO_THRESHOLD
                     && self.path_mtu_cap.is_none()
                 {
@@ -3674,6 +3690,29 @@ impl<'a> Socket<'a> {
             && matches!(self.acc_ecn.mode, EcnMode::AccEcn | EcnMode::ClassicEcn)
         {
             ip_repr.set_ecn(2); // ECT(0)
+        }
+
+        // smoltcp-edge: suppress content-free emits. A dispatch that
+        // entered the `seq_to_transmit` branch but produced no payload
+        // (pacing gate, zero cwnd, or a full send buffer), no control
+        // flag, and carries no new information — no ACK debt, no window
+        // update, no SACK ranges, no pending ECN feedback, no CWR —
+        // must not go on the wire: the bare ACK duplicates
+        // `remote_last_ack` exactly and only burns a TX cycle. Observed
+        // on the AF_XDP dataplane: ~33k/s empty ACKs per queue pair
+        // while pacing held data, starving real segments. The pacing
+        // deadline is still reported through `poll_at` so the retry
+        // arrives on time.
+        if repr.payload.is_empty()
+            && repr.control == TcpControl::None
+            && !self.ack_to_transmit()
+            && !self.window_to_update()
+            && !self.accecn_ack_needed
+            && !self.cwr_pending
+            && !commit_feedback
+            && repr.sack_ranges.iter().all(|r| r.is_none())
+        {
+            return Ok(());
         }
 
         // Actually send the packet. If this succeeds, it means the packet is in
@@ -11019,6 +11058,87 @@ mod test {
                 ..RECV_TEMPL
             }
         ]);
+    }
+
+    #[test]
+    fn test_pacing_blocked_data_emits_nothing() {
+        use cloud_node_transport::cc::reference::CubicRef;
+
+        // Regression: when the pacing gate holds new data before its
+        // deadline, dispatch must produce NO packet at all — previously
+        // each poll still committed the default bare ACK, which flooded
+        // the AF_XDP dataplane with ~33k/s content-free frames.
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.remote_win_len = 65535;
+        s.remote_mss = 1024;
+        s.set_transport_controller(Box::new(CubicRef::new(1024)));
+
+        let data = [b'x'; 8192];
+        s.send_slice(&data[..]).unwrap();
+
+        recv!(s, time 0, [
+            TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &data[..1024],
+                ..RECV_TEMPL
+            },
+            TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 1024,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &data[1024..2048],
+                ..RECV_TEMPL
+            },
+            TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 2048,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &data[2048..3072],
+                ..RECV_TEMPL
+            },
+            TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 3072,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &data[3072..4096],
+                ..RECV_TEMPL
+            }
+        ]);
+
+        // ACK one segment: cwnd opens for two more, but pacing spaces
+        // them ~10ms out (102400 B/s over 50ms srtt → due at ~t=60).
+        send!(
+            s,
+            time 50,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 1024),
+                window_len: 65535,
+                ..SEND_TEMPL
+            }
+        );
+
+        // Pacing spaces subsequent sends ~10ms out — the first post-ACK
+        // segment goes immediately; the NEXT is held until ~t=70.
+        recv!(s, time 60, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 4096,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[4096..5120],
+            ..RECV_TEMPL
+        }));
+
+        // Repeated polls before the pacing deadline must stay silent —
+        // not a single bare ACK (regression for the AF_XDP empty-ACK
+        // flood, ~33k/s content-free frames while pacing held data).
+        for t in [61i64, 65, 69] {
+            recv_nothing!(s, time t);
+        }
+
+        // At the deadline the queued segment finally appears.
+        recv!(s, time 70, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 5120,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[5120..6144],
+            ..RECV_TEMPL
+        }));
     }
 
     #[test]
