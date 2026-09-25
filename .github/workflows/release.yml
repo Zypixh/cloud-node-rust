@@ -214,6 +214,16 @@ jobs:
 
       - name: Build XDP eBPF Object
         shell: bash
+        env:
+          # Pin host-tool codegen to the fleet floor: without this the
+          # step falls back to .cargo/config.toml's target-cpu=native,
+          # compiling xtask (and host deps) for whatever CPU the runner
+          # happens to have — the mbx store then caches that binary and a
+          # later run on a different CPU model restores it and SIGILLs
+          # (observed: arm64 legs, exit 132). The bpf crate build is
+          # unaffected — xtask compiles it with its own
+          # CARGO_ENCODED_RUSTFLAGS (-C panic=abort).
+          RUSTFLAGS: "-C target-cpu=x86-64-v2"
         run: |
           set -euo pipefail
           # Never let a stale object survive into the package: remove any
