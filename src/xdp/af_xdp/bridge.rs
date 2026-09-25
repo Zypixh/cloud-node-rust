@@ -21,7 +21,9 @@ pub(crate) struct AfXdpUdpRouteEntry {
 #[cfg(target_os = "linux")]
 pub(crate) enum AfXdpForward {
     Udp(crate::udp_proxy::DownstreamUdpDatagram),
-    TcpFrame(Vec<u8>),
+    /// Wire-encoded TCP frame + the smoltcp emit stamp (µs) so the
+    /// downstream queue's dwell cap measures emit→wire, not hop→wire.
+    TcpFrame(Vec<u8>, i64),
 }
 
 /// T8: bounded TX deferral. A TX-ring-full frame is deferred to the next
@@ -126,6 +128,34 @@ const AF_XDP_TX_RETRY_CAP: usize = 256;
 /// (Ethernet preamble+IFG+header+FCS ≈ 38B).
 #[cfg(target_os = "linux")]
 const AF_XDP_EGRESS_OVERHEAD_BYTES: u64 = 38;
+
+/// Dwell bound for dataplane-queue latency measurement (µs). The
+/// smoltcp scoreboard stamps send records at emit time; a frame that
+/// queues for seconds afterwards still produces an ACK-time RTT sample,
+/// folding internal queue delay into the path estimate and collapsing
+/// EdgeCC's pacing/guardrail state. Emits beyond this bound are counted
+/// (`stale_dwells`) for observability — emit backpressure in the reactor
+/// is what actually keeps dwell below it. Aligned with CoDel interval.
+#[cfg(target_os = "linux")]
+const AF_XDP_MAX_FRAME_DWELL_US: i64 = 100_000;
+
+/// Stateless worker steering: a flow's owning worker is `fnv1a` of its
+/// normalized (local, peer) tuple modulo the interface's queue count —
+/// deterministic, so every packet of a flow lands on the same worker no
+/// matter which RSS queue it arrived on. Dialed flows are excluded (the
+/// dial registry owns their explicit routing).
+#[cfg(target_os = "linux")]
+fn steer_worker(flow: &AfXdpTcpFlowKey, workers: usize) -> usize {
+    let mut h = 0xcbf29ce484222325u64;
+    for addr in [flow.local_addr, flow.peer_addr] {
+        match addr {
+            SocketAddr::V4(a) => h = fnv1a(h, &a.ip().octets()),
+            SocketAddr::V6(a) => h = fnv1a(h, &a.ip().octets()),
+        }
+        h = fnv1a(h, &addr.port().to_be_bytes());
+    }
+    (h % workers.max(1) as u64) as usize
+}
 
 /// FNV-1a over (proto, src, dst, ports) — the scheduler's flow key.
 #[cfg(target_os = "linux")]
@@ -380,6 +410,15 @@ pub(crate) struct AfXdpQueueCtx {
     /// They spawn on the process-wide multi-thread runtime instead; the
     /// reactor only ever owns the dataplane (XSK, smoltcp, channels).
     pub(crate) proxy_rt: tokio::runtime::Handle,
+    /// Stateless worker steering: session ownership follows OUR hash of
+    /// the flow key over the same-interface worker set, not the NIC's
+    /// RSS decision. TCP frames whose flow hashes to a different worker
+    /// hop that worker's channel; this worker's own inbound steered
+    /// frames arrive on `steer_rx`. Indexed by position within the
+    /// interface's queue group (`steer_index` is this worker's slot).
+    pub(crate) steer_tx: Vec<mpsc::Sender<Vec<u8>>>,
+    pub(crate) steer_rx: mpsc::Receiver<Vec<u8>>,
+    pub(crate) steer_index: usize,
 }
 
 pub fn runtime() -> AfXdpRuntime {
@@ -669,6 +708,23 @@ pub(crate) async fn spawn_queue_reactors(
     // One forwarding channel per queue; the first sender per interface is
     // the cross-interface forward target.
     let mut iface_fwd: HashMap<String, mpsc::Sender<AfXdpForward>> = HashMap::new();
+    // Worker steering channels: one bounded channel per queue, every
+    // worker keeps the sender list for ITS interface's group so a frame
+    // can hop to its owning worker in O(1). Ordered by queue index.
+    let mut steer_receivers: Vec<mpsc::Receiver<Vec<u8>>> =
+        Vec::with_capacity(queue_handles.len());
+    let mut steer_senders_by_iface: HashMap<String, Vec<mpsc::Sender<Vec<u8>>>> =
+        HashMap::new();
+    for queue_handle in &queue_handles {
+        let (steer_tx, steer_rx) = mpsc::channel::<Vec<u8>>(AF_XDP_REACTOR_REQUEST_QUEUE);
+        steer_receivers.push(steer_rx);
+        steer_senders_by_iface
+            .entry(queue_handle.interface.clone())
+            .or_default()
+            .push(steer_tx);
+    }
+    let mut iface_queue_ordinal: HashMap<String, usize> = HashMap::new();
+    let mut steer_receivers = steer_receivers.into_iter();
     let mut contexts = Vec::with_capacity(queue_handles.len());
     for queue_handle in &queue_handles {
         let (downstream_tx, downstream_rx) =
@@ -682,6 +738,10 @@ pub(crate) async fn spawn_queue_reactors(
         iface_fwd
             .entry(queue_handle.interface.clone())
             .or_insert(fwd_tx);
+        let steer_index = *iface_queue_ordinal
+            .entry(queue_handle.interface.clone())
+            .and_modify(|n| *n += 1)
+            .or_insert(0);
         contexts.push(AfXdpQueueCtx {
             downstream_tx,
             downstream_rx,
@@ -693,6 +753,12 @@ pub(crate) async fn spawn_queue_reactors(
             lease: lease.clone(),
             egress_rate_bps: None,
             proxy_rt: tokio::runtime::Handle::current(),
+            steer_tx: steer_senders_by_iface
+                .get(&queue_handle.interface)
+                .cloned()
+                .unwrap_or_default(),
+            steer_rx: steer_receivers.next().expect("steer receiver per queue"),
+            steer_index,
         });
     }
     // Publish only after every queue is registered — and only when the
@@ -1016,6 +1082,9 @@ pub(crate) async fn run_queue_bridge_loop(
         lease,
         egress_rate_bps,
         proxy_rt,
+        steer_tx,
+        mut steer_rx,
+        steer_index,
     } = ctx;
     let own_interface: Arc<str> = Arc::from(queue_handle.interface.as_str());
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1032,19 +1101,44 @@ pub(crate) async fn run_queue_bridge_loop(
     // session reaps — never leave it to the caller.
     tcp_reactor.set_dial_registry(dial_registry.clone());
     // Event-driven idle wait sources. The socket is bound with
-    // XDP_USE_NEED_WAKEUP, so registering the fd with the reactor's IO
-    // driver (epoll → xsk_poll) is also what wakes the NIC driver after
-    // fill-ring starvation — readability therefore signals real RX.
-    #[cfg(target_os = "linux")]
-    let xsk_rx_ready: Option<tokio::io::unix::AsyncFd<std::os::fd::BorrowedFd<'static>>> = {
-        use std::os::fd::{AsRawFd, BorrowedFd};
-        // SAFETY: `queue_handle` outlives this AsyncFd — the socket fd it
-        // borrows stays open for the whole loop.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(queue_handle.rx.fd().as_raw_fd()) };
-        tokio::io::unix::AsyncFd::new(borrowed).ok()
+    // XDP_USE_NEED_WAKEUP, so a POLLIN poll on the fd is also what wakes
+    // the NIC driver after fill-ring starvation — readability signals
+    // real RX. A dedicated thread does that blocking poll and pushes a
+    // coalesced wake: the previous AsyncFd/epoll registration let the
+    // socket's permanently-ready EPOLLOUT keep the tokio IO driver hot,
+    // so `readable()` resolved instantly every round and the queue
+    // thread spun at 100% CPU with zero useful work.
+    let mut xsk_wake_rx = {
+        use std::os::fd::AsRawFd;
+        let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let xsk_fd = queue_handle.rx.fd().as_raw_fd();
+        std::thread::Builder::new()
+            .name(format!("xsk-wake-{}", queue_handle.queue))
+            .spawn(move || loop {
+                let mut pfd = libc::pollfd {
+                    fd: xsk_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let r = unsafe { libc::poll(&mut pfd, 1, -1) };
+                if r < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if r == 0 {
+                    continue;
+                }
+                // Bridge loop gone (dataplane retired) — channel closed.
+                if wake_tx.blocking_send(()).is_err() {
+                    break;
+                }
+            })
+            .map(|_| wake_rx)
+            .ok()
     };
-    #[cfg(not(target_os = "linux"))]
-    let xsk_rx_ready: Option<()> = None;
     // Items consumed by an idle-wake channel recv are stashed here and
     // processed first at their normal drain sites.
     let mut early_downstream: std::collections::VecDeque<crate::udp_proxy::DownstreamUdpDatagram> =
@@ -1106,6 +1200,14 @@ pub(crate) async fn run_queue_bridge_loop(
     );
     let mut aqm_drops = 0u64;
     let mut aqm_ce_marks = 0u64;
+    // Frames that exceeded the dataplane dwell bound before reaching the
+    // wire — observability only, they are still sent. A nonzero count
+    // under load means emit backpressure isn't bounding queue latency.
+    let mut stale_dwells = 0u64;
+    // Worker steering: frames hopped to a sibling worker's channel, and
+    // frames shed because that channel was full (TCP retransmit covers).
+    let mut steered_frames = 0u64;
+    let mut steer_sheds = 0u64;
     let tx_clock = crate::transport_clock::TransportClock::real();
     let mut last_status_refresh = std::time::Instant::now();
 
@@ -1121,7 +1223,7 @@ pub(crate) async fn run_queue_bridge_loop(
             let aborted = tcp_reactor.abort_all_sessions();
             let egress = tcp_reactor.poll();
             let mut sent = 0usize;
-            for (route, ip_packet) in &egress {
+            for (route, ip_packet, _) in &egress {
                 if encode_ip_reply_frame(&route.link, ip_packet, &mut encode_scratch).is_some()
                     && queue_handle
                         .send_raw_frame(&encode_scratch)
@@ -1176,6 +1278,14 @@ pub(crate) async fn run_queue_bridge_loop(
                     break;
                 }
                 cloud_node_transport::sched::Admit::Now => {}
+            }
+            // Dwell measurement only: frames past the bound still ship —
+            // the emit-side cap bounds queue depth so dwell can't reach
+            // the seconds scale that was poisoning RTT samples.
+            if tx_now.micros().saturating_sub(head.enqueued_us) as i64
+                > AF_XDP_MAX_FRAME_DWELL_US
+            {
+                stale_dwells = stale_dwells.saturating_add(1);
             }
             let stamp = cloud_node_transport::codel::Stamp {
                 enqueued_at: cloud_node_transport::TransportInstant::from_micros(
@@ -1275,6 +1385,9 @@ pub(crate) async fn run_queue_bridge_loop(
                     status.aqm_drops = aqm_drops;
                     status.aqm_ce_marks = aqm_ce_marks;
                     status.tx_inflight = queue_handle.tx_inflight() as u64;
+                    status.stale_dwells = stale_dwells;
+                    status.steered_frames = steered_frames;
+                    status.steer_sheds = steer_sheds;
                 },
             );
         }
@@ -1429,7 +1542,35 @@ pub(crate) async fn run_queue_bridge_loop(
             last_route_cache_sweep_ms = now_ms;
         }
 
+        // Steered frames from sibling workers merge into this round's
+        // RX set — the steer check below hashes them to this worker
+        // again, so they flow through the normal path untouched.
+        for _ in 0..AF_XDP_TCP_INGRESS_BUDGET {
+            match steer_rx.try_recv() {
+                Ok(frame) => frames.push(frame),
+                Err(_) => break,
+            }
+        }
         for frame in frames.drain(..) {
+            // Stateless worker steering: a TCP flow's session lives on
+            // the worker our hash picks, not the RSS queue the NIC
+            // happened to deliver it to — packets for a foreign flow
+            // hop the owner's channel (single-producer FIFO keeps
+            // per-flow ordering). Dialed flows skip this: the dial
+            // registry already routes them to their explicit owner.
+            if steer_tx.len() > 1
+                && let Some((flow, _)) = parse_tcp_flow_flags_from_frame(&frame)
+                && dial_registry.owner(&flow).is_none()
+            {
+                let target = steer_worker(&flow, steer_tx.len());
+                if target != steer_index {
+                    match steer_tx[target].try_send(frame) {
+                        Ok(()) => steered_frames = steered_frames.saturating_add(1),
+                        Err(_) => steer_sheds = steer_sheds.saturating_add(1),
+                    }
+                    continue;
+                }
+            }
             if let Some((flow, flags)) = parse_tcp_flow_flags_from_frame(&frame)
                 && tcp_reactor.should_ignore_unknown_non_syn(&flow, flags)
                 // T4: replies to node-dialed flows are demuxed below even
@@ -1860,7 +2001,7 @@ pub(crate) async fn run_queue_bridge_loop(
                         tx_now.micros(),
                     )
                 }
-                AfXdpForward::TcpFrame(frame) => PendingTx::frame(frame, tx_now.micros()),
+                AfXdpForward::TcpFrame(frame, enqueued_us) => PendingTx::frame(frame, enqueued_us.max(0) as u64),
             };
             let pending_len = pending.len();
             if matches!(
@@ -1931,11 +2072,23 @@ pub(crate) async fn run_queue_bridge_loop(
             }
         }
 
-        let tcp_egress = tcp_reactor.poll();
+        // TX backpressure hold: never pull more frames out of the reactor
+        // than the defer store can take — a saturated ring leaves the
+        // surplus inside smoltcp queueing where socket send buffers close
+        // the peer window (loss-free) instead of shedding wire frames.
+        let egress_budget = AF_XDP_TX_RETRY_CAP.saturating_sub(pending_tx_count);
+        let tcp_egress = tcp_reactor.poll_with_egress_budget(egress_budget);
         let tcp_egress_frames = tcp_egress.len();
         #[cfg(target_os = "linux")]
         AF_XDP_TCP_DIAG_EGRESS_FRAMES.fetch_add(tcp_egress_frames as u64, Ordering::Relaxed);
-        for (route, ip_packet) in tcp_egress {
+        for (route, ip_packet, enqueued_us) in tcp_egress {
+            // Dwell measurement: the emit-time stamp stays attached for
+            // observability — frames past the bound are still shipped
+            // (emit backpressure in the reactor bounds the queue, no
+            // packet is dropped here).
+            if tx_now.micros() as i64 - enqueued_us > AF_XDP_MAX_FRAME_DWELL_US {
+                stale_dwells = stale_dwells.saturating_add(1);
+            }
             if route.interface != own_interface {
                 // Cross-interface forwarding needs an owned frame; the
                 // reactor-side scratch clone only happens on this path.
@@ -1945,7 +2098,7 @@ pub(crate) async fn run_queue_bridge_loop(
                             // T8: the forward channel is bounded — a Full
                             // result is congestion shed and must be
                             // counted, never silently swallowed.
-                            match tx.try_send(AfXdpForward::TcpFrame(frame)) {
+                            match tx.try_send(AfXdpForward::TcpFrame(frame, enqueued_us)) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     congested = true;
@@ -1989,15 +2142,41 @@ pub(crate) async fn run_queue_bridge_loop(
                 );
                 continue;
             }
-            // T8 shaping gate (D-G2): token deficit defers the encoded
-            // frame; only a full retry queue sheds (counted).
+            // Per-flow ordering: a flow with deferred frames must not
+            // send newer frames directly — that would reorder its byte
+            // stream on the wire. Defer behind its own queued head; the
+            // egress budget above guarantees the store has room.
+            let (sched_flow, ..) = frame_sched_meta(&encode_scratch);
             let tx_now = cloud_node_transport::TransportInstant::from_micros(
                 tx_clock.now_micros().max(0) as u64,
             );
+            if pending_tx.contains_key(&sched_flow) {
+                if queue_deferred_tx(
+                    &mut pending_tx,
+                    &mut pending_tx_count,
+                    &mut sched,
+                    tx_now,
+                    PendingTx::frame(encode_scratch.clone(), enqueued_us.max(0) as u64),
+                ) {
+                    congested = true;
+                } else {
+                    congested = true;
+                    congested_drops = congested_drops.saturating_add(1);
+                    tracing::debug!(
+                        "AF_XDP TX retry queue full on {} queue {}; shedding TCP egress frame bytes={}",
+                        own_interface.as_ref(),
+                        queue_handle.queue,
+                        encode_scratch.len()
+                    );
+                }
+                continue;
+            }
+            // T8 shaping gate (D-G2): token deficit defers the encoded
+            // frame; only a full retry queue sheds (counted).
             if matches!(
                 sched.charge(
                     tx_now,
-                    frame_sched_meta(&encode_scratch).0,
+                    sched_flow,
                     encode_scratch.len() as u64,
                 ),
                 cloud_node_transport::sched::Admit::Wait(_)
@@ -2007,7 +2186,7 @@ pub(crate) async fn run_queue_bridge_loop(
                     &mut pending_tx_count,
                     &mut sched,
                     tx_now,
-                    PendingTx::frame(encode_scratch.clone(), tx_now.micros()),
+                    PendingTx::frame(encode_scratch.clone(), enqueued_us.max(0) as u64),
                 ) {
                     congested = true;
                     congested_drops = congested_drops.saturating_add(1);
@@ -2036,7 +2215,7 @@ pub(crate) async fn run_queue_bridge_loop(
                         &mut pending_tx_count,
                         &mut sched,
                         tx_now,
-                        PendingTx::frame(encode_scratch.clone(), tx_now.micros()),
+                        PendingTx::frame(encode_scratch.clone(), enqueued_us.max(0) as u64),
                     ) {
                         congested = true;
                         continue;
@@ -2044,10 +2223,18 @@ pub(crate) async fn run_queue_bridge_loop(
                     congested = true;
                     congested_drops = congested_drops.saturating_add(1);
                     if tx_failures.record(AfXdpTxStatus::Backpressured) {
+                        let (tx_ring_empty, tx_invalid, tx_completed) = queue_handle
+                            .xdp_stats()
+                            .unwrap_or((u64::MAX, u64::MAX, u64::MAX));
                         tracing::warn!(
-                            "AF_XDP TCP egress TX backpressure on {} queue {} persisted for {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} consecutive frames; queue stays up and sheds new work until the ring drains",
+                            "AF_XDP TCP egress TX backpressure on {} queue {} persisted for {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} consecutive frames; queue stays up and sheds new work until the ring drains (tx_inflight={} free_frames={} tx_ring_empty={} tx_invalid={} tx_completed={})",
                             own_interface.as_ref(),
-                            queue_handle.queue
+                            queue_handle.queue,
+                            queue_handle.tx_inflight(),
+                            queue_handle.free_frames_len(),
+                            tx_ring_empty,
+                            tx_invalid,
+                            tx_completed,
                         );
                     } else {
                         tracing::debug!(
@@ -2093,7 +2280,11 @@ pub(crate) async fn run_queue_bridge_loop(
         // fixed-rate poll loop; housekeeping latency stays bounded by the
         // timer deadline or the safety cap. `has_queued_work` guards
         // sources that carry no wake signal of their own (hot sessions,
-        // drained-but-unpumped wake marks, leftover ingress).
+        // drained-but-unpumped wake marks, leftover ingress). Deferred TX
+        // frames (`pending_tx_count`) carry no wake signal either — without
+        // this check a round that only deferred TX work would sleep up to
+        // the 1s cap, blowing past the CoDel 5ms target and amplifying
+        // TCP loss under TX backpressure.
         if proxy_bridge_should_idle(
             polled_packets,
             parsed_frames,
@@ -2102,10 +2293,15 @@ pub(crate) async fn run_queue_bridge_loop(
             downstream_budget_exhausted,
         ) && !tcp_reactor.has_queued_work()
         {
+            let wait_cap = if pending_tx_count > 0 || tcp_reactor.has_held_egress() {
+                Duration::from_millis(5)
+            } else {
+                AF_XDP_IDLE_WAIT_CAP
+            };
             let wait = tcp_reactor
                 .next_timer_delay()
-                .unwrap_or(AF_XDP_IDLE_WAIT_CAP)
-                .clamp(AF_XDP_IDLE_WAIT_FLOOR, AF_XDP_IDLE_WAIT_CAP);
+                .unwrap_or(wait_cap)
+                .clamp(AF_XDP_IDLE_WAIT_FLOOR, wait_cap);
             let wake_notify = tcp_reactor.wake_notify();
             // `is_closed` guards are load-bearing: a receiver whose
             // sender was dropped resolves `recv()` instantly every poll
@@ -2129,15 +2325,20 @@ pub(crate) async fn run_queue_bridge_loop(
                         early_requests.push_back(item);
                     }
                 }
-                _ = wake_notify.notified() => {}
-                guard = wait_xsk_readable(&xsk_rx_ready) => {
-                    #[cfg(target_os = "linux")]
-                    if let Some(mut guard) = guard {
-                        guard.clear_ready();
+                item = steer_rx.recv(), if !steer_rx.is_closed() => {
+                    if let Some(item) = item {
+                        frames.push(item);
                     }
-                    #[cfg(not(target_os = "linux"))]
-                    let _ = guard;
                 }
+                _ = wake_notify.notified() => {}
+                _ = async {
+                    match &mut xsk_wake_rx {
+                        Some(rx) => {
+                            let _ = rx.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
             }
         }
         // The busy path above never awaits; without an explicit yield the
@@ -2145,18 +2346,6 @@ pub(crate) async fn run_queue_bridge_loop(
         // tasks (sessions get ACKed by the smoltcp stack but no relay task
         // is ever polled).
         tokio::task::yield_now().await;
-    }
-}
-
-/// Idle-wake arm for the XSK receive ring — resolves `Some(guard)` when
-/// the fd signals POLLIN; pending forever when no socket exists (tests).
-#[cfg(target_os = "linux")]
-async fn wait_xsk_readable<'a>(
-    fd: &'a Option<tokio::io::unix::AsyncFd<std::os::fd::BorrowedFd<'static>>>,
-) -> Option<tokio::io::unix::AsyncFdReadyGuard<'a, std::os::fd::BorrowedFd<'static>>> {
-    match fd {
-        Some(fd) => fd.readable().await.ok(),
-        None => std::future::pending().await,
     }
 }
 

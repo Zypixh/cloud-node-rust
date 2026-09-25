@@ -220,6 +220,14 @@ pub(crate) struct AfXdpTcpIngressFrame {
 pub(crate) struct AfXdpTcpEgressFrame {
     pub(crate) route: Option<AfXdpRouteMeta>,
     pub(crate) ip_packet: Vec<u8>,
+    /// smoltcp emit instant (µs). The scoreboard stamps send records
+    /// when the segment is emitted — a frame that dwells inside the
+    /// dataplane afterwards still samples RTT at ACK time, folding
+    /// internal queue delay into the path estimate (observed: wire
+    /// RTT ~80 ms while minRttMicros reported 2.4 s). Frames older
+    /// than the dwell cap are shed before the wire instead of shipping
+    /// stale bytes and poisoning congestion-control state.
+    pub(crate) enqueued_us: i64,
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -460,8 +468,17 @@ impl SmoltcpAfXdpDevice {
         });
     }
 
-    pub(crate) fn drain_egress(&mut self) -> impl Iterator<Item = AfXdpTcpEgressFrame> + '_ {
-        self.egress.drain(..)
+    /// Drain at most `max` egress frames, leaving the rest queued in
+    /// FIFO order. TX-backpressure hold: frames left here stay inside
+    /// smoltcp-side queueing instead of being shed by the bridge's
+    /// bounded defer store — socket send buffers absorb the excess and
+    /// peer windows close, which is loss-free unlike a dropped frame.
+    pub(crate) fn drain_egress_bounded(
+        &mut self,
+        max: usize,
+    ) -> impl Iterator<Item = AfXdpTcpEgressFrame> + '_ {
+        let n = self.egress.len().min(max);
+        self.egress.drain(..n)
     }
 }
 
@@ -474,6 +491,9 @@ pub(crate) struct SmoltcpAfXdpRxToken {
 pub(crate) struct SmoltcpAfXdpTxToken<'a> {
     pub(crate) route: Option<AfXdpRouteMeta>,
     pub(crate) egress: &'a mut Vec<AfXdpTcpEgressFrame>,
+    /// Dispatch instant — the emit-time stamp written into queued
+    /// egress frames so the bridge can bound their dataplane dwell.
+    pub(crate) now_us: i64,
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -489,7 +509,7 @@ impl SmoltcpDevice for SmoltcpAfXdpDevice {
 
     fn receive(
         &mut self,
-        _timestamp: SmoltcpInstant,
+        timestamp: SmoltcpInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let frame = self.ingress.pop_front()?;
         self.current_route = Some(frame.route.clone());
@@ -506,14 +526,16 @@ impl SmoltcpDevice for SmoltcpAfXdpDevice {
             SmoltcpAfXdpTxToken {
                 route: Some(frame.route),
                 egress: &mut self.egress,
+                now_us: timestamp.total_micros(),
             },
         ))
     }
 
-    fn transmit(&mut self, _timestamp: SmoltcpInstant) -> Option<Self::TxToken<'_>> {
+    fn transmit(&mut self, timestamp: SmoltcpInstant) -> Option<Self::TxToken<'_>> {
         Some(SmoltcpAfXdpTxToken {
             route: self.current_route.clone(),
             egress: &mut self.egress,
+            now_us: timestamp.total_micros(),
         })
     }
 
@@ -559,17 +581,11 @@ impl TxToken for SmoltcpAfXdpTxToken<'_> {
     {
         let mut packet = vec![0u8; len];
         let result = f(&mut packet);
-        if let Some(route) = self.route {
-            self.egress.push(AfXdpTcpEgressFrame {
-                route: Some(route),
-                ip_packet: packet,
-            });
-        } else {
-            self.egress.push(AfXdpTcpEgressFrame {
-                route: None,
-                ip_packet: packet,
-            });
-        }
+        self.egress.push(AfXdpTcpEgressFrame {
+            route: self.route,
+            ip_packet: packet,
+            enqueued_us: self.now_us,
+        });
         result
     }
 }
@@ -1397,20 +1413,36 @@ impl AfXdpTcpReactor {
         clock
     }
 
-    pub(crate) fn poll(&mut self) -> Vec<(AfXdpRouteMeta, Vec<u8>)> {
+    pub(crate) fn poll(&mut self) -> Vec<(AfXdpRouteMeta, Vec<u8>, i64)> {
+        self.poll_with_egress_budget(usize::MAX)
+    }
+
+    /// Poll with a bounded egress drain: at most `egress_budget` emitted
+    /// frames are moved out of the device queue this round; the rest stay
+    /// queued in order. Callers pass the defer store's remaining capacity
+    /// so a saturated TX path holds frames in smoltcp-side queueing
+    /// (loss-free backpressure) instead of shedding them as TCP loss.
+    pub(crate) fn poll_with_egress_budget(
+        &mut self,
+        egress_budget: usize,
+    ) -> Vec<(AfXdpRouteMeta, Vec<u8>, i64)> {
         let now = SmoltcpInstant::from_micros(self.clock.now_micros());
-        self.poll_at(now)
+        self.poll_at(now, egress_budget)
     }
 
     #[cfg(test)]
     pub(crate) fn poll_at_for_test(
         &mut self,
         now: SmoltcpInstant,
-    ) -> Vec<(AfXdpRouteMeta, Vec<u8>)> {
-        self.poll_at(now)
+    ) -> Vec<(AfXdpRouteMeta, Vec<u8>, i64)> {
+        self.poll_at(now, usize::MAX)
     }
 
-    pub(crate) fn poll_at(&mut self, now: SmoltcpInstant) -> Vec<(AfXdpRouteMeta, Vec<u8>)> {
+    pub(crate) fn poll_at(
+        &mut self,
+        now: SmoltcpInstant,
+        egress_budget: usize,
+    ) -> Vec<(AfXdpRouteMeta, Vec<u8>, i64)> {
         // §2.6: arbitration tick — merge/split hysteresis, probe leasing,
         // tiered allocation. No-op when aggregation isn't configured.
         self.tick_aggregate(now);
@@ -1427,12 +1459,23 @@ impl AfXdpTcpReactor {
                 | PollIngressSingleResult::SocketStateChanged => {}
             }
         }
-        let _ = self
-            .iface
-            .poll_egress(now, &mut self.device, &mut self.sockets);
+        // Emit backpressure: while the device egress queue holds more
+        // frames than the TX path can promptly wire, skip the socket
+        // dispatch — bytes stay in smoltcp send buffers (peer windows
+        // close, loss-free) rather than being emitted, stamped "sent"
+        // on the scoreboard, and left to age in a queue where their
+        // dwell folds into RTT/pacing accounting.
+        if self.device.egress.len() < AF_XDP_TCP_EGRESS_EMIT_CAP {
+            let _ = self
+                .iface
+                .poll_egress(now, &mut self.device, &mut self.sockets);
+        }
         self.pump_sessions(now);
         self.release_budget_backpressure();
-        let frames = self.device.drain_egress().collect::<Vec<_>>();
+        let frames = self
+            .device
+            .drain_egress_bounded(egress_budget)
+            .collect::<Vec<_>>();
         let mut egress = Vec::with_capacity(frames.len());
         for frame in frames {
             let route = frame.route.or_else(|| {
@@ -1443,7 +1486,7 @@ impl AfXdpTcpReactor {
                 })
             });
             match route {
-                Some(route) => egress.push((route, frame.ip_packet)),
+                Some(route) => egress.push((route, frame.ip_packet, frame.enqueued_us)),
                 None => tracing::debug!(
                     "AF_XDP TCP reactor dropped egress packet without route bytes={}",
                     frame.ip_packet.len()
@@ -1472,6 +1515,15 @@ impl AfXdpTcpReactor {
             || !self.hot_deadline.is_empty()
             || !self.wake_set.is_empty()
             || !self.device.ingress.is_empty()
+    }
+
+    /// Frames held inside the device queue by the egress budget — they
+    /// need a bounded retry cadence, but must NOT bypass the bridge's
+    /// event wait entirely (a held queue during TX saturation would
+    /// otherwise spin the queue thread at 100% CPU with no benefit).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_held_egress(&self) -> bool {
+        !self.device.egress.is_empty()
     }
 
     /// Shared notify the stream tasks signal when they queue egress —
@@ -1560,6 +1612,7 @@ impl AfXdpTcpReactor {
         self.device.egress.push(AfXdpTcpEgressFrame {
             route: None,
             ip_packet,
+            enqueued_us: self.clock.now_micros(),
         });
     }
 

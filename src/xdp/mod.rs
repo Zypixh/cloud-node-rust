@@ -92,6 +92,21 @@ pub struct XdpQueueStatus {
     /// bufferbloat at the xsk TX ring.
     #[serde(default)]
     pub tx_inflight: u64,
+    /// Frames that crossed the dataplane dwell bound before reaching the
+    /// wire (emit→send > 100 ms). Measurement only — they were still
+    /// sent. Nonzero under load means emit backpressure isn't bounding
+    /// queue latency and RTT samples can fold in internal queueing.
+    #[serde(default)]
+    pub stale_dwells: u64,
+    /// TCP frames handed off to a sibling worker (flow-ownership
+    /// steering). High values relative to RX mean the NIC's RSS spread
+    /// disagrees with the worker assignment — normal on asymmetric RSS.
+    #[serde(default)]
+    pub steered_frames: u64,
+    /// Steered frames shed because the target worker's channel was full.
+    /// TCP retransmits cover the loss; nonzero means a worker is behind.
+    #[serde(default)]
+    pub steer_sheds: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1702,6 +1717,9 @@ impl XdpManager {
                 status.aqm_drops = prev.aqm_drops;
                 status.aqm_ce_marks = prev.aqm_ce_marks;
                 status.admission_refusals = prev.admission_refusals;
+                status.stale_dwells = prev.stale_dwells;
+                status.steered_frames = prev.steered_frames;
+                status.steer_sheds = prev.steer_sheds;
                 if prev.faulted {
                     status.faulted = true;
                     status.registered = false;

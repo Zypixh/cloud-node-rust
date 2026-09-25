@@ -98,6 +98,14 @@ pub(crate) const AF_XDP_TCP_INGRESS_BUDGET: usize = 512;
 /// Overflow is an explicit, counted refusal — never silent memory growth.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_INGRESS_QUEUE_MAX: usize = 4096;
+/// Emit backpressure: once this many emitted-but-unsent frames sit in the
+/// device egress queue, `poll_egress` is skipped entirely — smoltcp keeps
+/// its bytes in socket send buffers instead of stamping "sent" on records
+/// whose frames cannot reach the wire. The scoreboard's send/RTT/pacing
+/// accounting then stays anchored near wire time (observed on prod:
+/// emit→wire dwell folded into RTT samples as ~2.4 s on an ~80 ms path).
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_EGRESS_EMIT_CAP: usize = 512;
 /// EN-17: dirty-mark entries drained from the shared wake set per round.
 /// The set itself is hard-bounded by the session limit (one entry per live
 /// flow); the budget caps per-round drain work, leftovers stay queued.
